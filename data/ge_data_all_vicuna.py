@@ -1,172 +1,113 @@
-import argparse
-from tqdm import tqdm
-
-parser = argparse.ArgumentParser(description='sp')
-parser.add_argument('--start', type=int, default=0)
-parser.add_argument('--end', type=int, default=100)
-parser.add_argument('--index', type=int, default=1)
-parser.add_argument('--gpu_index', type=int, nargs='+', default=[0])
-parser.add_argument('--outdir', type=str, default='outdir0')
-args = parser.parse_args()
-import os
-
-os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_index)[1:-1]
+# data/ge_data_all_vicuna.py  (final stable version)
+# --------------------------------------------------------------------------- #
+#  Build a mini hidden-state dataset for Draft–Verify from any Llama-2
+#  checkpoint and a ShareGPT-style text source (local JSON or HF dataset id). #
+# --------------------------------------------------------------------------- #
+import argparse, os, json, itertools
+from pathlib import Path
+from typing  import Iterator
 
 import torch
-import torch.nn.functional as F
-from tqdm import tqdm
-from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset
 from fastchat.model.model_adapter import get_conversation_template
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from tqdm import tqdm
 
-bigname="/cache/CKPT/vicuna-7b-v1.3/"
+# ---------------- CLI ------------------------------------------------------- #
+p = argparse.ArgumentParser()
+p.add_argument("--start",  type=int, default=0)
+p.add_argument("--end",    type=int, default=100)
+p.add_argument("--index",  type=int, default=0)
+p.add_argument("--gpu_index", nargs="+", type=int, default=[0])
+p.add_argument("--outdir", type=str, default="outdir0")
+p.add_argument("--model_name", type=str,
+              default="meta-llama/Llama-2-7b-hf")
+p.add_argument("--sharegpt_source", type=str,
+              default="RyokoAI/ShareGPT52K",
+              help="Local JSON/L or HF dataset id")
+args = p.parse_args()
+os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, args.gpu_index))
 
-def longest_common_prefix(list1, list2):
-    prefix_length = 0
-    min_length = min(len(list1), len(list2))
+# ---------------- Dataset iterator ----------------------------------------- #
+def iter_sharegpt(src:str) -> Iterator[dict]:
+    """
+    Yield raw ShareGPT items without ever converting to Arrow/Parquet.
+    * Local file  : stream line-by-line (json or jsonl)
+    * HF dataset  : load with streaming=True and islice()
+    """
+    if Path(src).expanduser().is_file():                        # ---- local
+        file_path = Path(src).expanduser()
+        with open(file_path, "r", encoding="utf-8") as f:
+            for line in f:
+                yield json.loads(line.strip())
+    else:                                                       # ---- hub
+        ds_stream = load_dataset(src, split="train", streaming=True)
+        for ex in itertools.islice(ds_stream, args.start, args.end):
+            yield ex
 
-    for i in range(min_length):
-        if list1[i] == list2[i]:
-            prefix_length += 1
-        else:
-            break
+# ---------------- Build processed slice ------------------------------------ #
+def build_dataset(tok, max_len:int):
+    tmpl_name = "llama-2"
+    try: _ = get_conversation_template(tmpl_name)
+    except ValueError: tmpl_name = "vicuna"
 
-    common_prefix = list1[:prefix_length]
-    return common_prefix, prefix_length
+    processed = []
+    for raw in iter_sharegpt(args.sharegpt_source):
+        conv_raw = [m for m in raw["conversations"]
+                      if m.get("from") in ("human","gpt")]
+        if len(conv_raw) < 2: continue
+        conv = get_conversation_template(tmpl_name)
+        roles = {"human": conv.roles[0], "gpt": conv.roles[1]}
+        if conv_raw[0]["from"] != "human": conv_raw = conv_raw[1:]
+        conv.messages = [ [roles[m["from"]], m["value"]] for m in conv_raw ]
 
+        text = conv.get_prompt()
+        ids  = tok(text, truncation=True, max_length=max_len,
+                   return_tensors="pt").input_ids[0]
 
-def build_dataset_rank(
-        tokenizer, split="train",
-        select=None,
-        data_path = "/cache/CKPT/ShareGPT_V4.3_unfiltered_cleaned_split.json"
-):
-    ds = load_dataset('json', data_files=data_path)
-    
-    ds = ds['train']
-    ds = ds.shuffle(seed=42)
-    ds1 = ds.select(range(args.start, args.end))
-    original_columns1 = ds1.column_names
-    num_proc = 4
+        mask = torch.ones_like(ids); cur = 1; mask[:cur]=0
+        sep = conv.sep + conv.roles[1] + ": "
+        for i, turn in enumerate(text.split(conv.sep2)):
+            if not turn: break
+            parts = turn.split(sep);  # user-Prompt + assistant reply
+            if len(parts)!=2: break
+            instr_len = len(tok(parts[0]).input_ids) - 2
+            if i and not tok.legacy: instr_len -= 1
+            mask[cur:cur+instr_len] = 0
+            cur += len(tok(turn).input_ids)
+            if i and not tok.legacy: cur -= 1
+        mask[cur:] = 0
+        processed.append({"input_ids": ids[None,:], "loss_mask": mask[None,:]})
+    return processed
 
-    # need to be modify for summarization
-    def preprocess_function(examples):
-        new_examples = {
-            "conversation":[],
-            "input_ids": [],
-            "loss_mask": []
-        }
-        for i in range(len(examples['id'])):
-            conv = get_conversation_template("vicuna")
-            roles = {"human": conv.roles[0], "gpt": conv.roles[1]}
-            source= examples['conversations'][i]
-            if roles[source[0]["from"]] != conv.roles[0]:
-                # Skip the first one if it is not from human
-                source = source[1:]
-            conv.messages = []
-            for j, sentence in enumerate(source):
-                role = roles[sentence["from"]]
-                assert role == conv.roles[j % 2], f"{i}"
-                conv.append_message(role, sentence["value"])
-            conversation=conv.get_prompt()
+# ---------------- Load base model ----------------------------------------- #
+print(f"→ Loading base model {args.model_name}")
+tok = AutoTokenizer.from_pretrained(args.model_name, use_fast=True,
+                                    trust_remote_code=True)
+max_len = min(getattr(tok,"model_max_length",4096), 4096)
+model   = AutoModelForCausalLM.from_pretrained(
+            args.model_name, torch_dtype=torch.float16,
+            device_map="auto").eval()
+n_layers   = model.config.num_hidden_layers
+exit_layer = 2 if n_layers<=32 else 3
+print(f"Tokenizer max_len={max_len} | exit layer={exit_layer}")
 
-            input_ids = tokenizer(
-                conversation,
-                return_tensors="pt",
-                max_length=tokenizer.model_max_length,
-                truncation=True,
-            ).input_ids[0]
-            loss_mask=torch.ones_like(input_ids)
+dataset = build_dataset(tok, max_len)
+print(f"✓ Loaded {len(dataset)} samples")
 
-            sep = conv.sep + conv.roles[1] + ": "
-
-            total_len = int(input_ids.ne(tokenizer.pad_token_id).sum())
-
-            turns = conversation.split(conv.sep2)
-            cur_len = 1
-            loss_mask[:cur_len] = 0
-            for i, turn in enumerate(turns):
-                if turn == "":
-                    break
-                turn_len = len(tokenizer(turn).input_ids)
-
-                parts = turn.split(sep)
-                if len(parts) != 2:
-                    break
-                parts[0] += sep
-                # "-2" is hardcoded for the Llama tokenizer to make the offset correct.
-                instruction_len = len(tokenizer(parts[0]).input_ids) - 2
-
-                if i != 0 and not tokenizer.legacy:
-                    # The legacy and non-legacy modes handle special tokens differently
-                    instruction_len -= 1
-
-                # Ignore the user instructions
-                loss_mask[cur_len: cur_len + instruction_len] = 0
-                cur_len += turn_len
-
-                if i != 0 and not tokenizer.legacy:
-                    # The legacy and non-legacy modes handle special tokens differently
-                    cur_len -= 1
-
-            loss_mask[cur_len:] = 0
-
-            new_examples["conversation"].append(conversation)
-            new_examples["input_ids"].append(input_ids[None,:])
-            new_examples["loss_mask"].append(loss_mask[None,:])
-
-        return new_examples
-
-    ds1 = ds1.map(
-        preprocess_function,
-        batched=True,
-        num_proc=num_proc,
-        remove_columns=original_columns1,
-        load_from_cache_file=False
-    )
-
-    ds1.set_format(type="torch")
-    return ds1
-
-bigtokenizer = AutoTokenizer.from_pretrained(bigname, use_fast=False)
-ds = build_dataset_rank(bigtokenizer)
-print(ds)
-bigmodel = AutoModelForCausalLM.from_pretrained(bigname,  device_map="auto", torch_dtype=torch.float16)
-bigmodel.eval()
-
-
+out_root = Path(args.outdir)/str(args.index); out_root.mkdir(parents=True, exist_ok=True)
 
 @torch.no_grad()
-def ge(data):
-    input_ids=data["input_ids"]
-    outs_big = bigmodel(input_ids.cuda(), output_hidden_states=True)
-    assert len(outs_big.hidden_states) == 33
+def encode(sample):
+    ids  = sample["input_ids"].to("cuda")
+    outs = model(ids, output_hidden_states=True, use_cache=False)
+    return {
+        "input_ids": ids.cpu()[0],
+        "loss_mask": sample["loss_mask"].cpu()[0],
+        f"hidden_state_layer{exit_layer}": outs.hidden_states[exit_layer].cpu()[0],
+        "hidden_state": outs.hidden_states[-1].cpu()[0],
+    }
 
-    max_prob_tokens_big = torch.argmax(outs_big.logits, dim=-1)
-    probs = torch.softmax(outs_big.logits, dim=-1)
-    maxp =probs[0].max(dim=1).values
-    td={"input_ids":input_ids.cpu()[0],
-        "loss_mask":data["loss_mask"].cpu()[0]}
-    # early exit layer 
-    # exit at layer2 for vicuna-7B and layer3 for vicuna-13B 
-    td[f"hidden_state_layer2"] = outs_big.hidden_states[2].cpu()[0]
-    td[f"hidden_state_layer3"] = outs_big.hidden_states[3].cpu()[0]
-    td[f"hidden_state"] = outs_big.hidden_states[-1].cpu()[0]
-    return td
-
-outdir = f'{args.outdir}/{args.index}'
-if not os.path.exists(outdir):
-    os.makedirs(outdir)
-
-def writedata(name,data_point):
-    if not os.path.exists(name):
-        os.makedirs(name)
-    current_length=len(os.listdir(name))
-    idx=current_length
-    torch.save(data_point, f'{name}/data_{idx}.ckpt')
-
-
-for data in tqdm(ds):
-    outdata = ge(data)
-    writedata(outdir,outdata)
-
-
+for i,samp in enumerate(tqdm(dataset, desc="encoding")):
+    torch.save(encode(samp), out_root/f"data_{i}.ckpt")
+print(f"✓ Saved {i+1} ckpt files → {out_root}")
