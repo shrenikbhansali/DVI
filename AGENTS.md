@@ -43,12 +43,13 @@ Any PR that rewrites the algorithms inside these files **must** include:
 ---
 
 ## 2 · Always Check `adapter.py` First ❗
+We are **NOT** using the latest version of huggingface / transformers. We are using transformers=4.33.3. The version that you have installed *is* is the latest version. Therefore, you should check against the web or check against `kangaroo/adapter.py`. 
 
 `kangaroo/adapter.py` is **not** a thin wrapper:
 
-* Re‑implements **LlamaAttention**, **LlamaRotaryEmbedding**, causal masking, etc.
+* It is the transformers=4.33.3 implementations of **LlamaAttention**, **LlamaRotaryEmbedding**, causal masking, etc.
 * Caps KV‑cache to 64 tokens for memory.
-* Provides `_set_cos_sin_cache()`, `forward_early_stop()`, `_prepare_decoder_attention_mask()`—utilities that the rest of the codebase *must* call instead of HF counterparts.
+* Provides `_set_cos_sin_cache()`, `forward_early_stop()`, `_prepare_decoder_attention_mask()`—utilities that the rest of the codebase *will* call.
 
 ➡️ **Before you import or extend any HF module, search `adapter.py` to avoid
 silent incompatibilities.**
