@@ -1,6 +1,14 @@
 import torch
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, NamedTuple
+import logging
 from transformers.models.llama import LlamaForCausalLM
+
+
+class SpecStep(NamedTuple):
+    hidden: torch.Tensor  # (B, 1, H) on CPU float32
+    logits: torch.Tensor  # (B, |V|) on CPU float32
+    accept: torch.Tensor  # (B, 1) uint8
+    token: torch.Tensor   # (B, 1) int64
 
 
 class EarlyExitLlamaForCausalLM(LlamaForCausalLM):
@@ -84,3 +92,79 @@ class EarlyExitLlamaForCausalLM(LlamaForCausalLM):
         if in_features_large is not None:
             return hidden_states, self.model.norm(hidden_states)
         return hidden_states
+
+    # ------------------------------------------------------------------
+    @torch.no_grad()
+    def spec_decode_step(
+        self,
+        in_tokens: torch.LongTensor,
+        *,
+        temperature: float = 0.0,
+        position_ids: Optional[torch.Tensor] = None,
+        global_step: int = 0,
+    ) -> SpecStep:
+        """Run one speculative decoding step.
+
+        Parameters
+        ----------
+        in_tokens : Tensor
+            Input token ids of shape (B, 1).
+        temperature : float, optional
+            Sampling temperature; 0 for greedy.
+        position_ids : Tensor, optional
+            Positional ids for the token.
+        global_step : int, optional
+            Step index for debug logging.
+
+        Returns
+        -------
+        SpecStep
+            Micro-step output detached to CPU.
+        """
+
+        logger = logging.getLogger("debug_accept")
+
+        # --- Draft path -------------------------------------------------
+        hidden = self.forward_draft_or_large_model(
+            in_tokens_small=in_tokens, position_ids=position_ids
+        )
+        hidden_last = hidden[:, -1:, :]
+        draft_logits = self.exit_proj(hidden_last).float()
+
+        if temperature > 0:
+            probs = torch.softmax(draft_logits / temperature, dim=-1)
+            token = torch.multinomial(probs.view(probs.size(0), -1), 1)
+        else:
+            token = torch.argmax(draft_logits, dim=-1, keepdim=True)
+
+        # --- Verifier path --------------------------------------------
+        _, final_hidden = self.forward_draft_or_large_model(
+            in_features_large=hidden_last, position_ids=position_ids
+        )
+        final_logits = self.head_model(final_hidden).float()
+
+        accept = (
+            final_logits.argmax(dim=-1, keepdim=True) == token
+        ).to(torch.uint8)
+
+        prob = (
+            torch.softmax(final_logits, dim=-1)
+            .gather(-1, token)
+            .squeeze(-1)
+        )
+
+        for idx in range(accept.shape[0]):
+            logger.debug(
+                {
+                    "step": global_step,
+                    "accept": int(accept[idx].item()),
+                    "conf": float(prob[idx].item()),
+                }
+            )
+
+        return SpecStep(
+            hidden_last.detach().to(torch.float32).cpu().clone(),
+            draft_logits.squeeze(1).detach().to(torch.float32).cpu().clone(),
+            accept.detach().cpu().clone(),
+            token.detach().to(torch.int64).cpu().clone(),
+        )
