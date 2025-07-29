@@ -176,6 +176,5 @@ We also train the verifier’s adapter (LoRA \$\phi\$) using supervised losses:
 * \$\mathcal{L}\_{\text{CE}}\$: Cross-entropy loss using real token.
 * \$D\_{\text{KL}}\$: Ensures the verifier doesn’t change too rapidly.
 
----
 
-```
+
