@@ -64,9 +64,9 @@ The fast update  operates on every training step, focusing solely on improving t
 
 Formally, the draft adapter defines a stochastic policy $\pi_\theta(t \mid h_k)$, where $h_k$ is the intermediate hidden state at the split layer. At each decoding step, the model observes a binary reward $r_t \in \{0, 1\}$ based on whether the verifier accepted the token. The fast update applies the **REINFORCE** algorithm:
 
-$$
+${
 \nabla_\theta \mathbb{E}[r_t] = \mathbb{E}[(r_t - b) \nabla_\theta \log \pi_\theta(t \mid h_k)]
-$$
+}$
 
 where $b$ is a baseline used for variance reduction.
 
