@@ -22,8 +22,8 @@ This yields large speedups while maintaining output quality, since the verifier 
 
 The **Kangaroo** method improves upon SD by using a single model, split into two parts:
 
-* **Shallow layers** (layers $0 \to k$) act as the **draft** module.
-* **Deep layers** (layers $k \to L$) act as the **verifier**.
+- **Shallow layers** (layers $0 \to k$) act as the **draft** module.
+- **Deep layers** (layers $k \to L$) act as the **verifier**.
 
 The draft generates candidate logits, and the verifier reprocesses them. If both agree on a token, it is "accepted." This removes the need for an external draft model.
 
@@ -60,15 +60,15 @@ DVI has two distinct optimizations — **fast updates** and **slow updates** —
 
 ### Fast Updates (for Draft / Policy Improvement)
 
-The fast update  operates on every training step, focusing solely on improving the **draft** network's ability to generate tokens that are likely to be accepted by the verifier.
+The fast update operates on every training step, focusing solely on improving the **draft** network's ability to generate tokens that are likely to be accepted by the verifier.
 
 Formally, the draft adapter defines a stochastic policy $\pi_\theta(t \mid h_k)$, where $h_k$ is the intermediate hidden state at the split layer. At each decoding step, the model observes a binary reward $r_t \in \{0, 1\}$ based on whether the verifier accepted the token. The fast update applies the **REINFORCE** algorithm:
 
-${
+```math
 \nabla_\theta \mathbb{E}[r_t] = \mathbb{E}[(r_t - b) \nabla_\theta \log \pi_\theta(t \mid h_k)]
-}$
+````
 
-where $b$ is a baseline used for variance reduction.
+where \$b\$ is a baseline used for variance reduction.
 
 This provides an **unbiased policy gradient** signal encouraging the draft model to improve its match with the verifier. Crucially:
 
@@ -93,15 +93,15 @@ If the verifier becomes outdated — e.g., due to domain shift in streaming inpu
 
 To maintain verifier reliability, DVI applies a **slow update** schedule using a replay buffer of accepted and rejected tokens. The verifier is fine-tuned using a cross-entropy objective and regularized with a KL-divergence constraint:
 
-$$
+```math
 \mathcal{L}_{\text{verifier}} = \mathcal{L}_{\text{CE}} + \beta_{\text{KL}} \cdot D_{\text{KL}}(\pi_\phi \| \pi_{\phi_{\text{old}}})
-$$
+```
 
 Here:
 
-* $\mathcal{L}_{\text{CE}}$ trains the verifier on next-token prediction using its own historical outputs as soft targets.
-* $D_{\text{KL}}$ penalizes deviation from the previous verifier, preventing instability.
-* $\phi$ are the verifier parameters (typically a LoRA adapter), and $\phi_{\text{old}}$ is a frozen copy.
+* \$\mathcal{L}\_{\text{CE}}\$ trains the verifier on next-token prediction using its own historical outputs as soft targets.
+* \$D\_{\text{KL}}\$ penalizes deviation from the previous verifier, preventing instability.
+* \$\phi\$ are the verifier parameters (typically a LoRA adapter), and \$\phi\_{\text{old}}\$ is a frozen copy.
 
 This slow, conservative tuning ensures that:
 
@@ -115,31 +115,31 @@ This slow, conservative tuning ensures that:
 
 ### Kangaroo: Inference-time Speculative Decoding
 
-Let $h_k$ be the hidden state at layer $k$ of an LLM:
+Let \$h\_k\$ be the hidden state at layer \$k\$ of an LLM:
 
 1. **Draft** logits:
 
-   $$
-   z^{(D)} = W_{\text{out}}^{(S)} h_k + b^{(S)}
-   $$
+```math
+z^{(D)} = W_{\text{out}}^{(S)} h_k + b^{(S)}
+```
 
-   where $W_{\text{out}}^{(S)}$ are projection weights from shallow layers.
+where \$W\_{\text{out}}^{(S)}\$ are projection weights from shallow layers.
 
-2. Sample token $t \sim \text{softmax}(z^{(D)})$
+2. Sample token \$t \sim \text{softmax}(z^{(D)})\$
 
 3. **Verifier** re-computes hidden state:
 
-   $$
-   h_L = f_{k \to L}(h_k)
-   $$
+```math
+h_L = f_{k \to L}(h_k)
+```
 
-   Then computes:
+Then computes:
 
-   $$
-   z^{(V)} = W_{\text{out}}^{(D)} h_L + b^{(D)}
-   $$
+```math
+z^{(V)} = W_{\text{out}}^{(D)} h_L + b^{(D)}
+```
 
-4. If $\arg\max(z^{(D)}) = \arg\max(z^{(V)})$, token is accepted.
+4. If \$\arg\max(z^{(D)}) = \arg\max(z^{(V)})\$, token is accepted.
    Otherwise, it is rejected and replaced.
 
 This is purely deterministic logic. No training occurs. The model generates faster, but does not improve.
@@ -150,30 +150,32 @@ This is purely deterministic logic. No training occurs. The model generates fast
 
 #### Notation:
 
-* $\pi_\theta(t \mid h_k)$: Draft policy (parameterized by LoRA adapter $\theta$).
-* $r_t \in \{0, 1\}$: Verifier accept signal (1 = accepted, 0 = rejected).
-* $b$: EMA baseline for variance reduction.
+* \$\pi\_\theta(t \mid h\_k)\$: Draft policy (parameterized by LoRA adapter \$\theta\$).
+* \$r\_t \in {0, 1}\$: Verifier accept signal (1 = accepted, 0 = rejected).
+* \$b\$: EMA baseline for variance reduction.
 
 #### Objective: REINFORCE
 
 The draft adapter is trained via:
 
-$$
+```math
 \mathcal{L}_{\text{draft}} = - (r_t - b) \log \pi_\theta(t \mid h_k)
-$$
+```
 
 * Tokens accepted by the verifier are treated as positive reinforcement.
 * This encourages the draft to mimic tokens likely to be accepted.
 
 #### Slow Update: Verifier Training
 
-We also train the verifier’s adapter (LoRA $\phi$) using supervised losses:
+We also train the verifier’s adapter (LoRA \$\phi\$) using supervised losses:
 
-$$
+```math
 \mathcal{L}_{\text{verifier}} = \underbrace{\mathcal{L}_{\text{CE}}(t, \pi_\phi)}_{\text{Supervised on GT token}} + \beta_{\text{KL}} \underbrace{D_{\text{KL}}(\pi_\phi \| \pi_{\phi_{\text{old}}})}_{\text{Conservative update}}
-$$
+```
 
-* $\mathcal{L}_{\text{CE}}$: Cross-entropy loss using real token.
-* $D_{\text{KL}}$: Ensures the verifier doesn’t change too rapidly.
-* Only a few steps are taken to update verifier, preserving label quality.
+* \$\mathcal{L}\_{\text{CE}}\$: Cross-entropy loss using real token.
+* \$D\_{\text{KL}}\$: Ensures the verifier doesn’t change too rapidly.
 
+---
+
+```
