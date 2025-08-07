@@ -1,97 +1,180 @@
-<img src="imgs/logo.png" alt="Kangaroo" width="100" align="left"><div align="center"><h1>&nbsp;Kangaroo: Lossless Self-Speculative Decoding via Double Early Exiting</h1></div>
+# DVI: Draft → Verify → Improve
 
-<p align="center">
-| <a href="https://arxiv.org/abs/2404.18911"><b>Arxiv Paper</b></a> |
-</p>
+## Overview
 
+DVI extends self-speculation by turning the verifier’s internal accept/reject signal into a training objective—resulting in a fully self-supervised, online reinforcement learning system.
 
-<p align="center">
-  <a href="">
-    <img src="https://img.shields.io/badge/Version-v0.0.1-orange.svg" alt="Version">
-  </a>
-  <a href="https://github.com/SafeAILab/EAGLE/pulls">
-    <img src="https://img.shields.io/badge/Contributions-welcome-brightgreen.svg?style=flat" alt="Contributions welcome">
-  </a>
-</p>
+---
 
-<br/>
+## Background
 
-Drawing inspiration from early exiting, we propose a novel
-self-speculative decoding framework Kangaroo, which uses a fixed shallow sub-network as a self-draft model, with the remaining layers serving as the larger target model. We train a lightweight and efficient adapter module on top of the sub-network to bridge the gap between the sub-network and the full model’s representation ability. The adapter network consists of only one multi-head attention and two
-normalization layers. Surprisingly, we find this simple design efficient but powerful. To further reduce the inference latency of the self-draft model, we introduce an additional early exiting mechanism for generating draft tokens, aiming to avoid
-unnecessary costs on more difficult tokens.
+### Speculative Decoding (SD)
 
-<p align="center">
-  <img src="imgs/kangaroo.png" >
-</p>
-<p align="center">
-</p>
+Speculative decoding is an inference-time optimization designed to increase throughput for autoregressive generation. Instead of generating one token at a time, it:
 
+1. Uses a **draft model** to propose multiple tokens in parallel.
+2. Uses a **verifier model** to check those proposals.
+3. Accepts matching tokens; regenerates the rest.
 
-#### TODO List
-- [X] inference code & checkpoints of Kangaroo.
-- [X] code for training Kangaroo.
-- [ ] tree verification.
-- [ ] bsz > 1 and decoding with sampling.
+This yields large speedups while maintaining output quality, since the verifier ensures semantic and statistical correctness.
 
-#### Training
+### Kangaroo: Self-Speculative Decoding
 
-We follow the training procedure of [Medusa](https://github.com/FasterDecoding/Medusa#medusa-simple-framework-for-accelerating-llm-generation-with-multiple-decoding-heads) and [Eagle](https://github.com/SafeAILab/EAGLE?tab=readme-ov-file).
+The **Kangaroo** method improves upon SD by using a single model, split into two parts:
 
+- **Shallow layers** (layers $0 \to k$) act as the **draft** module.
+- **Deep layers** (layers $k \to L$) act as the **verifier**.
 
-1. data preprocess
+The draft generates candidate logits, and the verifier reprocesses them. If both agree on a token, it is "accepted." This removes the need for an external draft model.
 
-```python
-cd data
-python allocation.py --outdir /home/ma-user/work/Data/
+However, Kangaroo is only an inference-time trick: the accept/reject signal is discarded.
+
+---
+
+## DVI
+
+DVI converts speculative decoding into an **online training signal**. It reuses the verifier's decision as **reinforcement feedback** to improve the draft module, forming a training-time loop of:
+
+> **Draft → Verify → Improve**
+
+By doing this, DVI enables continual, self-supervised training from natural interaction (e.g., chatbot transcripts or streaming dialogue).
+
+---
+
+## Kangaroo vs. DVI
+
+| Kangaroo (Inference-only)                        | DVI (Training-enabled)                                             |
+| ------------------------------------------------ | ------------------------------------------------------------------ |
+| Uses draft/verify split to accelerate generation | Uses same split, but converts accept/reject into a training signal |
+| Accept/reject signal is discarded                | Accept = reward 1, Reject = reward 0 → used in REINFORCE           |
+| No learning from experience                      | Performs continual RL using on-device buffer                       |
+| Requires static, fixed model                     | Online learning; model adapts to new data                          |
+| Only improves runtime throughput                 | Improves both throughput **and** model quality over time           |
+| No replay or learning memory                     | Maintains experience buffer on verifier device                     |
+
+---
+
+## Fast and Slow Updates (not always RL)
+
+DVI has two distinct optimizations — **fast updates** and **slow updates** — to manage learning in the **draft** and the **verifier** modules respectively.
+
+### Fast Updates (for Draft / Policy Improvement)
+
+The fast update operates on every training step, focusing solely on improving the **draft** network's ability to generate tokens that are likely to be accepted by the verifier.
+
+Formally, the draft adapter defines a stochastic policy $\pi_\theta(t \mid h_k)$, where $h_k$ is the intermediate hidden state at the split layer. At each decoding step, the model observes a binary reward $r_t \in \{0, 1\}$ based on whether the verifier accepted the token. The fast update applies the **REINFORCE** algorithm:
+
+```math
+\nabla_\theta \mathbb{E}[r_t] = \mathbb{E}[(r_t - b) \nabla_\theta \log \pi_\theta(t \mid h_k)]
+````
+
+where \$b\$ is a baseline used for variance reduction.
+
+This provides an **unbiased policy gradient** signal encouraging the draft model to improve its match with the verifier. Crucially:
+
+* The fast update **does not** modify the verifier.
+* The signal is **local** (per token) and **immediate**.
+* It assumes the verifier remains a stable source of feedback.
+
+This assumption — that the verifier is reliable and well-calibrated — is the weak point. Over time, the **draft network may shift its distribution**, causing the verifier’s judgments to become **out-of-domain** or inconsistent. When this happens, the reward signal may no longer reflect actual token quality, and learning degrades.
+
+---
+
+### Slow Updates (Verifier Maintenance)
+
+To address this drift, DVI introduces **slow updates** to the verifier component. These updates are performed **periodically** and are **supervised**, not policy-based.
+
+The verifier serves as both:
+
+1. An **executor** of speculative decoding (deciding accept vs reject), and
+2. A **teacher** that provides reward signals to train the draft.
+
+If the verifier becomes outdated — e.g., due to domain shift in streaming input or evolving draft behavior — then its accept/reject signals become meaningless. Worse, the system may reinforce poor behaviors.
+
+To maintain verifier reliability, DVI applies a **slow update** schedule using a replay buffer of accepted and rejected tokens. The verifier is fine-tuned using a cross-entropy objective and regularized with a KL-divergence constraint:
+
+```math
+\mathcal{L}_{\text{verifier}} = \mathcal{L}_{\text{CE}} + \beta_{\text{KL}} \cdot D_{\text{KL}}(\pi_\phi \| \pi_{\phi_{\text{old}}})
 ```
 
-2. training
+Here:
 
-```
-python start_train.py
-```
+* \$\mathcal{L}\_{\text{CE}}\$ trains the verifier on next-token prediction using its own historical outputs as soft targets.
+* \$D\_{\text{KL}}\$ penalizes deviation from the previous verifier, preventing instability.
+* \$\phi\$ are the verifier parameters (typically a LoRA adapter), and \$\phi\_{\text{old}}\$ is a frozen copy.
 
+This slow, conservative tuning ensures that:
 
-#### Inference
+* The verifier continues to track the **domain distribution**.
+* The accept/reject decisions remain a valid training signal.
+* The overall learning loop remains **stable and aligned**.
 
+---
 
-```python
-## Vicuna-7B as an example
+## Mathematical Formulation
 
-## Vanilla decoding
-CUDA_VISIBLE_DEVICES=0 python -m evaluation.inference_baseline --model-path "/cache/CKPT/vicuna-7b-v1.3" --model-id "vicuna-7b-v1.3-vanilla-float16-temp-0.0" --bench-name "Kangaroo" --temperature 0.0 --dtype "float16"
+### Kangaroo: Inference-time Speculative Decoding
 
-## Kangaroo
-CUDA_VISIBLE_DEVICES=0 python -m evaluation.inference_kangaroo --adapter-path "/cache/CKPT/kangaroo-vicuna-7b-v1.3" --exitlayer 2 --model-path "/cache/CKPT/vicuna-7b-v1.3" --threshold 0.6 --steps 6 --model-id "vicuna-7b-v1.3-kangaroo-thres-0.6-steps-6-float16" --bench-name "Kangaroo" --dtype "float16"
-```
+Let \$h\_k\$ be the hidden state at layer \$k\$ of an LLM:
 
-To get the detailed speed information, run ``python evaluation/speed.py``.
+1. **Draft** logits:
 
-The corresponding huggingface ckpts of kangaroo can be downloaded at [Kangaroo Google Drive](https://drive.google.com/drive/folders/1_lSqhasWeIUyfCft50JtKuQ2-TWepm8p?usp=sharing).
-
-
-#### Citation
-
-```
-@article{liu2024kangaroo,
-  title={Kangaroo: Lossless Self-Speculative Decoding via Double Early Exiting},
-  author={Liu, Fangcheng and Tang, Yehui and Liu, Zhenhua and Ni, Yunsheng and Han, Kai and Wang, Yunhe},
-  journal={arXiv preprint arXiv:2404.18911},
-  year={2024}
-}
+```math
+z^{(D)} = W_{\text{out}}^{(S)} h_k + b^{(S)}
 ```
 
+where \$W\_{\text{out}}^{(S)}\$ are projection weights from shallow layers.
+
+2. Sample token \$t \sim \text{softmax}(z^{(D)})\$
+
+3. **Verifier** re-computes hidden state:
+
+```math
+h_L = f_{k \to L}(h_k)
+```
+
+Then computes:
+
+```math
+z^{(V)} = W_{\text{out}}^{(D)} h_L + b^{(D)}
+```
+
+4. If \$\arg\max(z^{(D)}) = \arg\max(z^{(V)})\$, token is accepted.
+   Otherwise, it is rejected and replaced.
+
+This is purely deterministic logic. No training occurs. The model generates faster, but does not improve.
+
+---
+
+### DVI: Draft → Verify → Improve (Online RL)
+
+#### Notation:
+
+* \$\pi\_\theta(t \mid h\_k)\$: Draft policy (parameterized by LoRA adapter \$\theta\$).
+* \$r\_t \in {0, 1}\$: Verifier accept signal (1 = accepted, 0 = rejected).
+* \$b\$: EMA baseline for variance reduction.
+
+#### Objective: REINFORCE
+
+The draft adapter is trained via:
+
+```math
+\mathcal{L}_{\text{draft}} = - (r_t - b) \log \pi_\theta(t \mid h_k)
+```
+
+* Tokens accepted by the verifier are treated as positive reinforcement.
+* This encourages the draft to mimic tokens likely to be accepted.
+
+#### Slow Update: Verifier Training
+
+We also train the verifier’s adapter (LoRA \$\phi\$) using supervised losses:
+
+```math
+\mathcal{L}_{\text{verifier}} = \underbrace{\mathcal{L}_{\text{CE}}(t, \pi_\phi)}_{\text{Supervised on GT token}} + \beta_{\text{KL}} \underbrace{D_{\text{KL}}(\pi_\phi \| \pi_{\phi_{\text{old}}})}_{\text{Conservative update}}
+```
+
+* \$\mathcal{L}\_{\text{CE}}\$: Cross-entropy loss using real token.
+* \$D\_{\text{KL}}\$: Ensures the verifier doesn’t change too rapidly.
 
 
-## Acknowledgements
 
-We acknowledge the authors of 
-
-* [Spec-Bench](https://github.com/hemingkx/Spec-Bench/tree/main) for the awesome benchmark.
-* [Medusa](https://github.com/FasterDecoding/Medusa#medusa-simple-framework-for-accelerating-llm-generation-with-multiple-decoding-heads) and [Eagle](https://github.com/SafeAILab/EAGLE?tab=readme-ov-file) for pioneer work.
-
-
-### License
-
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
