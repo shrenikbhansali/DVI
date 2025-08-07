@@ -107,7 +107,10 @@ class EarlyExitLlamaForCausalLM(LlamaForCausalLM):
 
         # verifier also returns pre‑head hidden for layer‑norm’d logits
         if in_features_large is not None:
-            return hidden, self.model.norm(hidden)
+            norm = self.model.norm(hidden)
+            if norm.dim() == 3 and norm.size(1) == 1:
+                norm = norm.squeeze(1)
+            return hidden, norm
         return hidden
 
     # ------------------------------------------------------------------ #
