@@ -39,6 +39,24 @@ DVI converts speculative decoding into an **online training signal**. It reuses 
 
 By doing this, DVI enables continual, self-supervised training from natural interaction (e.g., chatbot transcripts or streaming dialogue).
 
+### Bootstrap Challenge & Unified Loss (NEW)
+
+Starting from an un-trained draft head yields **near-zero acceptance** → no gradient.
+We therefore **bootstrap** with a *decaying* KL term:
+
+```math
+{\cal L}_{\text{total}}
+  = (1-\lambda_t)\,{\cal L}_{\text{RL}}
+  + \lambda_t\,D_{\text{KL}}\bigl(p_{\text{verify}}\;\|\;p_{\text{draft}}\bigr),
+\qquad
+\lambda_t = \exp(-t/\tau).
+```
+
+* Early: behaves like knowledge-distillation ⇒ dense signal.  
+* Late: pure REINFORCE ⇒ unbiased optimisation.
+
+This **unifies** distillation + RL into one objective and removes stage-wise complexity.
+
 ---
 
 ## Kangaroo vs. DVI
@@ -46,7 +64,7 @@ By doing this, DVI enables continual, self-supervised training from natural inte
 | Kangaroo (Inference-only)                        | DVI (Training-enabled)                                             |
 | ------------------------------------------------ | ------------------------------------------------------------------ |
 | Uses draft/verify split to accelerate generation | Uses same split, but converts accept/reject into a training signal |
-| Accept/reject signal is discarded                | Accept = reward 1, Reject = reward 0 → used in REINFORCE           |
+| Accept/reject signal is discarded                | Accept = reward 1, Reject = reward 0 → REINFORCE (+ KL warm-up λ_t)|
 | No learning from experience                      | Performs continual RL using on-device buffer                       |
 | Requires static, fixed model                     | Online learning; model adapts to new data                          |
 | Only improves runtime throughput                 | Improves both throughput **and** model quality over time           |
