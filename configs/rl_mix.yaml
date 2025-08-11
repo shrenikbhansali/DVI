@@ -1,0 +1,15 @@
+model_id: meta-llama/Llama-2-7b-hf
+early_layer: 2
+lr: 1e-4
+rollout_len: 4
+buffer_cap: 2048
+batch_size: 32
+clip: 1.0
+max_steps: 20000
+kl_lambda0: 1.0
+kl_tau: 5000
+kl_min: 0.0
+kl_schedule: exp
+kl_temperature: 1.0
+kl_dir: v2d
+no_rl: false

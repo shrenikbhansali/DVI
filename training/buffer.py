@@ -7,7 +7,11 @@ __all__ = ["ReplayBuffer"]
 
 
 class ReplayBuffer:
-    """Fixed-capacity token replay buffer stored on a single device."""
+    """Fixed-capacity token replay buffer stored on a single device.
+
+    Buffers are allocated on ``self.device``. Pass ``torch.device('cpu')``
+    during training to save VRAM.
+    """
 
     def __init__(self, capacity: int, device: torch.device):
         self.capacity = int(capacity)
@@ -15,9 +19,10 @@ class ReplayBuffer:
 
         # Storage buffers
         self._hidden_buf: Optional[torch.Tensor] = None
-        self._token_buf = torch.empty(self.capacity, dtype=torch.long, device=device)
-        self._reward_buf = torch.empty(self.capacity, dtype=torch.float32, device=device)
-        self._conf_buf = torch.empty(self.capacity, dtype=torch.float32, device=device)
+        self._token_buf = torch.empty(self.capacity, dtype=torch.long, device=self.device)
+        self._reward_buf = torch.empty(self.capacity, dtype=torch.float32, device=self.device)
+        self._conf_buf = torch.empty(self.capacity, dtype=torch.float32, device=self.device)
+        self._vlogits_buf: Optional[torch.Tensor] = None
 
         # Pointers
         self._write_idx = 0
@@ -30,6 +35,7 @@ class ReplayBuffer:
         token: int,
         reward: float,
         conf: float,
+        vlogits: Optional[torch.Tensor] = None,
     ) -> bool:
         """Append a transition and return ``True`` if an old slot was overwritten."""
         if self._hidden_buf is None:
@@ -46,6 +52,12 @@ class ReplayBuffer:
         self._token_buf[idx] = int(token)
         self._reward_buf[idx] = float(reward)
         self._conf_buf[idx] = float(conf)
+
+        if vlogits is not None:
+            if self._vlogits_buf is None:
+                shape = (self.capacity, vlogits.numel())
+                self._vlogits_buf = torch.empty(shape, dtype=vlogits.dtype, device=self.device)
+            self._vlogits_buf[idx].copy_(vlogits.detach().to(self.device).view(-1))
 
         self._write_idx = (idx + 1) % self.capacity
         if not drop:
@@ -71,12 +83,17 @@ class ReplayBuffer:
         choice = indices[perm]
         logging.debug("Sampling %d entries (accepted_only=%s)", batch_size, accepted_only)
 
-        return {
+        out = {
             "hidden": self._hidden_buf[choice].clone(),
             "token": self._token_buf[choice].clone(),
             "reward": self._reward_buf[choice].clone(),
             "conf": self._conf_buf[choice].clone(),
         }
+        if self._vlogits_buf is not None:
+            out["vlogits"] = self._vlogits_buf[choice].clone()
+        else:
+            out["vlogits"] = torch.empty((batch_size, 0), device=self.device)
+        return out
 
     @torch.no_grad()
     def accepted_count(self) -> int:

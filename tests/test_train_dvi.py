@@ -10,7 +10,12 @@ if __package__ is None:
     sys.path.append(str(pathlib.Path(__file__).resolve().parents[1]))
 
 from kangaroo.earlyexit import EarlyExitLlamaForCausalLM
-from train_dvi import prepare_model_for_training, reinforce_update, update_baseline
+from train_dvi import (
+    prepare_model_for_training,
+    reinforce_update,
+    update_baseline,
+    mixed_update,
+)
 from training.buffer import ReplayBuffer
 
 
@@ -68,12 +73,14 @@ def test_rollout_updates_params():
     ids = torch.randint(0, cfg.vocab_size, (1, 1))
     attempts = 0
     while buf.accepted_count() == 0 and attempts < 20:
+        vlogits = model.verifier_logits_for_next(ids[:, -1:])
         step = model.spec_decode_step(ids[:, -1:])
-        buf.append(step.hidden.clone(), int(step.token), float(step.accept), 0.0)
+        buf.append(step.hidden.clone(), int(step.token), float(step.accept), 0.0, vlogits=vlogits.squeeze(0))
         ids = torch.cat([ids, step.token], dim=-1)
         attempts += 1
     if buf.accepted_count() == 0:
-        buf.append(torch.zeros(1, 1, cfg.hidden_size), 0, 1.0, 0.0)
+        vlogits = torch.zeros(cfg.vocab_size)
+        buf.append(torch.zeros(1, 1, cfg.hidden_size), 0, 1.0, 0.0, vlogits=vlogits)
     batch = buf.sample(1, accepted_only=True)
     reinforce_update(model, opt, batch, baseline=0.0, clip=1.0)
     changed = any(not torch.equal(params_before[n], p) for n, p in model.named_parameters() if p.requires_grad)
@@ -95,7 +102,82 @@ def test_reinforce_update_finite():
         'token': torch.zeros(3, 1, dtype=torch.long),
         'reward': torch.ones(3),
         'conf': torch.zeros(3),
+        'vlogits': torch.randn(3, cfg.vocab_size),
     }
     loss, grad = reinforce_update(model, opt, batch, baseline=0.0, clip=1.0)
     assert math.isfinite(loss)
     assert math.isfinite(grad)
+
+
+def test_buffer_carries_vlogits():
+    model, cfg = make_model()
+    buf = ReplayBuffer(8, torch.device('cpu'))
+    ids = torch.randint(0, cfg.vocab_size, (1, 1))
+    vlogits = model.verifier_logits_for_next(ids[:, -1:])
+    step = model.spec_decode_step(ids[:, -1:])
+    buf.append(step.hidden.squeeze(0), int(step.token), float(step.accept), 0.0, vlogits=vlogits.squeeze(0))
+    sample = buf.sample(1, accepted_only=False)
+    assert 'vlogits' in sample
+    assert sample['vlogits'].shape == (1, cfg.vocab_size)
+
+
+def test_mixed_update_kl_only():
+    model, cfg = make_model()
+    opt = torch.optim.Adam([p for p in model.parameters() if p.requires_grad], lr=0.01)
+    params_before = {n: p.detach().clone() for n, p in model.named_parameters()}
+    batch = {
+        'hidden': torch.randn(3, 1, cfg.hidden_size),
+        'token': torch.zeros(3, 1, dtype=torch.long),
+        'reward': torch.ones(3),
+        'conf': torch.zeros(3),
+        'vlogits': torch.randn(3, cfg.vocab_size),
+    }
+    mixed_update(model, opt, batch, baseline=0.0, clip=1.0, kl_lambda=1.0, use_rl=False)
+    changed = any(not torch.equal(params_before[n], p) for n, p in model.named_parameters() if p.requires_grad)
+    assert changed
+    for n, p in model.named_parameters():
+        if n.startswith('lora_D') or n == 'lm_head.weight':
+            assert torch.equal(params_before[n], p)
+
+
+def test_mixed_update_rl_only():
+    model1, cfg = make_model()
+    model2, _ = make_model()
+    model2.load_state_dict(model1.state_dict())
+    opt1 = torch.optim.Adam([p for p in model1.parameters() if p.requires_grad], lr=0.01)
+    opt2 = torch.optim.Adam([p for p in model2.parameters() if p.requires_grad], lr=0.01)
+    batch = {
+        'hidden': torch.randn(3, 1, cfg.hidden_size),
+        'token': torch.zeros(3, 1, dtype=torch.long),
+        'reward': torch.ones(3),
+        'conf': torch.zeros(3),
+        'vlogits': torch.randn(3, cfg.vocab_size),
+    }
+    loss_ref, _ = reinforce_update(model1, opt1, batch, baseline=0.0, clip=1.0)
+    params_before = {n: p.detach().clone() for n, p in model2.named_parameters() if p.requires_grad}
+    loss, gnorm, rl_loss, kl = mixed_update(model2, opt2, batch, baseline=0.0, clip=1.0, kl_lambda=0.0, use_rl=True)
+    assert math.isfinite(loss) and math.isfinite(gnorm)
+    assert math.isfinite(kl)
+    assert rl_loss == pytest.approx(loss_ref, rel=1e-5)
+    changed = any(not torch.equal(params_before[n], p) for n, p in model2.named_parameters() if p.requires_grad)
+    assert changed
+
+
+def test_verifier_accessor_preserves_state():
+    model1, cfg = make_model()
+    model2, _ = make_model()
+    model2.load_state_dict(model1.state_dict())
+
+    ids = torch.randint(0, cfg.vocab_size, (1, 1))
+
+    # Call accessor (twice for paranoia) and then decode
+    _ = model1.verifier_logits_for_next(ids[:, -1:])
+    _ = model1.verifier_logits_for_next(ids[:, -1:])
+    step_a = model1.spec_decode_step(ids[:, -1:])
+    token_a = step_a.token.clone()
+
+    # Decode without using accessor
+    step_b = model2.spec_decode_step(ids[:, -1:])
+    token_b = step_b.token.clone()
+
+    assert torch.equal(token_a, token_b), "verifier accessor changed next token!"
