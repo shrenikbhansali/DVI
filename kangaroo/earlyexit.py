@@ -12,6 +12,7 @@ class SpecStep(NamedTuple):
     logits: torch.Tensor   # (B, |V|)   fp32  CPU
     accept: torch.Tensor   # (B, 1)     uint8 CPU
     token:  torch.Tensor   # (B, 1)     int64 CPU
+    conf:   torch.Tensor
 
 
 class EarlyExitLlamaForCausalLM(LlamaForCausalLM):
@@ -192,4 +193,5 @@ class EarlyExitLlamaForCausalLM(LlamaForCausalLM):
             draft_logits.detach().cpu().clone().float(),  # (B,V)
             accept.detach().cpu().clone(),                # (B,1)
             token.detach().cpu().clone(),                 # (B,1)
+            conf.detach().cpu().clone().float(),
         )

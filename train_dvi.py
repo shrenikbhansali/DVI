@@ -22,6 +22,7 @@ from kangaroo.earlyexit import EarlyExitLlamaForCausalLM
 from kangaroo.sgp_lora import inject_dual_lora, enable_lora_grads
 from training.buffer import ReplayBuffer
 from training.kl_mix import exp_decay_lambda, cosine_decay_lambda
+import torch.nn.functional as F
 
 
 # ------------------------------------------------------------------
@@ -108,28 +109,26 @@ def mixed_update(model, opt, batch, baseline: float, clip: float,
                  kl_lambda: float, kl_dir: str = "v2d",
                  kl_temperature: float = 1.0, use_rl: bool = True):
     dev = next(model.parameters()).device
+
+    # --- Cast to float32 for numerics ---
     hidden = batch["hidden"].to(dev)
     if hidden.dim() == 3:
         hidden = hidden.squeeze(1)
-    logits_d = model.exit_proj(hidden)
-    logp_d = torch.log_softmax(logits_d, dim=-1)
+    logits_d = model.exit_proj(hidden).float()               # float32
+    logp_d   = torch.log_softmax(logits_d, dim=-1)          # float32
 
-    tokens = batch["token"].to(dev)
+    tokens  = batch["token"].to(dev)
     if tokens.dim() == 1:
         tokens = tokens.unsqueeze(1)
+
     rewards = batch["reward"].to(dev)
 
-    if kl_dir not in ("v2d", "d2v"):
-        raise ValueError(f"Unsupported kl_dir={kl_dir}; expected 'v2d' or 'd2v'.")
-
-    # --- SAL safety checks ---
+    # --- SAL safety checks + float32 target logits ---
     if "vlogits" not in batch:
         raise ValueError("SAL requires 'vlogits' in batch; missing.")
-    logits_v = batch["vlogits"].to(dev)
-    if logits_v.ndim != 2:
-        raise ValueError(f"Expected vlogits to be 2D (B, |V|); got shape {tuple(logits_v.shape)}")
+    logits_v = batch["vlogits"].to(dev).float()              # float32
     vocab_size = model.lm_head.weight.shape[0]
-    if logits_v.shape[0] != hidden.shape[0] or logits_v.shape[1] != vocab_size:
+    if logits_v.ndim != 2 or logits_v.shape[1] != vocab_size or logits_v.shape[0] != hidden.shape[0]:
         raise ValueError(
             f"SAL vlogits shape mismatch; expected (B={hidden.shape[0]}, |V|={vocab_size}), "
             f"got {tuple(logits_v.shape)}"
@@ -137,25 +136,52 @@ def mixed_update(model, opt, batch, baseline: float, clip: float,
 
     if kl_temperature != 1.0:
         logits_v = logits_v / kl_temperature
-    logp_v = torch.log_softmax(logits_v, dim=-1).detach()
-    p_v = logp_v.exp()
+    logp_v = torch.log_softmax(logits_v, dim=-1)            # float32
+
+    # --- Stable KL using F.kl_div ---
+    # v2d: KL(Pv || Pd)  = sum Pv * (log Pv - log Pd)
+    # d2v: KL(Pd || Pv)  = sum Pd * (log Pd - log Pv)
+    with torch.no_grad():
+        p_v = logp_v.exp()
+        p_d = logp_d.exp()
 
     if kl_dir == "v2d":
-        kl = (p_v * (logp_v - logp_d)).sum(dim=-1).mean()
+        kl_elem = F.kl_div(input=logp_d, target=p_v, log_target=False, reduction='none').sum(dim=-1)
+    elif kl_dir == "d2v":
+        kl_elem = F.kl_div(input=logp_v, target=p_d, log_target=False, reduction='none').sum(dim=-1)
     else:
-        p_d = logp_d.exp()
-        kl = (p_d * (logp_d - logp_v)).sum(dim=-1).mean()
+        raise ValueError(f"Unsupported kl_dir={kl_dir}; expected 'v2d' or 'd2v'.")
 
+    kl = kl_elem.mean()
+
+    # --- RL on accepted tokens only (more stable), keep KL on full batch ---
     rl_loss = torch.zeros([], device=dev)
     if use_rl:
-        log_pi = logp_d.gather(1, tokens)[:, 0]
-        rl_loss = -((rewards - baseline) * log_pi).mean()
+        with torch.no_grad():
+            acc_mask = (rewards == 1.0)
+        if acc_mask.any():
+            log_pi_sel = logp_d.gather(1, tokens)[:, 0][acc_mask]
+            rewards_sel = rewards[acc_mask]
+            rl_loss = -((rewards_sel - baseline) * log_pi_sel).mean()
+        else:
+            rl_loss = torch.zeros([], device=dev)
 
     loss = (1.0 - kl_lambda) * rl_loss + kl_lambda * kl
 
+    # --- Guard against NaNs/Infs ---
+    if not torch.isfinite(loss):
+        opt.zero_grad(set_to_none=True)
+        return float('nan'), float('nan'), float(rl_loss), float(kl)
+
     loss.backward()
+
     grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
-    opt.step(); opt.zero_grad()
+    if not torch.isfinite(grad_norm):
+        opt.zero_grad(set_to_none=True)
+        return float(loss.item()), float('nan'), float(rl_loss), float(kl)
+
+    opt.step()
+    opt.zero_grad(set_to_none=True)
     return float(loss.item()), float(grad_norm), float(rl_loss), float(kl)
 
 
@@ -195,10 +221,10 @@ def train_loop(args):
 
             token_cuda = step.token.to(dev)        # 🟢 keep on same device
             buffer.append(
-                step.hidden.squeeze(0),
-                int(step.token.squeeze().item()),
-                float(step.accept.squeeze().item()),
-                conf=0.0,
+                hidden=step.hidden.squeeze(0),
+                token=int(step.token.squeeze().item()),
+                reward=float(step.accept.squeeze().item()),
+                conf=float(step.conf.squeeze().item()),
                 vlogits=vlogits.squeeze(0).detach().cpu(),
             )
             ids = torch.cat([ids, token_cuda], dim=-1)
