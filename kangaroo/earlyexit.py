@@ -12,6 +12,7 @@ class SpecStep(NamedTuple):
     logits: torch.Tensor   # (B, |V|)   fp32  CPU
     accept: torch.Tensor   # (B, 1)     uint8 CPU
     token:  torch.Tensor   # (B, 1)     int64 CPU
+    conf:   torch.Tensor
 
 
 class EarlyExitLlamaForCausalLM(LlamaForCausalLM):
@@ -113,6 +114,42 @@ class EarlyExitLlamaForCausalLM(LlamaForCausalLM):
             return hidden, norm
         return hidden
 
+    @torch.no_grad()
+    def verifier_logits_for_next(
+        self,
+        in_tokens: torch.LongTensor,
+        position_ids: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Return verifier-path logits for the next token given ``in_tokens``.
+
+        This helper runs a forward pass through both the draft and verifier
+        stacks without leaving gradients and restores the KV-cache afterwards
+        so that it has no side-effects on subsequent decoding steps.
+        """
+
+        # Backup KV cache to avoid mutating model state
+        pkv_backup = None
+        if self.past_key_values is not None:
+            pkv_backup = [
+                None if pkv is None else tuple(p.clone() for p in pkv)
+                for pkv in self.past_key_values
+            ]
+
+        draft_hidden = self.forward_draft_or_large_model(
+            in_tokens_small=in_tokens, position_ids=position_ids
+        )
+        _, norm = self.forward_draft_or_large_model(
+            in_features_large=draft_hidden, position_ids=position_ids
+        )
+        if norm.dim() == 3 and norm.size(1) == 1:
+            norm = norm.squeeze(1)
+        logits = self.lm_head(norm)
+
+        if pkv_backup is not None:
+            self.past_key_values = pkv_backup
+
+        return logits
+
     # ------------------------------------------------------------------ #
     # ONE SPECULATIVE MICRO‑STEP                                         #
     # ------------------------------------------------------------------ #
@@ -156,4 +193,5 @@ class EarlyExitLlamaForCausalLM(LlamaForCausalLM):
             draft_logits.detach().cpu().clone().float(),  # (B,V)
             accept.detach().cpu().clone(),                # (B,1)
             token.detach().cpu().clone(),                 # (B,1)
+            conf.detach().cpu().clone().float(),
         )
