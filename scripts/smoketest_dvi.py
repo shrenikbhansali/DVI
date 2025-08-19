@@ -8,6 +8,12 @@
 #   - Policy gradient uses log-prob (-E[log π_s(v)]) for stronger early gradients
 #   - Sharper teacher by default (T=1.0) and stronger CE during warm-up
 #   - Optimizer includes new pre-norm & scale params
+#   - **FIX** tok/s measurement: CUDA synchronize + count actual collected tokens
+#   - **NEW** KV cache size reporting each step (bytes/MB + estimated seq_len)
+#   - **NEW** Weights & Biases tracking (entity/project defaults set)
+#   - **NO-CACHE PROBE (HARD)**: probe snapshots & restores all known KV holders so nothing persists
+#   - **RATE-LIMIT** KV mutation warnings (avoid spam)
+#   - **W&B STEP** Always log with explicit step to keep steps monotonic.
 
 import os
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
@@ -21,10 +27,19 @@ import torch.nn.functional as F
 from datasets import load_dataset
 from transformers import AutoTokenizer, __version__ as transformers_ver
 
+# W&B (optional)
+try:
+    import wandb as _wandb
+except Exception:
+    _wandb = None
+
 # repo-local
 from kangaroo.earlyexit import EarlyExitLlamaForCausalLM
 from kangaroo.sgp_lora import inject_dual_lora, enable_lora_grads
 from training.buffer import ReplayBuffer
+
+WANDB_DEFAULT_ENTITY  = "sbhansali8-georgia-institute-of-technology"
+WANDB_DEFAULT_PROJECT = "DVI-Testing"
 
 # ----------------------- utils -----------------------
 
@@ -87,28 +102,180 @@ def free_cuda(note=""):
     gc.collect()
     if note: print(f"[mem] cleared caches {note}", flush=True)
 
+def _cuda_sync():
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+def _human_bytes(n: int) -> str:
+    if n is None: return "0 B"
+    units = ["B","KB","MB","GB","TB"]
+    i = 0
+    x = float(n)
+    while x >= 1024 and i < len(units)-1:
+        x /= 1024.0; i += 1
+    return f"{x:.2f} {units[i]}"
+
 # -------------------- KV helpers --------------------
+
+def _kv_snapshot(spec):
+    """
+    Snapshot references (not clones) of all likely KV attributes so we can
+    restore them exactly even if the underlying forward replaces them.
+    """
+    slots = []
+    for base_name, obj in (("spec", spec), ("model", getattr(spec, "model", None))):
+        if obj is None: continue
+        for attr in ("past_key_values", "_past_key_values"):
+            if hasattr(obj, attr):
+                slots.append((obj, attr, getattr(obj, attr, None)))
+    return slots
+
+def _kv_restore(slots):
+    for obj, attr, val in slots:
+        try:
+            setattr(obj, attr, val)
+        except Exception:
+            pass
+
+def _first_nonempty_pkv(spec: EarlyExitLlamaForCausalLM):
+    """
+    Look across common KV holders.
+    """
+    for obj in (spec, getattr(spec, "model", None)):
+        if obj is None: continue
+        for name in ("past_key_values", "_past_key_values"):
+            if hasattr(obj, name):
+                pkv = getattr(obj, name)
+                if pkv:  # non-empty container
+                    return pkv
+    return None
+
+def estimate_kv_cache(spec: EarlyExitLlamaForCausalLM) -> Tuple[int, int]:
+    """
+    Estimate current KV cache size in bytes and approximate seq_len.
+    """
+    pkv = _first_nonempty_pkv(spec)
+    if not pkv:
+        return 0, 0
+    total_bytes = 0
+    est_seq_len = 0
+    try:
+        for layer in pkv:
+            for t in layer:
+                if isinstance(t, torch.Tensor):
+                    total_bytes += t.element_size() * t.nelement()
+                    if t.ndim >= 2:
+                        est_seq_len = max(est_seq_len, int(t.shape[-2]))
+    except Exception:
+        pass
+    return int(total_bytes), int(est_seq_len)
+
+def clear_all_kv(spec, verbose: bool = False, tag: str = ""):
+    """
+    Wipes *all* likely KV holders (spec & spec.model, both names).
+    """
+    touched = []
+    for obj in (spec, getattr(spec, "model", None)):
+        if obj is None: continue
+        for name in ("past_key_values", "_past_key_values"):
+            if hasattr(obj, name):
+                try:
+                    setattr(obj, name, None)
+                    touched.append(f"{obj.__class__.__name__}.{name}")
+                except Exception:
+                    pass
+    if verbose:
+        print(f"[kv-clear]{(' '+tag) if tag else ''} -> {', '.join(touched) if touched else 'none'}", flush=True)
+
+# -------------------- draft path helpers --------------------
 
 @torch.inference_mode()
 def prime_kv_full(spec: EarlyExitLlamaForCausalLM, input_ids: torch.Tensor):
-    spec.past_key_values = None
+    # fresh KV for both drafter & verifier paths
+    clear_all_kv(spec)
     h = spec.forward_draft_or_large_model(in_tokens_small=input_ids)
     _ , _ = spec.forward_draft_or_large_model(in_features_large=h)
 
 @torch.inference_mode()
 def advance_kv_with_committed(spec: EarlyExitLlamaForCausalLM, token_ids: torch.Tensor):
+    # commit the teacher token into KV (this path SHOULD use cache)
     h = spec.forward_draft_or_large_model(in_tokens_small=token_ids)
     _ , _ = spec.forward_draft_or_large_model(in_features_large=h)
 
 def _top1(logits: torch.Tensor) -> int:
     return int(torch.argmax(logits, dim=-1, keepdim=True)[0,0].item())
 
+# -------------------- strictly side-effect free drafter probe --------------------
+
+@torch.inference_mode()
+def drafter_hidden_no_cache(spec: EarlyExitLlamaForCausalLM, ids_last: torch.Tensor) -> torch.Tensor:
+    """
+    Compute drafter hidden for next token WITHOUT persisting any KV changes.
+    Strategy:
+      1) Snapshot all known KV holders.
+      2) Try to call with use_cache=False.
+      3) If unsupported, temporarily toggle config.use_cache=False.
+      4) ALWAYS restore the exact KV objects we snapshotted in (1).
+    Returns [B,1,H] hidden.
+    """
+    slots = _kv_snapshot(spec)
+
+    # First try: pass the flag down if the wrapper supports it
+    try:
+        out = spec.forward_draft_or_large_model(in_tokens_small=ids_last, use_cache=False)
+        return out
+    except TypeError:
+        pass
+    except Exception:
+        pass
+    finally:
+        # If forward wrote anything, this puts it back immediately.
+        _kv_restore(slots)
+
+    # Fallback: temporarily disable model-level use_cache
+    toggled = []
+    def _toggle(obj):
+        if obj is not None and hasattr(obj, "config") and hasattr(obj.config, "use_cache"):
+            toggled.append((obj, obj.config.use_cache))
+            obj.config.use_cache = False
+    _toggle(spec)
+    _toggle(getattr(spec, "model", None))
+    try:
+        out = spec.forward_draft_or_large_model(in_tokens_small=ids_last)
+    finally:
+        for obj, prev in toggled:
+            try: obj.config.use_cache = prev
+            except Exception: pass
+        _kv_restore(slots)
+    return out
+
+# -------------------- exit logits helper --------------------
+
+def model_exit_logits(spec: EarlyExitLlamaForCausalLM, h: Optional[torch.Tensor] = None,
+                      logits_in: Optional[torch.Tensor] = None, preproj_h: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """
+    Apply pre-norm + exit head with optional global scale.
+    """
+    assert (h is not None) ^ (preproj_h is not None), "Provide either h or preproj_h"
+    x = h.float() if preproj_h is None else preproj_h.float()
+    if preproj_h is None and hasattr(spec, "exit_pre_norm") and spec.exit_pre_norm is not None:
+        x = spec.exit_pre_norm(x)
+    out = spec.exit_proj(x)
+    if hasattr(spec, "exit_logit_scale"):
+        out = spec.exit_logit_scale * out
+    return out
+
 # -------------------- evaluation (acceptance metric) --------------------
+
+_KV_WARN_COUNT = 0
+_KV_WARN_LIMIT = 8
 
 @torch.inference_mode()
 def eval_acceptance(spec: EarlyExitLlamaForCausalLM, tok: AutoTokenizer, prompts: List[str],
                     rollout_len: int, steps_per_prompt: int = 1,
-                    dump_debug: bool = False, dump_path: Optional[str] = None, topk: int = 5) -> Tuple[float, Dict[int,float]]:
+                    dump_debug: bool = False, dump_path: Optional[str] = None, topk: int = 5,
+                    quiet: bool = False) -> Tuple[float, Dict[int,float]]:
+    global _KV_WARN_COUNT
     spec.eval()
     dev = next(spec.parameters()).device
     accepts = []
@@ -121,20 +288,23 @@ def eval_acceptance(spec: EarlyExitLlamaForCausalLM, tok: AutoTokenizer, prompts
             v_logits = spec.verifier_logits_for_next(ids_last)
             if not torch.isfinite(v_logits).all():
                 accepts.append(0); break
-            v_top1   = _top1(v_logits)
+            v_top1 = _top1(v_logits)
 
-            # side-effect-free probe of drafter
-            pkv_backup = [None if pkv is None else tuple(t.clone() for t in pkv)
-                          for pkv in (spec.past_key_values or [])]
-            d_hidden   = spec.forward_draft_or_large_model(in_tokens_small=ids_last)  # [B,1,H]
-            # --- patched: pre-norm + scale before exit head ---
+            # Take KV measurement, probe (side-effect free), measure again
+            kv_bytes_b, kv_seq_b = estimate_kv_cache(spec)
+            d_hidden = drafter_hidden_no_cache(spec, ids_last)  # [B,1,H], restores KV inside
+            kv_bytes_a, kv_seq_a = estimate_kv_cache(spec)
+            if (kv_bytes_b != kv_bytes_a or kv_seq_b != kv_seq_a) and _KV_WARN_COUNT < _KV_WARN_LIMIT:
+                print("[kv] WARNING: probe seems to have mutated past_key_values during eval.", flush=True)
+                _KV_WARN_COUNT += 1
+
+            # exit logits
             h = d_hidden.squeeze(1).float()
             if hasattr(spec, "exit_pre_norm") and spec.exit_pre_norm is not None:
                 h = spec.exit_pre_norm(h)
             d_logits = spec.exit_proj(h)
             if hasattr(spec, "exit_logit_scale"):
                 d_logits = spec.exit_logit_scale * d_logits
-            # ---------------------------------------------------
 
             if not torch.isfinite(d_logits).all():
                 accepts.append(0)
@@ -157,10 +327,17 @@ def eval_acceptance(spec: EarlyExitLlamaForCausalLM, tok: AutoTokenizer, prompts
                 except Exception:
                     pass
 
-            spec.past_key_values = pkv_backup
+            # commit verifier token (this updates/cache as intended)
             v_token = torch.tensor([[v_top1]], device=ids_last.device, dtype=ids_last.dtype)
             advance_kv_with_committed(spec, v_token)
             ids_last = v_token
+
+        # end-of-prompt cleanup: drop KV & clear caches
+        clear_all_kv(spec)
+        if not quiet:
+            free_cuda("(eval prompt done)")
+        else:
+            free_cuda("")
 
     acc = sum(accepts)/max(1, len(accepts))
     c = {w: ctar(accepts, w) for w in (1,2,3,4)}
@@ -191,8 +368,7 @@ def prepare_dvi_trainable(model_id: str, early_layer: int, dtype=torch.float16):
     model.exit_proj.weight.data.copy_(w)
     model.exit_proj.weight.requires_grad = True
 
-    # --- patched: add pre-norm + learnable global logit scale ---
-    # Try to clone the model's final RMSNorm if available; otherwise fallback to LayerNorm
+    # add pre-norm + learnable global logit scale
     try:
         base_norm = model.model.norm  # Llama final RMSNorm
         model.exit_pre_norm = copy.deepcopy(base_norm).to(w.device)
@@ -202,7 +378,6 @@ def prepare_dvi_trainable(model_id: str, early_layer: int, dtype=torch.float16):
         p.requires_grad = True
 
     model.exit_logit_scale = nn.Parameter(torch.tensor(1.0, device=w.device))
-    # -------------------------------------------------------------
 
     model.lm_head.weight.requires_grad = False
     if hasattr(model, "head_model"):
@@ -254,7 +429,7 @@ def one_mixed_step(model, opt, batch,
                    init_fro: float = None, max_fro: float = 0.0, max_fro_ratio: float = 0.0):
     """
     Mixed objective:
-      - RL surrogate: maximize E[log π_s(v)]  => loss_pg = -E[log π_s(v)]   (patched)
+      - RL surrogate: maximize E[log π_s(v)]  => loss_pg = -E[log π_s(v)]
       - KL(teacher -> student) with softened teacher
       - CE: anchor on teacher top-1 (stabilizer)
       - ENT: optional entropy bonus (maximize entropy)
@@ -264,21 +439,20 @@ def one_mixed_step(model, opt, batch,
     vlogits = batch["vlogits"].to(dev)         # [B, V] (fp16 ok)
     tokens  = batch["token"].to(dev).view(-1)  # [B]
 
-    # --- patched: pre-norm + scale ---
+    # pre-norm + scale
     h = hidden.float()
     if hasattr(model, "exit_pre_norm") and model.exit_pre_norm is not None:
         h = model.exit_pre_norm(h)
     slogits = model.exit_proj(h)               # [B, V] fp32
     if hasattr(model, "exit_logit_scale"):
         slogits = model.exit_logit_scale * slogits
-    # ---------------------------------
 
     slogp   = F.log_softmax(slogits, dim=-1)
     sp      = slogp.exp()
 
     # RL (expected acceptance, log-prob surrogate)
     pi_v = sp.gather(1, tokens.view(-1,1)).squeeze(1)  # [B]
-    loss_pg = -torch.log(pi_v.clamp_min(1e-8)).mean()  # patched
+    loss_pg = -torch.log(pi_v.clamp_min(1e-8)).mean()
 
     # KL (teacher -> student)
     tlogits = vlogits.float() / float(temperature)
@@ -326,40 +500,42 @@ def one_mixed_step(model, opt, batch,
 @torch.inference_mode()
 def rollout_collect(spec: EarlyExitLlamaForCausalLM, tok: AutoTokenizer, prompt: str,
                     buf: ReplayBuffer, steps: int,
-                    debug_out: Optional[List[Dict]] = None, topk: int = 5):
+                    debug_out: Optional[List[Dict]] = None, topk: int = 5) -> int:
+    """
+    Collect up to `steps` tokens; returns the actual number collected.
+    """
     spec.eval()
     dev = next(spec.parameters()).device
     enc = tok(prompt, return_tensors="pt").to(dev)
     prime_kv_full(spec, enc["input_ids"])
     last = enc["input_ids"][:, -1:]
 
+    n_collected = 0
     for _ in range(steps):
         v_logits = spec.verifier_logits_for_next(last)
         if not torch.isfinite(v_logits).all():
             break
         v_top1   = _top1(v_logits)
 
-        # probe drafter without state mutation
-        pkv_backup = [None if pkv is None else tuple(t.clone() for t in pkv)
-                      for pkv in (spec.past_key_values or [])]
-        d_hidden   = spec.forward_draft_or_large_model(in_tokens_small=last)      # [B,1,H]
-        # --- patched: pre-norm + scale ---
+        # --- probe drafter WITHOUT persisting KV changes ---
+        d_hidden   = drafter_hidden_no_cache(spec, last)      # [B,1,H]
+        # pre-norm + scale
         h = d_hidden.squeeze(1).float()
         if hasattr(spec, "exit_pre_norm") and spec.exit_pre_norm is not None:
             h = spec.exit_pre_norm(h)
-        d_logits   = spec.exit_proj(h)                                            # [B,V]
+        d_logits   = spec.exit_proj(h)                        # [B,V]
         if hasattr(spec, "exit_logit_scale"):
             d_logits = spec.exit_logit_scale * d_logits
-        # ----------------------------------
+
         d_top1     = _top1(d_logits) if torch.isfinite(d_logits).all() else -1
         accept_bit = int(d_top1 == v_top1)
 
         buf.append(
-            hidden=d_hidden.squeeze(0).squeeze(0).cpu(),  # [H] (pre-norm is applied in training step)
+            hidden=d_hidden.squeeze(0).squeeze(0).cpu(),  # [H]
             token=int(v_top1),                             # teacher top-1 id
-            reward=float(accept_bit),                     # acceptance bit (metric)
+            reward=float(accept_bit),                     # acceptance bit
             conf=0.0,
-            vlogits=v_logits.squeeze(0).cpu(),            # teacher logits (for KL)
+            vlogits=v_logits.squeeze(0).cpu(),            # teacher logits
         )
 
         if debug_out is not None:
@@ -376,10 +552,13 @@ def rollout_collect(spec: EarlyExitLlamaForCausalLM, tok: AutoTokenizer, prompt:
             except Exception:
                 pass
 
-        spec.past_key_values = pkv_backup
+        # commit verifier token into KV for next step
         v_token = torch.tensor([[v_top1]], device=last.device, dtype=last.dtype)
         advance_kv_with_committed(spec, v_token)
         last = v_token
+        n_collected += 1
+
+    return n_collected
 
 def buf_debug(buf: ReplayBuffer, k: int = 16):
     size = len(buf)
@@ -414,6 +593,57 @@ def phase_of_step(step, warmup_kl, ramp):
     else:
         return "RL"
 
+# --- W&B helpers -------------------------------------------------
+
+def init_wandb(args) -> Optional[object]:
+    if args.no_wandb:
+        print("[wandb] disabled via --no-wandb", flush=True)
+        return None
+    if _wandb is None:
+        print("[wandb] package not available; continuing without W&B logging.", flush=True)
+        return None
+
+    entity  = args.wandb_entity or WANDB_DEFAULT_ENTITY
+    project = args.wandb_project or WANDB_DEFAULT_PROJECT
+    name    = args.run_name or f"{os.path.basename(args.model_id)}-L{args.early_layer}-seed{args.seed}-{int(time.time())}"
+
+    try:
+        run = _wandb.init(
+            entity=entity,
+            project=project,
+            name=name,
+            config=vars(args),
+            settings=_wandb.Settings(start_method="thread"),
+        )
+        print(f"[wandb] initialized: entity={entity} project={project} name={name}", flush=True)
+        return run
+    except Exception as e:
+        print(f"[wandb] init failed: {e}; continuing without W&B.", flush=True)
+        return None
+
+def wandb_watch_model(model, log_freq: int = 25):
+    """Call this AFTER the model is constructed to watch gradients/params."""
+    if _wandb is None or _wandb.run is None:
+        return
+    try:
+        _wandb.watch(model, log="gradients", log_freq=log_freq, log_graph=False)
+    except TypeError:
+        try:
+            _wandb.run.watch(model, log="gradients", log_freq=log_freq, log_graph=False)
+        except Exception as e:
+            print(f"[wandb] watch skipped: {e}", flush=True)
+    except Exception as e:
+        print(f"[wandb] watch skipped: {e}", flush=True)
+
+def wandb_log(d: Dict, step: Optional[int] = None):
+    if _wandb is None or _wandb.run is None:
+        return
+    try:
+        _wandb.log(d, step=step)
+    except Exception:
+        pass
+# ----------------------------------------------------------------
+
 # -------------------- training loop --------------------
 
 def train_bestcase_kl_rl(model, tok, prompts_train, prompts_eval,
@@ -424,7 +654,8 @@ def train_bestcase_kl_rl(model, tok, prompts_train, prompts_eval,
                          kl_min: float, pg_max: float, ent_weight: float,
                          outdir: str, accepted_only_flag: bool,
                          debug_dump_every: int, debug_topk: int,
-                         max_fro: float, max_fro_ratio: float):
+                         max_fro: float, max_fro_ratio: float,
+                         quiet_eval: bool):
 
     metrics_path = os.path.join(outdir, "logs", "train_metrics.jsonl")
     samples_path = os.path.join(outdir, "logs", "rollout_samples.jsonl")
@@ -439,25 +670,49 @@ def train_bestcase_kl_rl(model, tok, prompts_train, prompts_eval,
         lm_norm  = float(torch.linalg.vector_norm(model.lm_head.weight).item())
     print(f"[sanity] head norms: ||lm||={lm_norm:.3f} ||exit||={init_fro:.3f}", flush=True)
 
+    # W&B initial log (explicit step=0)
+    wandb_log({"sanity/lm_head_norm": lm_norm, "sanity/exit_head_norm": init_fro}, step=0)
+
     print("\n[e2e] measuring acceptance (pre-train)…", flush=True)
     free_cuda("(pre-eval)")
     acc0, ctar0 = eval_acceptance(
         model, tok, prompts_eval, rollout_len, steps_per_prompt=1,
-        dump_debug=True, dump_path=samples_path, topk=debug_topk
+        dump_debug=True, dump_path=samples_path, topk=debug_topk, quiet=quiet_eval
     )
     print(f"[e2e] PRE  | acc={acc0:.3f} | CTAR1={ctar0[1]:.3f} CTAR2={ctar0[2]:.3f} CTAR3={ctar0[3]:.3f} CTAR4={ctar0[4]:.3f}", flush=True)
+    wandb_log({"eval/pre/acc": acc0,
+               "eval/pre/ctar1": ctar0[1], "eval/pre/ctar2": ctar0[2],
+               "eval/pre/ctar3": ctar0[3], "eval/pre/ctar4": ctar0[4]}, step=0)
 
     ptr = 0
+    tokens_total = 0
+    ema_tok_s = None
+
     for g in range(steps):
         model.eval()  # rollout in eval mode
         p = prompts_train[ptr % len(prompts_train)]; ptr += 1
 
-        # --- data collection timing for tok/s
-        t_roll_s = time.time()
+        # Accurate tok/s: synchronize + count actual collected tokens
         dbg_roll = [] if (debug_dump_every and (g % debug_dump_every == 0)) else None
-        rollout_collect(model, tok, p, buf, steps=rollout_len, debug_out=dbg_roll, topk=debug_topk)
-        t_roll_e = time.time()
-        tok_s = float(rollout_len) / max(1e-6, (t_roll_e - t_roll_s))
+        _cuda_sync()
+        t_roll_s = time.perf_counter()
+        n_collected = rollout_collect(model, tok, p, buf, steps=rollout_len, debug_out=dbg_roll, topk=debug_topk)
+        _cuda_sync()
+        t_roll_e = time.perf_counter()
+        elapsed = max(1e-6, (t_roll_e - t_roll_s))
+        tok_s = float(n_collected) / elapsed
+        tokens_total += n_collected
+        ema_tok_s = tok_s if ema_tok_s is None else (0.9*ema_tok_s + 0.1*tok_s)
+
+        # KV cache & GPU memory stats (post-rollout; KV holds last state)
+        kv_bytes, kv_seq = estimate_kv_cache(model)
+        kv_mb = kv_bytes / (1024**2)
+        if torch.cuda.is_available():
+            mem_alloc = torch.cuda.memory_allocated() / (1024**2)
+            mem_reserved = torch.cuda.memory_reserved() / (1024**2)
+            mem_max = torch.cuda.max_memory_allocated() / (1024**2)
+        else:
+            mem_alloc = mem_reserved = mem_max = 0.0
 
         if g % 10 == 0:
             buf_debug(buf, k=16)
@@ -465,7 +720,13 @@ def train_bestcase_kl_rl(model, tok, prompts_train, prompts_eval,
         # wait for enough data
         if len(buf) < batch_size:
             print(f"[train] step {g:04d} | {phase_of_step(g, warmup_kl, ramp_steps):>10} | "
-                  f"buf={len(buf)}/{batch_size} | tok/s≈{tok_s:.2f} | waiting for batch…", flush=True)
+                  f"buf={len(buf)}/{batch_size} | tok/s={tok_s:.2f} (EMA {ema_tok_s:.2f}) | "
+                  f"KV={kv_mb:.2f} MB (seq≈{kv_seq}) | waiting for batch…", flush=True)
+            wandb_log({"roll/tok_s": tok_s, "roll/tok_s_ema": ema_tok_s,
+                       "kv/bytes": kv_bytes, "kv/MB": kv_mb, "kv/seq_est": kv_seq,
+                       "cuda/mem_alloc_MB": mem_alloc, "cuda/mem_reserved_MB": mem_reserved,
+                       "cuda/mem_max_alloc_MB": mem_max,
+                       "buf/size": len(buf)}, step=g)
             continue
 
         # schedule
@@ -486,7 +747,8 @@ def train_bestcase_kl_rl(model, tok, prompts_train, prompts_eval,
 
         # one train step
         model.train()
-        t_trn_s = time.time()
+        _cuda_sync()
+        t_trn_s = time.perf_counter()
         out = one_mixed_step(
             model, opt, batch,
             temperature=temperature, clip=1.0,
@@ -494,7 +756,8 @@ def train_bestcase_kl_rl(model, tok, prompts_train, prompts_eval,
             ent_weight=ent_weight,
             init_fro=init_fro, max_fro=max_fro, max_fro_ratio=max_fro_ratio
         )
-        t_trn_e = time.time()
+        _cuda_sync()
+        t_trn_e = time.perf_counter()
         step_time = (t_trn_e - t_trn_s)
 
         # quick metrics
@@ -508,7 +771,7 @@ def train_bestcase_kl_rl(model, tok, prompts_train, prompts_eval,
         if not out["ok"] or not math.isfinite(out["loss"]) or not math.isfinite(out["kl"]):
             print(f"[train][nan] step {g:04d} | {phase:>10} | "
                   f"loss {out['loss']} | KL {out['kl']} | PG {out['pg']} | CE {out['ce']} | "
-                  f"grad {out['grad']} -> restoring exit head weights & clearing opt",
+                  f"grad {out['grad']} -> clearing opt state",
                   flush=True)
             opt.state.clear()
             free_cuda("(nan-recovery)")
@@ -521,10 +784,11 @@ def train_bestcase_kl_rl(model, tok, prompts_train, prompts_eval,
             f"loss {out['loss']:+7.4f} "
             f"(PG {out['pg']:+7.4f}→{out['c_pg']:+7.4f} , KL {out['kl']:+7.4f}→{out['c_kl']:+7.4f} , "
             f"CE {out['ce']:+6.4f}→{out['c_ce']:+6.4f} , ENT {out['ent']:+6.4f}→{out['c_ent']:+6.4f}) | "
-            f"grad {out['grad']:6.2f} | tok/s≈{tok_s:.2f} | step_time {step_time*1e3:6.1f} ms | "
+            f"grad {out['grad']:6.2f} | tok/s={tok_s:.2f} (EMA {ema_tok_s:.2f}) | step_time {step_time*1e3:6.1f} ms | "
             f"π_s(v)≈{out['pi_v']:.4f} | std_s={std_s:.3f} std_t={std_t:.3f} | "
             f"||exit||={exit_norm:.2f} | roll_acc≈{accept_roll:.4f} | "
-            f"buf_size={buf_size} acc_rate≈{buf_rate:.3f} | λ_pg={lam_pg:.3f} λ_kl={lam_kl:.3f} | accepted_only={accepted_only}",
+            f"buf_size={buf_size} acc_rate≈{buf_rate:.3f} | λ_pg={lam_pg:.3f} λ_kl={lam_kl:.3f} | accepted_only={accepted_only} | "
+            f"KV={kv_mb:.2f} MB (seq≈{kv_seq}) | CUDA alloc={mem_alloc:.1f} MB",
             flush=True
         )
 
@@ -533,14 +797,37 @@ def train_bestcase_kl_rl(model, tok, prompts_train, prompts_eval,
             step=g, phase=phase,
             loss=out["loss"], kl=out["kl"], pg=out["pg"], ce=out["ce"], ent=out["ent"],
             c_pg=out["c_pg"], c_kl=out["c_kl"], c_ce=out["c_ce"], c_ent=out["c_ent"],
-            grad=float(out["grad"]), tok_s=tok_s, step_time_ms=step_time*1e3,
+            grad=float(out["grad"]), tok_s=tok_s, tok_s_ema=ema_tok_s, step_time_ms=step_time*1e3,
             pi_s_v=out["pi_v"], std_s=std_s, std_t=std_t,
             exit_norm=exit_norm,
             roll_acc=accept_roll, buf_size=buf_size, buf_acc_rate=buf_rate,
             lam_pg=lam_pg, lam_kl=lam_kl, accepted_only=accepted_only,
+            kv_bytes=kv_bytes, kv_mb=kv_mb, kv_seq_est=kv_seq,
+            cuda_mem_alloc_mb=mem_alloc, cuda_mem_reserved_mb=mem_reserved, cuda_mem_max_alloc_mb=mem_max,
+            tokens_total=tokens_total,
         )
         with open(metrics_path, "a") as f:
             f.write(json.dumps(metrics) + "\n")
+
+        # W&B log (explicit step=g)
+        wandb_log({
+            "loss/total": out["loss"], "loss/pg": out["pg"], "loss/kl": out["kl"],
+            "loss/ce": out["ce"], "loss/ent": out["ent"],
+            "contrib/pg": out["c_pg"], "contrib/kl": out["c_kl"],
+            "contrib/ce": out["c_ce"], "contrib/ent": out["c_ent"],
+            "grad/norm": float(out["grad"]),
+            "roll/tok_s": tok_s, "roll/tok_s_ema": ema_tok_s,
+            "time/step_ms": step_time*1e3,
+            "policy/pi_s_v": out["pi_v"], "logits/std_s": std_s, "logits/std_t": std_t,
+            "head/exit_norm": exit_norm,
+            "roll/accept_rate_batch": accept_roll,
+            "buf/size": buf_size, "buf/accept_rate": buf_rate,
+            "schedule/lam_pg": lam_pg, "schedule/lam_kl": lam_kl,
+            "sampling/accepted_only": int(accepted_only),
+            "kv/bytes": kv_bytes, "kv/MB": kv_mb, "kv/seq_est": kv_seq,
+            "cuda/mem_alloc_MB": mem_alloc, "cuda/mem_reserved_MB": mem_reserved, "cuda/mem_max_alloc_MB": mem_max,
+            "tokens/total": tokens_total,
+        }, step=g)
 
         # rollout sample dump if requested
         if dbg_roll:
@@ -555,11 +842,14 @@ def train_bestcase_kl_rl(model, tok, prompts_train, prompts_eval,
             print("[e2e] measuring acceptance (mid-train)…", flush=True)
             acc_mid, ctar_mid = eval_acceptance(
                 model, tok, prompts_eval, rollout_len, steps_per_prompt=1,
-                dump_debug=True, dump_path=samples_path, topk=debug_topk
+                dump_debug=True, dump_path=samples_path, topk=debug_topk, quiet=quiet_eval
             )
             print(f"[e2e] MID  | step {g+1:04d} | acc={acc_mid:.3f} | "
                   f"CTAR1={ctar_mid[1]:.3f} CTAR2={ctar_mid[2]:.3f} CTAR3={ctar_mid[3]:.3f} CTAR4={ctar_mid[4]:.3f}",
                   flush=True)
+            wandb_log({"eval/mid/acc": acc_mid,
+                       "eval/mid/ctar1": ctar_mid[1], "eval/mid/ctar2": ctar_mid[2],
+                       "eval/mid/ctar3": ctar_mid[3], "eval/mid/ctar4": ctar_mid[4]}, step=g+1)
 
     # Final eval — free training state first
     del opt
@@ -570,18 +860,22 @@ def train_bestcase_kl_rl(model, tok, prompts_train, prompts_eval,
     print("\n[e2e] measuring acceptance (post-train)…", flush=True)
     acc1, ctar1 = eval_acceptance(
         model, tok, prompts_eval, rollout_len, steps_per_prompt=1,
-        dump_debug=True, dump_path=samples_path, topk=debug_topk
+        dump_debug=True, dump_path=samples_path, topk=debug_topk, quiet=quiet_eval
     )
     print(f"[e2e] POST | acc={acc1:.3f} | Δ={acc1-acc0:+.3f} | "
           f"CTAR1={ctar1[1]:.3f} CTAR2={ctar1[2]:.3f} CTAR3={ctar1[3]:.3f} CTAR4={ctar1[4]:.3f}", flush=True)
+    wandb_log({"eval/post/acc": acc1,
+               "eval/post/ctar1": ctar1[1], "eval/post/ctar2": ctar1[2],
+               "eval/post/ctar3": ctar1[3], "eval/post/ctar4": ctar1[4],
+               "eval/delta_acc": (acc1-acc0)}, step=steps)
 
 # --------------------------- main ---------------------------
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model-id", type=str, default="meta-llama/Llama-2-7b-hf")
-    ap.add_argument("--early-layer", type=int, default=24)  # patched: later default exit
-    ap.add_argument("--train-prompts", type=int, default=256)
+    ap.add_argument("--early-layer", type=int, default=4)  # later default exit
+    ap.add_argument("--train-prompts", type=int, default=512)
     ap.add_argument("--eval-prompts", type=int, default=64)
 
     ap.add_argument("--steps", type=int, default=300)
@@ -595,7 +889,7 @@ def main():
     ap.add_argument("--ce-weight", type=float, default=0.20)
     ap.add_argument("--ent-weight", type=float, default=0.00)
 
-    # KL->RL schedule (patched: shorter warmup & ramp)
+    # KL->RL schedule (shorter warmup & ramp)
     ap.add_argument("--warmup-kl", type=int, default=40)
     ap.add_argument("--ramp-steps", type=int, default=80)
     ap.add_argument("--kl-min", type=float, default=0.05)
@@ -614,6 +908,16 @@ def main():
 
     ap.add_argument("--eval-every", type=int, default=50)
     ap.add_argument("--seed", type=int, default=1234)
+
+    # W&B args
+    ap.add_argument("--no-wandb", action="store_true", help="Disable Weights & Biases logging.")
+    ap.add_argument("--wandb-entity", type=str, default=WANDB_DEFAULT_ENTITY, help="W&B entity (team or user).")
+    ap.add_argument("--wandb-project", type=str, default=WANDB_DEFAULT_PROJECT, help="W&B project name.")
+    ap.add_argument("--run-name", type=str, default=None, help="Optional W&B run name.")
+
+    # Noise control for eval
+    ap.add_argument("--quiet-eval", action="store_true", help="Silence per-prompt cache clear prints during eval.")
+
     args = ap.parse_args()
 
     ensure_dirs(args.outdir)
@@ -637,6 +941,13 @@ def main():
         diff_nrm = (model.lm_head.weight.detach().float() - model.exit_proj.weight.detach().float()).norm().item()
     print("[sanity] head parity:", {"||lm||": lm_nrm, "||exit||": exit_nrm, "||lm-exit||": diff_nrm}, flush=True)
 
+    # W&B init after model is ready (so watch can attach)
+    run = init_wandb(args)
+    wandb_log({"sanity/head_parity_lm": lm_nrm,
+               "sanity/head_parity_exit": exit_nrm,
+               "sanity/head_parity_diff": diff_nrm}, step=0)
+    wandb_watch_model(model, log_freq=25)
+
     train_bestcase_kl_rl(
         model, tok, prompts_train, prompts_eval,
         steps=args.steps, rollout_len=args.rollout, batch_size=args.batch_size,
@@ -646,8 +957,15 @@ def main():
         kl_min=args.kl_min, pg_max=args.pg_max, ent_weight=args.ent_weight,
         outdir=args.outdir, accepted_only_flag=args.accepted_only,
         debug_dump_every=args.debug_dump_every, debug_topk=args.debug_topk,
-        max_fro=args.max_fro, max_fro_ratio=args.max_fro_ratio
+        max_fro=args.max_fro, max_fro_ratio=args.max_fro_ratio,
+        quiet_eval=args.quiet_eval
     )
+
+    if run is not None:
+        try:
+            run.finish()
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     main()
