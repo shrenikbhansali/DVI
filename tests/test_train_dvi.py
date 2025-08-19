@@ -163,6 +163,42 @@ def test_mixed_update_rl_only():
     assert changed
 
 
+def test_mixed_update_rl_all_tokens():
+    model1, cfg = make_model()
+    model2, _ = make_model()
+    model2.load_state_dict(model1.state_dict())
+    opt = torch.optim.Adam([p for p in model2.parameters() if p.requires_grad], lr=0.01)
+    # rewards include both accepts (1) and rejects (0)
+    batch = {
+        'hidden': torch.randn(4, 1, cfg.hidden_size),
+        'token': torch.randint(0, cfg.vocab_size, (4, 1)),
+        'reward': torch.tensor([1.0, 0.0, 1.0, 0.0]),
+        'conf': torch.zeros(4),
+        'vlogits': torch.randn(4, cfg.vocab_size),
+    }
+
+    # manual RL loss over all tokens
+    with torch.no_grad():
+        hidden = batch['hidden'].squeeze(1)
+        logits = model1.exit_proj(hidden).float()
+        logp = torch.log_softmax(logits, dim=-1)
+        log_pi = logp.gather(1, batch['token'])[:, 0]
+        expected = -((batch['reward'] - 0.0) * log_pi).mean().item()
+
+    loss, gnorm, rl_loss, kl = mixed_update(
+        model2,
+        opt,
+        batch,
+        baseline=0.0,
+        clip=1.0,
+        kl_lambda=0.0,
+        use_rl=True,
+        rl_all_tokens=True,
+    )
+    assert math.isfinite(loss) and math.isfinite(gnorm)
+    assert rl_loss == pytest.approx(expected, rel=1e-5)
+
+
 def test_verifier_accessor_preserves_state():
     model1, cfg = make_model()
     model2, _ = make_model()

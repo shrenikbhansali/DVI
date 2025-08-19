@@ -105,9 +105,18 @@ def reinforce_update(model, opt, batch, baseline: float, clip: float):
     return float(loss.item()), float(grad_norm)
 
 
-def mixed_update(model, opt, batch, baseline: float, clip: float,
-                 kl_lambda: float, kl_dir: str = "v2d",
-                 kl_temperature: float = 1.0, use_rl: bool = True):
+def mixed_update(
+    model,
+    opt,
+    batch,
+    baseline: float,
+    clip: float,
+    kl_lambda: float,
+    kl_dir: str = "v2d",
+    kl_temperature: float = 1.0,
+    use_rl: bool = True,
+    rl_all_tokens: bool = False,
+):
     dev = next(model.parameters()).device
 
     # --- Cast to float32 for numerics ---
@@ -154,17 +163,25 @@ def mixed_update(model, opt, batch, baseline: float, clip: float,
 
     kl = kl_elem.mean()
 
-    # --- RL on accepted tokens only (more stable), keep KL on full batch ---
+    # --- RL loss -----------------------------------------------------------
+    # Default: policy gradient only on accepted tokens.  When
+    # ``rl_all_tokens`` is True, apply REINFORCE on every token using the
+    # accept bit as reward (rejections receive negative advantage when the
+    # baseline > 0).
     rl_loss = torch.zeros([], device=dev)
     if use_rl:
-        with torch.no_grad():
-            acc_mask = (rewards == 1.0)
-        if acc_mask.any():
-            log_pi_sel = logp_d.gather(1, tokens)[:, 0][acc_mask]
-            rewards_sel = rewards[acc_mask]
-            rl_loss = -((rewards_sel - baseline) * log_pi_sel).mean()
+        log_pi_all = logp_d.gather(1, tokens)[:, 0]
+        if rl_all_tokens:
+            rl_loss = -((rewards - baseline) * log_pi_all).mean()
         else:
-            rl_loss = torch.zeros([], device=dev)
+            with torch.no_grad():
+                acc_mask = (rewards == 1.0)
+            if acc_mask.any():
+                log_pi_sel = log_pi_all[acc_mask]
+                rewards_sel = rewards[acc_mask]
+                rl_loss = -((rewards_sel - baseline) * log_pi_sel).mean()
+            else:
+                rl_loss = torch.zeros([], device=dev)
 
     loss = (1.0 - kl_lambda) * rl_loss + kl_lambda * kl
 
