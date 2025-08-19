@@ -1,570 +1,653 @@
-#!/usr/bin/env python
-"""DVI smoketest script.
+# tests/dvi_bestcase_kl_rl.py
+# DVI best-case with richer logging & debuggability.
+# Phase schedule: KL warm-start → mixed (KL+RL) ramp → RL.
+# Adds: human-readable logs, JSONL dumps, accepted-only toggle with backoff, scale-safe exit head.
+# Patches:
+#   - Later default exit layer (24)
+#   - Exit pre-norm + learnable logit scale before exit head
+#   - Policy gradient uses log-prob (-E[log π_s(v)]) for stronger early gradients
+#   - Sharper teacher by default (T=1.0) and stronger CE during warm-up
+#   - Optimizer includes new pre-norm & scale params
 
-Orchestrates a tiny run that demonstrates the draft path can be trained
-with a mixture of KL and reinforcement learning.  The goal is not state
-of the art quality but exercising the training pipeline end‑to‑end.
-"""
-
-import argparse
-import csv
-import json
-import logging
-import math
 import os
-import random
-import time
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+import gc, math, random, argparse, json, time, copy
+from typing import List, Tuple, Dict, Optional
 
 import torch
-from torch.utils.tensorboard import SummaryWriter
-from transformers import AutoTokenizer
+import torch.nn as nn
+import torch.nn.functional as F
+from datasets import load_dataset
+from transformers import AutoTokenizer, __version__ as transformers_ver
 
+# repo-local
 from kangaroo.earlyexit import EarlyExitLlamaForCausalLM
+from kangaroo.sgp_lora import inject_dual_lora, enable_lora_grads
 from training.buffer import ReplayBuffer
-from training.kl_mix import cosine_decay_lambda, exp_decay_lambda
-from train_dvi import prepare_model_for_training, mixed_update, update_baseline
 
-# ``args`` is populated in ``main`` and accessed by helper functions (e.g.
-# ``rollout``) via the global namespace.
-args: Optional[argparse.Namespace] = None
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+# ----------------------- utils -----------------------
 
-DTYPE_MAP = {
-    "float16": torch.float16,
-    "bfloat16": torch.bfloat16,
-    "float32": torch.float32,
-}
+def set_seed(seed: int = 1234):
+    random.seed(seed); torch.manual_seed(seed)
+    if torch.cuda.is_available(): torch.cuda.manual_seed_all(seed)
 
+def ensure_dirs(outdir: str):
+    os.makedirs(outdir, exist_ok=True)
+    os.makedirs(os.path.join(outdir, "logs"), exist_ok=True)
 
-def set_seed(seed: int) -> None:
-    random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+def env_dump(outdir: Optional[str] = None):
+    info = dict(
+        torch_version=torch.__version__,
+        cuda=torch.version.cuda if torch.cuda.is_available() else None,
+        transformers=transformers_ver,
+        gpus=torch.cuda.device_count(),
+        device=str(torch.device("cuda" if torch.cuda.is_available() else "cpu")),
+        alloc_conf=os.environ.get("PYTORCH_CUDA_ALLOC_CONF", None),
+    )
+    msg = "[env] " + json.dumps(info, indent=2)
+    print(msg, flush=True)
+    if outdir:
+        with open(os.path.join(outdir, "logs", "env.json"), "w") as f:
+            json.dump(info, f, indent=2)
 
-
-def setup_outdir(path: str) -> Path:
-    out = Path(path)
-    (out / "plots").mkdir(parents=True, exist_ok=True)
-    (out / "logs").mkdir(parents=True, exist_ok=True)
-    return out
-
-
-def setup_logging(outdir: Path, level: str) -> logging.Logger:
-    logger = logging.getLogger()
-    logger.setLevel(getattr(logging, level.upper()))
-    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
-    sh = logging.StreamHandler()
-    sh.setFormatter(fmt)
-    fh = logging.FileHandler(outdir / "logs" / "smoketest.log")
-    fh.setFormatter(fmt)
-    logger.handlers = []
-    logger.addHandler(sh)
-    logger.addHandler(fh)
-    return logger
-
-
-# ---------------------------------------------------------------------------
-# Data loading
-# ---------------------------------------------------------------------------
-
-
-def download_alpaca_sample(dest: Path, max_prompts: int) -> List[Dict[str, str]]:
-    """Download a small Alpaca JSON file.
-
-    The function is resilient: if download fails we return an empty list and
-    the caller can fall back to random prompts.
-    """
-    import json as _json
-    import requests
-
-    if dest.exists():
-        with dest.open("r", encoding="utf-8") as f:
-            return _json.load(f)[:max_prompts]
-
-    url = "https://raw.githubusercontent.com/tatsu-lab/alpaca/main/alpaca_data.json"
-    try:
-        resp = requests.get(url, timeout=10)
-        resp.raise_for_status()
-        data = resp.json()[:max_prompts]
-        dest.write_text(_json.dumps(data), encoding="utf-8")
-        return data
-    except Exception as exc:  # pragma: no cover - network failure branch
-        logging.warning("Failed to download Alpaca sample: %s", exc)
-        return []
-
-
-def load_prompts(args, tokenizer: Optional[AutoTokenizer]) -> List[str]:
-    if args.data_mode == "alpaca":
-        path = Path(args.data_path) if args.data_path else Path(args.outdir) / "alpaca_sample.json"
-        data = download_alpaca_sample(path, args.max_prompts)
-        prompts = []
-        for rec in data:
-            instr = rec.get("instruction", "")
-            inp = rec.get("input", "")
-            prompts.append(f"Instruction: {instr}\nInput: {inp}\nAnswer:")
-        return prompts
-    elif args.data_mode == "lines" and args.data_path:
-        with open(args.data_path, "r", encoding="utf-8") as f:
-            return [ln.strip() for ln in f if ln.strip()][: args.max_prompts]
-    return []  # random mode or missing path
-
-
-@torch.no_grad()
-def sample_prompt(tokenizer: Optional[AutoTokenizer], prompts: List[str], device: torch.device, vocab: int, trunc: int) -> torch.Tensor:
-    if tokenizer and prompts:
-        text = random.choice(prompts)[:trunc]
-        return tokenizer(text, return_tensors="pt").input_ids.to(device)
-    # fallback random prompt of length 4
-    return torch.randint(0, vocab, (1, 4), device=device)
-
-
-# ---------------------------------------------------------------------------
-# Rollout utilities
-# ---------------------------------------------------------------------------
-
-
-def entropy_from_logits(logits: torch.Tensor) -> float:
-    logp = torch.log_softmax(logits, dim=-1)
-    return float(-(logp.exp() * logp).sum(dim=-1).mean().item())
-
-
-@dataclass
-class RolloutStats:
-    accept_flags: List[int]
-    duration: float
-
-
-def rollout(
-    model: EarlyExitLlamaForCausalLM,
-    ids: torch.Tensor,
-    K: int,
-    buffer: ReplayBuffer,
-    debug: List[Dict],
-    tokenizer: Optional[AutoTokenizer],
-    phase: str,
-    step: int,
-    token_pos: List[int],
-    mismatch_hist: Dict[int, int],
-    check_vlogits_shape: List[bool],
-) -> RolloutStats:
-    """Roll out ``K`` speculative steps and append transitions to buffer."""
-    device = ids.device
-    accept_flags: List[int] = []
-    start = time.time()
-    for k in range(K):
-        vlogits = model.verifier_logits_for_next(ids[:, -1:])
-        step_out = model.spec_decode_step(ids[:, -1:])
-
-        if not check_vlogits_shape:
-            vocab = model.lm_head.weight.shape[0]
-            assert vlogits.shape == (ids.size(0), vocab), "vlogits has unexpected shape"
-            check_vlogits_shape.append(True)
-
-        buffer.append(
-            step_out.hidden.squeeze(0).cpu(),
-            int(step_out.token.squeeze().item()),
-            float(step_out.accept.squeeze().item()),
-            float(step_out.conf.squeeze().item()),
-            vlogits.squeeze(0).cpu(),
-        )
-
-        ids = torch.cat([ids, step_out.token.to(device)], dim=-1)
-        accept = int(step_out.accept.item())
-        accept_flags.append(accept)
-
-        # first-mismatch histogram
-        v_top = int(vlogits.argmax(dim=-1).item())
-        if v_top != int(step_out.token.item()):
-            pos = token_pos[0]
-            mismatch_hist[pos] = mismatch_hist.get(pos, 0) + 1
-        token_pos[0] += 1
-
-        # debug samples --------------------------------------------------
-        if len(debug) < args.debug_samples:
-            draft_logits = model.exit_proj(step_out.hidden.to(device)).squeeze(1).float()
-            draft_probs = torch.softmax(draft_logits, dim=-1)[0]
-            v_probs = torch.softmax(vlogits.float(), dim=-1)[0]
-            d_prob, d_id = torch.topk(draft_probs, 5)
-            v_prob, v_id = torch.topk(v_probs, 5)
-            tok_id = int(step_out.token.item())
-            entry = {
-                "phase": phase,
-                "step": step,
-                "prompt_text": tokenizer.decode(ids[0].tolist()) if tokenizer else "",
-                "draft_token_id": tok_id,
-                "draft_token_str": tokenizer.decode([tok_id]) if tokenizer else str(tok_id),
-                "verifier_argmax_id": int(v_top),
-                "verifier_argmax_str": tokenizer.decode([v_top]) if tokenizer else str(v_top),
-                "accept": accept,
-                "draft_topk": [[int(i), float(p)] for p, i in zip(d_prob.tolist(), d_id.tolist())],
-                "verifier_topk": [[int(i), float(p)] for p, i in zip(v_prob.tolist(), v_id.tolist())],
-                "conf_verifier_selected": float(v_probs[tok_id]),
-                "position": token_pos[0] - 1,
-            }
-            debug.append(entry)
-    dur = time.time() - start
-    return RolloutStats(accept_flags=accept_flags, duration=dur)
-
-
-# ---------------------------------------------------------------------------
-# Training phases
-# ---------------------------------------------------------------------------
-
-
-def run_phase(
-    phase: str,
-    steps: int,
-    args,
-    model: EarlyExitLlamaForCausalLM,
-    tokenizer: Optional[AutoTokenizer],
-    prompts: List[str],
-    buffer: ReplayBuffer,
-    baseline: float,
-    global_step: int,
-    stats: Dict[str, List[float]],
-    history: Dict[str, List[float]],
-    writer: Optional[SummaryWriter],
-    csv_writer: csv.DictWriter,
-    mismatch_hist: Dict[int, int],
-    token_pos: List[int],
-    check_vlogits_shape: List[bool],
-    tracker: 'MetricTracker',
-    opt: torch.optim.Optimizer,
-    baseline_ref: float,
-) -> (float, int):
-    dev = next(model.parameters()).device
-    for s in range(1, steps + 1):
-        global_step += 1
-        prompt = sample_prompt(tokenizer, prompts, dev, model.config.vocab_size, args.prompt_trunc)
-        rollout_stats = rollout(
-            model,
-            prompt[:, :1],
-            args.rollout_len,
-            buffer,
-            history.setdefault("debug", []),
-            tokenizer,
-            phase,
-            global_step,
-            token_pos,
-            mismatch_hist,
-            check_vlogits_shape,
-        )
-        stats.setdefault(phase, []).append(sum(rollout_stats.accept_flags) / len(rollout_stats.accept_flags))
-
-        # determine if we have enough samples for update
-        if phase == "baseline":
-            loss = rl_loss = kl_loss = gnorm = 0.0
-            kl_lambda = 0.0
+def build_prompts_from_alpaca(limit: int) -> List[str]:
+    ds = load_dataset("tatsu-lab/alpaca", split="train")
+    prompts = []
+    for ex in ds:
+        inst = ex.get("instruction", "").strip()
+        inp  = ex.get("input", "").strip()
+        if inp:
+            text = f"### Instruction:\n{inst}\n\n### Input:\n{inp}\n\n### Response:\n"
         else:
-            accepted_only = False
-            use_rl = phase != "warmup" or not args.no_rl_during_warmup
-            if use_rl and not args.rl_all_tokens:
-                accepted_only = True
-            count = buffer.accepted_count() if accepted_only else len(buffer)
-            if count >= args.batch_size:
-                batch = buffer.sample(args.batch_size, accepted_only=accepted_only)
-                if phase == "warmup":
-                    kl_lambda = 1.0
-                    use_rl = False
-                elif phase == "mixed":
-                    if args.kl_schedule == "exp":
-                        kl_lambda = exp_decay_lambda(global_step, args.kl_lambda0, args.kl_tau, args.kl_min)
-                    else:
-                        total = args.baseline_steps + args.warmup_steps + args.mixed_steps + args.pure_rl_steps
-                        kl_lambda = cosine_decay_lambda(global_step, total, args.kl_lambda0, args.kl_min)
-                    use_rl = True
-                else:  # pure_rl
-                    kl_lambda = 0.0
-                    use_rl = True
-                loss, gnorm, rl_loss, kl_loss = mixed_update(
-                    model,
-                    opt,
-                    batch,
-                    baseline=baseline,
-                    clip=args.clip,
-                    kl_lambda=kl_lambda,
-                    kl_dir=args.kl_dir,
-                    kl_temperature=args.kl_temperature,
-                    use_rl=use_rl,
-                    rl_all_tokens=args.rl_all_tokens,
-                )
-                if use_rl and args.adv_baseline_mode == "ema":
-                    baseline = update_baseline(baseline, batch["reward"])
-                draft_ent = entropy_from_logits(model.exit_proj(batch["hidden"].to(dev).squeeze(1)).float())
-                verifier_ent = entropy_from_logits(batch["vlogits"].to(dev).float())
+            text = f"### Instruction:\n{inst}\n\n### Response:\n"
+        if len(text) > 20:
+            prompts.append(text)
+        if len(prompts) >= limit:
+            break
+    try:
+        ds.cleanup_cache_files()
+    except Exception:
+        pass
+    return prompts
+
+def ctar(bits: List[int], w: int) -> float:
+    if len(bits) < w: return 0.0
+    tot = len(bits) - w + 1
+    ok = 0
+    for i in range(tot):
+        if all(bits[i + j] == 1 for j in range(w)):
+            ok += 1
+    return ok / max(1, tot)
+
+def free_cuda(note=""):
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+    gc.collect()
+    if note: print(f"[mem] cleared caches {note}", flush=True)
+
+# -------------------- KV helpers --------------------
+
+@torch.inference_mode()
+def prime_kv_full(spec: EarlyExitLlamaForCausalLM, input_ids: torch.Tensor):
+    spec.past_key_values = None
+    h = spec.forward_draft_or_large_model(in_tokens_small=input_ids)
+    _ , _ = spec.forward_draft_or_large_model(in_features_large=h)
+
+@torch.inference_mode()
+def advance_kv_with_committed(spec: EarlyExitLlamaForCausalLM, token_ids: torch.Tensor):
+    h = spec.forward_draft_or_large_model(in_tokens_small=token_ids)
+    _ , _ = spec.forward_draft_or_large_model(in_features_large=h)
+
+def _top1(logits: torch.Tensor) -> int:
+    return int(torch.argmax(logits, dim=-1, keepdim=True)[0,0].item())
+
+# -------------------- evaluation (acceptance metric) --------------------
+
+@torch.inference_mode()
+def eval_acceptance(spec: EarlyExitLlamaForCausalLM, tok: AutoTokenizer, prompts: List[str],
+                    rollout_len: int, steps_per_prompt: int = 1,
+                    dump_debug: bool = False, dump_path: Optional[str] = None, topk: int = 5) -> Tuple[float, Dict[int,float]]:
+    spec.eval()
+    dev = next(spec.parameters()).device
+    accepts = []
+    dbg_out = []
+    for p in prompts:
+        enc = tok(p, return_tensors="pt").to(dev)
+        prime_kv_full(spec, enc["input_ids"])
+        ids_last = enc["input_ids"][:, -1:]
+        for _ in range(steps_per_prompt * rollout_len):
+            v_logits = spec.verifier_logits_for_next(ids_last)
+            if not torch.isfinite(v_logits).all():
+                accepts.append(0); break
+            v_top1   = _top1(v_logits)
+
+            # side-effect-free probe of drafter
+            pkv_backup = [None if pkv is None else tuple(t.clone() for t in pkv)
+                          for pkv in (spec.past_key_values or [])]
+            d_hidden   = spec.forward_draft_or_large_model(in_tokens_small=ids_last)  # [B,1,H]
+            # --- patched: pre-norm + scale before exit head ---
+            h = d_hidden.squeeze(1).float()
+            if hasattr(spec, "exit_pre_norm") and spec.exit_pre_norm is not None:
+                h = spec.exit_pre_norm(h)
+            d_logits = spec.exit_proj(h)
+            if hasattr(spec, "exit_logit_scale"):
+                d_logits = spec.exit_logit_scale * d_logits
+            # ---------------------------------------------------
+
+            if not torch.isfinite(d_logits).all():
+                accepts.append(0)
+                d_top1 = -1
             else:
-                loss = rl_loss = kl_loss = gnorm = 0.0
-                kl_lambda = 0.0
-                draft_ent = verifier_ent = 0.0
+                d_top1 = _top1(d_logits)
+                accepts.append(int(d_top1 == v_top1))
 
-        # metric aggregation ---------------------------------------------
-        tracker.update_window(rollout_stats.accept_flags, rollout_stats.duration)
-        history.setdefault("acc", []).append(tracker.acceptance_rate())
-        history.setdefault("ctar1", []).append(tracker.ctar_w(1))
-        history.setdefault("ctar2", []).append(tracker.ctar_w(2))
-        history.setdefault("comp", []).append(tracker.compression())
-        history.setdefault("tok_s", []).append(tracker.throughput())
-        history.setdefault("loss", []).append(loss)
-        history.setdefault("rl", []).append(rl_loss)
-        history.setdefault("kl", []).append(kl_loss)
-        history.setdefault("lambda", []).append(kl_lambda)
-        history.setdefault("grad", []).append(gnorm)
-        history.setdefault("baseline", []).append(baseline)
-        history.setdefault("ent_d", []).append(draft_ent)
-        history.setdefault("ent_v", []).append(verifier_ent)
+            if dump_debug and dump_path:
+                try:
+                    v_prob, v_id = torch.topk(torch.softmax(v_logits.float(), dim=-1)[0], k=topk)
+                    d_prob, d_id = torch.topk(torch.softmax(d_logits.float(), dim=-1)[0], k=topk)
+                    dbg_out.append({
+                        "draft_top1": int(d_top1),
+                        "verifier_top1": int(v_top1),
+                        "accept": int(d_top1 == v_top1),
+                        "verifier_topk": [[int(i), float(p)] for p, i in zip(v_prob.tolist(), v_id.tolist())],
+                        "draft_topk": [[int(i), float(p)] for p, i in zip(d_prob.tolist(), d_id.tolist())],
+                    })
+                except Exception:
+                    pass
 
-        row = {
-            "phase": phase,
-            "step": global_step,
-            "acc": tracker.acceptance_rate(),
-            "ctar1": tracker.ctar_w(1),
-            "ctar2": tracker.ctar_w(2),
-            "comp": tracker.compression(),
-            "tok_s": tracker.throughput(),
-            "loss": loss,
-            "rl": rl_loss,
-            "kl": kl_loss,
-            "lambda": kl_lambda,
-            "grad": gnorm,
-            "baseline": baseline,
-            "ent_d": draft_ent,
-            "ent_v": verifier_ent,
-        }
-        csv_writer.writerow(row)
-        if writer:
-            for k, v in row.items():
-                if k in {"phase", "step"}:
-                    continue
-                writer.add_scalar(f"{phase}/{k}", v, global_step)
+            spec.past_key_values = pkv_backup
+            v_token = torch.tensor([[v_top1]], device=ids_last.device, dtype=ids_last.dtype)
+            advance_kv_with_committed(spec, v_token)
+            ids_last = v_token
 
-        if global_step % args.eval_interval == 0:
-            delta = tracker.acceptance_rate() - baseline_ref
-            logging.info(
-                f"[PHASE {phase}][step {global_step}] acc={tracker.acceptance_rate():.2f} (Δ{delta:+.2f}) "
-                f"CTAR1={tracker.ctar_w(1):.2f} CTAR2={tracker.ctar_w(2):.2f} comp={tracker.compression():.2f} "
-                f"tok/s={tracker.throughput():.1f} RL={rl_loss:.2f} KL={kl_loss:.2f} total={loss:.2f} "
-                f"λ={kl_lambda:.2f} grad={gnorm:.2f} base={baseline:.2f}"
+    acc = sum(accepts)/max(1, len(accepts))
+    c = {w: ctar(accepts, w) for w in (1,2,3,4)}
+
+    if dump_debug and dump_path and dbg_out:
+        with open(dump_path, "a") as f:
+            for rec in dbg_out:
+                f.write(json.dumps(rec) + "\n")
+    return acc, c
+
+# -------------------- model (train drafter only) --------------------
+
+def prepare_dvi_trainable(model_id: str, early_layer: int, dtype=torch.float16):
+    model = EarlyExitLlamaForCausalLM.from_pretrained(
+        model_id, torch_dtype=dtype, device_map="auto", EARLY_STOP_LAYER=early_layer
+    )
+    model = inject_dual_lora(model, exit_layer=early_layer, rank=8)
+    for p in model.parameters(): p.requires_grad = False
+    enable_lora_grads(model, "lora_S", True)    # drafter learns
+    enable_lora_grads(model, "lora_D", False)   # deep path frozen
+
+    with torch.no_grad():
+        w = model.lm_head.weight.detach().clone().float()
+
+    # Exit head
+    model.exit_proj = nn.Linear(w.shape[1], w.shape[0], bias=False,
+                                device=w.device, dtype=torch.float32)
+    model.exit_proj.weight.data.copy_(w)
+    model.exit_proj.weight.requires_grad = True
+
+    # --- patched: add pre-norm + learnable global logit scale ---
+    # Try to clone the model's final RMSNorm if available; otherwise fallback to LayerNorm
+    try:
+        base_norm = model.model.norm  # Llama final RMSNorm
+        model.exit_pre_norm = copy.deepcopy(base_norm).to(w.device)
+    except Exception:
+        model.exit_pre_norm = nn.LayerNorm(w.shape[1], elementwise_affine=True, device=w.device)
+    for p in model.exit_pre_norm.parameters():
+        p.requires_grad = True
+
+    model.exit_logit_scale = nn.Parameter(torch.tensor(1.0, device=w.device))
+    # -------------------------------------------------------------
+
+    model.lm_head.weight.requires_grad = False
+    if hasattr(model, "head_model"):
+        for p in model.head_model.parameters(): p.requires_grad = False
+    return model
+
+def build_optimizer(model, lr_exit=2e-4, lr_lora=5e-5, wd_exit=1e-2, wd_lora=0.0):
+    head_params = [model.exit_proj.weight]
+    if hasattr(model, "exit_pre_norm") and model.exit_pre_norm is not None:
+        head_params += list(model.exit_pre_norm.parameters())
+    if hasattr(model, "exit_logit_scale"):
+        head_params += [model.exit_logit_scale]
+
+    groups = [
+        {"params": head_params, "lr": lr_exit, "weight_decay": wd_exit},
+    ]
+    lora_s = [p for n,p in model.named_parameters() if p.requires_grad and "lora_S" in n]
+    if lora_s:
+        groups.append({"params": lora_s, "lr": lr_lora, "weight_decay": wd_lora})
+    return torch.optim.AdamW(groups, betas=(0.9, 0.999), eps=1e-8)
+
+# -------------------- objectives --------------------
+
+def _maybe_clamp_exit_head(model, init_fro: float, max_fro: float, max_fro_ratio: float):
+    """Clamp Frobenius norm only if a bound is set; prefer relative cap."""
+    if (max_fro is None or max_fro <= 0.0) and (max_fro_ratio is None or max_fro_ratio <= 0.0):
+        return  # disabled
+    with torch.no_grad():
+        W = model.exit_proj.weight
+        n = torch.linalg.vector_norm(W).float().item()
+        bound = None
+        if max_fro and max_fro > 0:
+            bound = max_fro
+        if max_fro_ratio and max_fro_ratio > 0:
+            bound_rel = init_fro * max_fro_ratio
+            bound = min(bound, bound_rel) if bound is not None else bound_rel
+        if bound is not None and math.isfinite(n) and n > bound:
+            W.mul_(bound / n)
+
+def _logit_stats(s_logits: torch.Tensor, t_logits: torch.Tensor):
+    s = s_logits.float()
+    t = t_logits.float()
+    return float(s.std().item()), float(t.std().item())
+
+def one_mixed_step(model, opt, batch,
+                   temperature=1.0, clip=1.0,
+                   ce_weight=0.20,
+                   lam_pg=0.0, lam_kl=1.0, ent_weight=0.0,
+                   init_fro: float = None, max_fro: float = 0.0, max_fro_ratio: float = 0.0):
+    """
+    Mixed objective:
+      - RL surrogate: maximize E[log π_s(v)]  => loss_pg = -E[log π_s(v)]   (patched)
+      - KL(teacher -> student) with softened teacher
+      - CE: anchor on teacher top-1 (stabilizer)
+      - ENT: optional entropy bonus (maximize entropy)
+    """
+    dev = next(model.parameters()).device
+    hidden  = batch["hidden"].to(dev)          # [B, H]
+    vlogits = batch["vlogits"].to(dev)         # [B, V] (fp16 ok)
+    tokens  = batch["token"].to(dev).view(-1)  # [B]
+
+    # --- patched: pre-norm + scale ---
+    h = hidden.float()
+    if hasattr(model, "exit_pre_norm") and model.exit_pre_norm is not None:
+        h = model.exit_pre_norm(h)
+    slogits = model.exit_proj(h)               # [B, V] fp32
+    if hasattr(model, "exit_logit_scale"):
+        slogits = model.exit_logit_scale * slogits
+    # ---------------------------------
+
+    slogp   = F.log_softmax(slogits, dim=-1)
+    sp      = slogp.exp()
+
+    # RL (expected acceptance, log-prob surrogate)
+    pi_v = sp.gather(1, tokens.view(-1,1)).squeeze(1)  # [B]
+    loss_pg = -torch.log(pi_v.clamp_min(1e-8)).mean()  # patched
+
+    # KL (teacher -> student)
+    tlogits = vlogits.float() / float(temperature)
+    tlogp   = F.log_softmax(tlogits, dim=-1)
+    tp      = tlogp.exp()
+    kl = F.kl_div(input=slogp, target=tp, reduction="batchmean", log_target=False)
+
+    # CE anchor
+    ce = F.nll_loss(slogp, tokens, reduction="mean") if ce_weight > 0.0 else torch.tensor(0.0, device=dev)
+
+    # Entropy bonus (maximize entropy -> subtract from loss)
+    ent = -(sp * slogp).sum(-1).mean()
+
+    # Weighted total + per-term contributions
+    loss = lam_pg*loss_pg + lam_kl*kl + ce_weight*ce - ent_weight*ent
+    contrib_pg  = float((lam_pg*loss_pg).detach().item())
+    contrib_kl  = float((lam_kl*kl).detach().item())
+    contrib_ce  = float((ce_weight*ce).detach().item()) if ce_weight > 0.0 else 0.0
+    contrib_ent = float((-ent_weight*ent).detach().item()) if ent_weight > 0.0 else 0.0
+
+    # NaN/Inf guard
+    is_finite = (torch.isfinite(loss) & torch.isfinite(kl) & torch.isfinite(loss_pg) & torch.isfinite(ce) & torch.isfinite(ent)).item()
+    if not bool(is_finite):
+        opt.zero_grad(set_to_none=True)
+        return dict(ok=False, loss=float("nan"), kl=float("nan"), pg=float("nan"),
+                    ce=float("nan"), ent=float("nan"), grad=float("nan"),
+                    c_pg=contrib_pg, c_kl=contrib_kl, c_ce=contrib_ce, c_ent=contrib_ent,
+                    pi_v=float(pi_v.mean().item()), std_s_t=(0.0, 0.0))
+
+    loss.backward()
+    grad = torch.nn.utils.clip_grad_norm_((p for p in model.parameters() if p.requires_grad), clip)
+    opt.step(); opt.zero_grad(set_to_none=True)
+
+    # Gentle, configurable clamp (disabled by default)
+    _maybe_clamp_exit_head(model, init_fro, max_fro, max_fro_ratio)
+
+    std_s, std_t = _logit_stats(slogits.detach(), vlogits.detach())
+    return dict(ok=True, loss=float(loss.item()), kl=float(kl.item()), pg=float(loss_pg.item()),
+                ce=float(ce.item()), ent=float(ent.item()), grad=float(grad),
+                c_pg=contrib_pg, c_kl=contrib_kl, c_ce=contrib_ce, c_ent=contrib_ent,
+                pi_v=float(pi_v.mean().item()), std_s_t=(std_s, std_t))
+
+# -------------------- rollout & buffer --------------------
+
+@torch.inference_mode()
+def rollout_collect(spec: EarlyExitLlamaForCausalLM, tok: AutoTokenizer, prompt: str,
+                    buf: ReplayBuffer, steps: int,
+                    debug_out: Optional[List[Dict]] = None, topk: int = 5):
+    spec.eval()
+    dev = next(spec.parameters()).device
+    enc = tok(prompt, return_tensors="pt").to(dev)
+    prime_kv_full(spec, enc["input_ids"])
+    last = enc["input_ids"][:, -1:]
+
+    for _ in range(steps):
+        v_logits = spec.verifier_logits_for_next(last)
+        if not torch.isfinite(v_logits).all():
+            break
+        v_top1   = _top1(v_logits)
+
+        # probe drafter without state mutation
+        pkv_backup = [None if pkv is None else tuple(t.clone() for t in pkv)
+                      for pkv in (spec.past_key_values or [])]
+        d_hidden   = spec.forward_draft_or_large_model(in_tokens_small=last)      # [B,1,H]
+        # --- patched: pre-norm + scale ---
+        h = d_hidden.squeeze(1).float()
+        if hasattr(spec, "exit_pre_norm") and spec.exit_pre_norm is not None:
+            h = spec.exit_pre_norm(h)
+        d_logits   = spec.exit_proj(h)                                            # [B,V]
+        if hasattr(spec, "exit_logit_scale"):
+            d_logits = spec.exit_logit_scale * d_logits
+        # ----------------------------------
+        d_top1     = _top1(d_logits) if torch.isfinite(d_logits).all() else -1
+        accept_bit = int(d_top1 == v_top1)
+
+        buf.append(
+            hidden=d_hidden.squeeze(0).squeeze(0).cpu(),  # [H] (pre-norm is applied in training step)
+            token=int(v_top1),                             # teacher top-1 id
+            reward=float(accept_bit),                     # acceptance bit (metric)
+            conf=0.0,
+            vlogits=v_logits.squeeze(0).cpu(),            # teacher logits (for KL)
+        )
+
+        if debug_out is not None:
+            try:
+                v_prob, v_id = torch.topk(torch.softmax(v_logits.float(), dim=-1)[0], k=topk)
+                d_prob, d_id = torch.topk(torch.softmax(d_logits.float(), dim=-1)[0], k=topk)
+                debug_out.append({
+                    "draft_top1": int(d_top1),
+                    "verifier_top1": int(v_top1),
+                    "accept": accept_bit,
+                    "verifier_topk": [[int(i), float(p)] for p, i in zip(v_prob.tolist(), v_id.tolist())],
+                    "draft_topk": [[int(i), float(p)] for p, i in zip(d_prob.tolist(), d_id.tolist())],
+                })
+            except Exception:
+                pass
+
+        spec.past_key_values = pkv_backup
+        v_token = torch.tensor([[v_top1]], device=last.device, dtype=last.dtype)
+        advance_kv_with_committed(spec, v_token)
+        last = v_token
+
+def buf_debug(buf: ReplayBuffer, k: int = 16):
+    size = len(buf)
+    acc  = buf.accepted_count()
+    stats = {"total": size, "accepted": acc, "accept_rate_est": (acc/size) if size else 0.0}
+    print("[buf]", json.dumps(stats, indent=2))
+    if size == 0: return
+    show = min(k, size)
+    try:
+        samp = buf.sample(show, accepted_only=False)
+        for i in range(show):
+            print(f"  sample[{i:02d}] tok={int(samp['token'][i])} r={float(samp['reward'][i])}")
+    except ValueError:
+        pass
+
+# -------------------- schedules --------------------
+
+def mix_schedule(step, warmup_kl:int, ramp:int, kl_min:float, pg_max:float):
+    """Linear: KL 1→kl_min; PG 0→pg_max after warmup."""
+    if step < warmup_kl:
+        return 0.0, 1.0
+    t = min(1.0, (step - warmup_kl) / max(1, ramp))
+    lam_pg = pg_max * t
+    lam_kl = (1.0 - t) * 1.0 + t * kl_min
+    return lam_pg, lam_kl
+
+def phase_of_step(step, warmup_kl, ramp):
+    if step < warmup_kl:
+        return "WARMUP(KL)"
+    elif step < warmup_kl + ramp:
+        return "MIXED"
+    else:
+        return "RL"
+
+# -------------------- training loop --------------------
+
+def train_bestcase_kl_rl(model, tok, prompts_train, prompts_eval,
+                         steps: int, rollout_len: int, batch_size: int,
+                         lr_exit: float, lr_lora: float, temperature: float,
+                         ce_weight: float, eval_every: int,
+                         warmup_kl: int, ramp_steps: int,
+                         kl_min: float, pg_max: float, ent_weight: float,
+                         outdir: str, accepted_only_flag: bool,
+                         debug_dump_every: int, debug_topk: int,
+                         max_fro: float, max_fro_ratio: float):
+
+    metrics_path = os.path.join(outdir, "logs", "train_metrics.jsonl")
+    samples_path = os.path.join(outdir, "logs", "rollout_samples.jsonl")
+
+    opt = build_optimizer(model, lr_exit=lr_exit, lr_lora=lr_lora, wd_exit=1e-2, wd_lora=0.0)
+    buf = ReplayBuffer(capacity=max(4096, batch_size*rollout_len*8), device=torch.device("cpu"))
+
+    # Pre-train eval & initial norms
+    model.eval()
+    with torch.no_grad():
+        init_fro = float(torch.linalg.vector_norm(model.exit_proj.weight).item())
+        lm_norm  = float(torch.linalg.vector_norm(model.lm_head.weight).item())
+    print(f"[sanity] head norms: ||lm||={lm_norm:.3f} ||exit||={init_fro:.3f}", flush=True)
+
+    print("\n[e2e] measuring acceptance (pre-train)…", flush=True)
+    free_cuda("(pre-eval)")
+    acc0, ctar0 = eval_acceptance(
+        model, tok, prompts_eval, rollout_len, steps_per_prompt=1,
+        dump_debug=True, dump_path=samples_path, topk=debug_topk
+    )
+    print(f"[e2e] PRE  | acc={acc0:.3f} | CTAR1={ctar0[1]:.3f} CTAR2={ctar0[2]:.3f} CTAR3={ctar0[3]:.3f} CTAR4={ctar0[4]:.3f}", flush=True)
+
+    ptr = 0
+    for g in range(steps):
+        model.eval()  # rollout in eval mode
+        p = prompts_train[ptr % len(prompts_train)]; ptr += 1
+
+        # --- data collection timing for tok/s
+        t_roll_s = time.time()
+        dbg_roll = [] if (debug_dump_every and (g % debug_dump_every == 0)) else None
+        rollout_collect(model, tok, p, buf, steps=rollout_len, debug_out=dbg_roll, topk=debug_topk)
+        t_roll_e = time.time()
+        tok_s = float(rollout_len) / max(1e-6, (t_roll_e - t_roll_s))
+
+        if g % 10 == 0:
+            buf_debug(buf, k=16)
+
+        # wait for enough data
+        if len(buf) < batch_size:
+            print(f"[train] step {g:04d} | {phase_of_step(g, warmup_kl, ramp_steps):>10} | "
+                  f"buf={len(buf)}/{batch_size} | tok/s≈{tok_s:.2f} | waiting for batch…", flush=True)
+            continue
+
+        # schedule
+        lam_pg, lam_kl = mix_schedule(g, warmup_kl, ramp_steps, kl_min, pg_max)
+
+        # sampling policy
+        phase = phase_of_step(g, warmup_kl, ramp_steps)
+        accepted_only = accepted_only_flag and (phase != "WARMUP(KL)") and (lam_pg > 0.0)
+        try:
+            batch = buf.sample(batch_size, accepted_only=accepted_only)
+        except ValueError:
+            if accepted_only:
+                print(f"[train][backoff] step {g:04d} | accepted-only requested but pool too small; sampling all tokens this step.")
+                batch = buf.sample(batch_size, accepted_only=False)
+            else:
+                print(f"[train] step {g:04d} | buffer insufficient (total={len(buf)}); collecting more…")
+                continue
+
+        # one train step
+        model.train()
+        t_trn_s = time.time()
+        out = one_mixed_step(
+            model, opt, batch,
+            temperature=temperature, clip=1.0,
+            ce_weight=ce_weight, lam_pg=lam_pg, lam_kl=lam_kl,
+            ent_weight=ent_weight,
+            init_fro=init_fro, max_fro=max_fro, max_fro_ratio=max_fro_ratio
+        )
+        t_trn_e = time.time()
+        step_time = (t_trn_e - t_trn_s)
+
+        # quick metrics
+        accept_roll = float(batch["reward"].float().mean().item())
+        buf_size = len(buf); buf_acc = buf.accepted_count()
+        buf_rate = (buf_acc / buf_size) if buf_size else 0.0
+        with torch.no_grad():
+            exit_norm = float(torch.linalg.vector_norm(model.exit_proj.weight).item())
+
+        # safety recovery
+        if not out["ok"] or not math.isfinite(out["loss"]) or not math.isfinite(out["kl"]):
+            print(f"[train][nan] step {g:04d} | {phase:>10} | "
+                  f"loss {out['loss']} | KL {out['kl']} | PG {out['pg']} | CE {out['ce']} | "
+                  f"grad {out['grad']} -> restoring exit head weights & clearing opt",
+                  flush=True)
+            opt.state.clear()
+            free_cuda("(nan-recovery)")
+            continue
+
+        # human-readable line
+        std_s, std_t = out["std_s_t"]
+        print(
+            f"[train] step {g:04d} | {phase:>10} | "
+            f"loss {out['loss']:+7.4f} "
+            f"(PG {out['pg']:+7.4f}→{out['c_pg']:+7.4f} , KL {out['kl']:+7.4f}→{out['c_kl']:+7.4f} , "
+            f"CE {out['ce']:+6.4f}→{out['c_ce']:+6.4f} , ENT {out['ent']:+6.4f}→{out['c_ent']:+6.4f}) | "
+            f"grad {out['grad']:6.2f} | tok/s≈{tok_s:.2f} | step_time {step_time*1e3:6.1f} ms | "
+            f"π_s(v)≈{out['pi_v']:.4f} | std_s={std_s:.3f} std_t={std_t:.3f} | "
+            f"||exit||={exit_norm:.2f} | roll_acc≈{accept_roll:.4f} | "
+            f"buf_size={buf_size} acc_rate≈{buf_rate:.3f} | λ_pg={lam_pg:.3f} λ_kl={lam_kl:.3f} | accepted_only={accepted_only}",
+            flush=True
+        )
+
+        # JSONL metrics dump
+        metrics = dict(
+            step=g, phase=phase,
+            loss=out["loss"], kl=out["kl"], pg=out["pg"], ce=out["ce"], ent=out["ent"],
+            c_pg=out["c_pg"], c_kl=out["c_kl"], c_ce=out["c_ce"], c_ent=out["c_ent"],
+            grad=float(out["grad"]), tok_s=tok_s, step_time_ms=step_time*1e3,
+            pi_s_v=out["pi_v"], std_s=std_s, std_t=std_t,
+            exit_norm=exit_norm,
+            roll_acc=accept_roll, buf_size=buf_size, buf_acc_rate=buf_rate,
+            lam_pg=lam_pg, lam_kl=lam_kl, accepted_only=accepted_only,
+        )
+        with open(metrics_path, "a") as f:
+            f.write(json.dumps(metrics) + "\n")
+
+        # rollout sample dump if requested
+        if dbg_roll:
+            with open(samples_path, "a") as f:
+                for rec in dbg_roll:
+                    f.write(json.dumps({"step": g, **rec}) + "\n")
+
+        # mid-train eval
+        if (g+1) % eval_every == 0:
+            model.eval()
+            free_cuda("(pre mid-train eval)")
+            print("[e2e] measuring acceptance (mid-train)…", flush=True)
+            acc_mid, ctar_mid = eval_acceptance(
+                model, tok, prompts_eval, rollout_len, steps_per_prompt=1,
+                dump_debug=True, dump_path=samples_path, topk=debug_topk
             )
-    return baseline, global_step
+            print(f"[e2e] MID  | step {g+1:04d} | acc={acc_mid:.3f} | "
+                  f"CTAR1={ctar_mid[1]:.3f} CTAR2={ctar_mid[2]:.3f} CTAR3={ctar_mid[3]:.3f} CTAR4={ctar_mid[4]:.3f}",
+                  flush=True)
 
+    # Final eval — free training state first
+    del opt
+    del buf
+    free_cuda("(pre post-train eval)")
+    model.eval()
 
-# ---------------------------------------------------------------------------
-# Metric tracker class
-# ---------------------------------------------------------------------------
+    print("\n[e2e] measuring acceptance (post-train)…", flush=True)
+    acc1, ctar1 = eval_acceptance(
+        model, tok, prompts_eval, rollout_len, steps_per_prompt=1,
+        dump_debug=True, dump_path=samples_path, topk=debug_topk
+    )
+    print(f"[e2e] POST | acc={acc1:.3f} | Δ={acc1-acc0:+.3f} | "
+          f"CTAR1={ctar1[1]:.3f} CTAR2={ctar1[2]:.3f} CTAR3={ctar1[3]:.3f} CTAR4={ctar1[4]:.3f}", flush=True)
 
-
-class MetricTracker:
-    def __init__(self, K: int):
-        self.K = K
-        self.reset()
-
-    def reset(self):
-        self.tokens = 0
-        self.accepted = 0
-        self.windows = 0
-        self.ctar_counts = [0 for _ in range(self.K)]
-        self.throughput_tokens = 0
-        self.throughput_time = 0.0
-
-    def update_window(self, accepts: Iterable[int], duration: float) -> None:
-        accepts = list(accepts)
-        self.windows += 1
-        self.tokens += len(accepts)
-        self.accepted += sum(accepts)
-        for w in range(1, self.K + 1):
-            if len(accepts) >= w and all(accepts[:w]):
-                self.ctar_counts[w - 1] += 1
-        self.throughput_tokens += len(accepts)
-        self.throughput_time += duration
-
-    def acceptance_rate(self) -> float:
-        return self.accepted / self.tokens if self.tokens else 0.0
-
-    def ctar_w(self, w: int) -> float:
-        return self.ctar_counts[w - 1] / self.windows if self.windows else 0.0
-
-    def compression(self) -> float:
-        return self.accepted / self.windows if self.windows else 0.0
-
-    def throughput(self) -> float:
-        return self.throughput_tokens / self.throughput_time if self.throughput_time else 0.0
-
-
-# ---------------------------------------------------------------------------
-# Argument parser
-# ---------------------------------------------------------------------------
-
-
-def parse_args():
-    p = argparse.ArgumentParser("DVI smoketest")
-    # model / device ------------------------------------------------------
-    p.add_argument("--model_id", type=str, required=True)
-    p.add_argument("--early_layer", type=int, default=2)
-    p.add_argument("--dtype", choices=list(DTYPE_MAP), default="float16")
-    p.add_argument("--device", type=str, default="auto")
-
-    # data ---------------------------------------------------------------
-    p.add_argument("--data_mode", choices=["alpaca", "lines", "random"], default="alpaca")
-    p.add_argument("--data_path", type=str, default=None)
-    p.add_argument("--max_prompts", type=int, default=2000)
-    p.add_argument("--prompt_trunc", type=int, default=128)
-
-    # rollout / training lengths ---------------------------------------
-    p.add_argument("--K", "--rollout_len", type=int, default=4)
-    p.add_argument("--baseline_steps", type=int, default=150)
-    p.add_argument("--warmup_steps", type=int, default=200)
-    p.add_argument("--mixed_steps", type=int, default=400)
-    p.add_argument("--pure_rl_steps", type=int, default=200)
-    p.add_argument("--eval_interval", type=int, default=25)
-
-    # optim / buffer ----------------------------------------------------
-    p.add_argument("--lr", type=float, default=1e-4)
-    p.add_argument("--batch_size", type=int, default=8)
-    p.add_argument("--buffer_cap", type=int, default=1024)
-    p.add_argument("--clip", type=float, default=1.0)
-
-    # SAL / schedule ----------------------------------------------------
-    p.add_argument("--kl_schedule", choices=["exp", "cosine"], default="exp")
-    p.add_argument("--kl_lambda0", type=float, default=1.0)
-    p.add_argument("--kl_min", type=float, default=0.0)
-    p.add_argument("--kl_tau", type=int, default=200)
-    p.add_argument("--kl_dir", choices=["v2d", "d2v"], default="v2d")
-    p.add_argument("--kl_temperature", type=float, default=1.5)
-
-    # RL specifics ------------------------------------------------------
-    p.add_argument("--rl_all_tokens", action="store_true", default=True)
-    p.add_argument("--no-rl_all_tokens", dest="rl_all_tokens", action="store_false")
-    p.add_argument("--no_rl_during_warmup", action="store_true", default=True)
-    p.add_argument("--adv_baseline_mode", choices=["ema", "none"], default="ema")
-
-    # output / reproducibility -----------------------------------------
-    p.add_argument("--outdir", type=str, required=True)
-    p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--tensorboard", action="store_true")
-    p.add_argument("--log_level", choices=["INFO", "DEBUG"], default="INFO")
-    p.add_argument("--debug_samples", type=int, default=32)
-
-    return p.parse_args()
-
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
+# --------------------------- main ---------------------------
 
 def main():
-    global args
-    args = parse_args()
-    outdir = setup_outdir(args.outdir)
-    logger = setup_logging(outdir, args.log_level)
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--model-id", type=str, default="meta-llama/Llama-2-7b-hf")
+    ap.add_argument("--early-layer", type=int, default=24)  # patched: later default exit
+    ap.add_argument("--train-prompts", type=int, default=256)
+    ap.add_argument("--eval-prompts", type=int, default=64)
+
+    ap.add_argument("--steps", type=int, default=300)
+    ap.add_argument("--rollout", type=int, default=8)
+    ap.add_argument("--batch-size", type=int, default=64)
+
+    # patched defaults: stronger head LR; sharper teacher; stronger CE
+    ap.add_argument("--lr-exit", type=float, default=5e-4)
+    ap.add_argument("--lr-lora", type=float, default=5e-5)
+    ap.add_argument("--temperature", type=float, default=1.0)
+    ap.add_argument("--ce-weight", type=float, default=0.20)
+    ap.add_argument("--ent-weight", type=float, default=0.00)
+
+    # KL->RL schedule (patched: shorter warmup & ramp)
+    ap.add_argument("--warmup-kl", type=int, default=40)
+    ap.add_argument("--ramp-steps", type=int, default=80)
+    ap.add_argument("--kl-min", type=float, default=0.05)
+    ap.add_argument("--pg-max", type=float, default=1.0)
+
+    # Debugging / logging
+    ap.add_argument("--outdir", type=str, default="minbench_out")
+    ap.add_argument("--debug-dump-every", type=int, default=25, help="Dump rollout samples every N steps (0 to disable).")
+    ap.add_argument("--debug-topk", type=int, default=5, help="Top-k to include in sample dumps.")
+    ap.add_argument("--accepted-only", action="store_true",
+                    help="Prefer training only on accepted tokens (activated in MIXED/RL; backoffs to all when insufficient).")
+
+    # Exit-head scale safety (disabled by default)
+    ap.add_argument("--max-fro", type=float, default=0.0, help="Absolute clamp for ‖exit_proj‖. 0 disables.")
+    ap.add_argument("--max-fro-ratio", type=float, default=0.0, help="Relative clamp vs initial ‖exit_proj‖ (e.g., 1.5). 0 disables.")
+
+    ap.add_argument("--eval-every", type=int, default=50)
+    ap.add_argument("--seed", type=int, default=1234)
+    args = ap.parse_args()
+
+    ensure_dirs(args.outdir)
+    env_dump(args.outdir)
     set_seed(args.seed)
 
-    with open(outdir / "config.json", "w", encoding="utf-8") as f:
-        json.dump(vars(args), f, indent=2)
+    tok = AutoTokenizer.from_pretrained(args.model_id, use_fast=True)
+    if tok.pad_token_id is None: tok.pad_token = tok.eos_token
 
-    dev = torch.device(args.device if args.device != "auto" else ("cuda" if torch.cuda.is_available() else "cpu"))
-    dtype = DTYPE_MAP[args.dtype]
+    print("[e2e] loading prompts…", flush=True)
+    prompts_train = build_prompts_from_alpaca(args.train_prompts)
+    prompts_eval  = build_prompts_from_alpaca(args.eval_prompts)
 
-    try:
-        tokenizer = AutoTokenizer.from_pretrained(args.model_id)
-    except Exception:  # pragma: no cover - tokenizer failure
-        tokenizer = None
-        logging.warning("Falling back to random prompts; tokenizer load failed")
+    print("[e2e] loading model…", flush=True)
+    model = prepare_dvi_trainable(args.model_id, args.early_layer, dtype=torch.float16)
 
-    model = EarlyExitLlamaForCausalLM.from_pretrained(args.model_id, torch_dtype=dtype, EARLY_STOP_LAYER=args.early_layer)
-    model.to(dev)
-    model = prepare_model_for_training(model, args.early_layer)
+    # sanity: head parity & norms (before any training)
+    with torch.no_grad():
+        lm_nrm   = model.lm_head.weight.detach().float().norm().item()
+        exit_nrm = model.exit_proj.weight.detach().float().norm().item()
+        diff_nrm = (model.lm_head.weight.detach().float() - model.exit_proj.weight.detach().float()).norm().item()
+    print("[sanity] head parity:", {"||lm||": lm_nrm, "||exit||": exit_nrm, "||lm-exit||": diff_nrm}, flush=True)
 
-    # KV side-effect-free check ----------------------------------------
-    ids = torch.randint(0, model.config.vocab_size, (1, 1), device=dev)
-    v1 = model.verifier_logits_for_next(ids)
-    v2 = model.verifier_logits_for_next(ids)
-    assert torch.allclose(v1, v2), "verifier accessor has side effects on outputs"
+    train_bestcase_kl_rl(
+        model, tok, prompts_train, prompts_eval,
+        steps=args.steps, rollout_len=args.rollout, batch_size=args.batch_size,
+        lr_exit=args.lr_exit, lr_lora=args.lr_lora, temperature=args.temperature,
+        ce_weight=args.ce_weight, eval_every=args.eval_every,
+        warmup_kl=args.warmup_kl, ramp_steps=args.ramp_steps,
+        kl_min=args.kl_min, pg_max=args.pg_max, ent_weight=args.ent_weight,
+        outdir=args.outdir, accepted_only_flag=args.accepted_only,
+        debug_dump_every=args.debug_dump_every, debug_topk=args.debug_topk,
+        max_fro=args.max_fro, max_fro_ratio=args.max_fro_ratio
+    )
 
-    prompts = load_prompts(args, tokenizer)
-    buffer = ReplayBuffer(args.buffer_cap, torch.device("cpu"))
-    opt = torch.optim.Adam([p for p in model.parameters() if p.requires_grad], lr=args.lr)
-    baseline = 0.0
-
-    tracker = MetricTracker(args.K)
-    writer = SummaryWriter(outdir) if args.tensorboard else None
-
-    csv_file = open(outdir / "metrics.csv", "w", newline="")
-    fieldnames = ["phase", "step", "acc", "ctar1", "ctar2", "comp", "tok_s", "loss", "rl", "kl", "lambda", "grad", "baseline", "ent_d", "ent_v"]
-    csv_writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
-    csv_writer.writeheader()
-
-    stats: Dict[str, List[float]] = {}
-    history: Dict[str, List[float]] = {}
-    mismatch_hist: Dict[int, int] = {}
-    token_pos = [0]
-    check_vlogits_shape: List[bool] = []
-
-    # phases ------------------------------------------------------------
-    global_step = 0
-    baseline, global_step = run_phase("baseline", args.baseline_steps, args, model, tokenizer, prompts, buffer, baseline, global_step, stats, history, writer, csv_writer, mismatch_hist, token_pos, check_vlogits_shape, tracker, opt, 0.0)
-    baseline_ref = sum(stats["baseline"]) / len(stats["baseline"]) if stats.get("baseline") else 0.0
-    baseline_ctar1 = tracker.ctar_w(1)
-    baseline_comp = tracker.compression()
-    baseline, global_step = run_phase("warmup", args.warmup_steps, args, model, tokenizer, prompts, buffer, baseline, global_step, stats, history, writer, csv_writer, mismatch_hist, token_pos, check_vlogits_shape, tracker, opt, baseline_ref)
-
-    warmup_mean = sum(stats.get("warmup", [0.0])) / max(len(stats.get("warmup", [])), 1)
-    if warmup_mean < baseline_ref + 0.03:
-        raise SystemExit("Acceptance failed to improve during warmup; aborting")
-
-    baseline, global_step = run_phase("mixed", args.mixed_steps, args, model, tokenizer, prompts, buffer, baseline, global_step, stats, history, writer, csv_writer, mismatch_hist, token_pos, check_vlogits_shape, tracker, opt, baseline_ref)
-    baseline, global_step = run_phase("pure_rl", args.pure_rl_steps, args, model, tokenizer, prompts, buffer, baseline, global_step, stats, history, writer, csv_writer, mismatch_hist, token_pos, check_vlogits_shape, tracker, opt, baseline_ref)
-
-    csv_file.close()
-    if writer:
-        writer.close()
-
-    # summary -----------------------------------------------------------
-    end_acc = sum(history.get("acc", [])[-10:]) / max(len(history.get("acc", [])[-10:]), 1)
-    ctar1_final = history.get("ctar1", [0.0])[-1]
-    comp_final = history.get("comp", [0.0])[-1]
-    peak_tok_s = max(history.get("tok_s", [0.0]))
-    summary = {
-        "baseline_acc_mean": baseline_ref,
-        "baseline_acc_std": float(torch.tensor(stats.get("baseline", [0.0])).std().item()) if stats.get("baseline") else 0.0,
-        "end_acc": end_acc,
-        "delta_acc": end_acc - baseline_ref,
-        "ctar1_final": ctar1_final,
-        "ctar1_delta": ctar1_final - baseline_ctar1,
-        "compression_final": comp_final,
-        "compression_delta": comp_final - baseline_comp,
-        "peak_tok_s": peak_tok_s,
-        "final_lambda": history.get("lambda", [0.0])[-1] if history.get("lambda") else 0.0,
-        "final_baseline": baseline,
-        "verdict": "PASS" if end_acc - baseline_ref >= 0.03 else "WARN",
-    }
-    with open(outdir / "final_summary.json", "w", encoding="utf-8") as f:
-        json.dump(summary, f, indent=2)
-
-    with open(outdir / "debug_samples.jsonl", "w", encoding="utf-8") as f:
-        for rec in history.get("debug", []):
-            f.write(json.dumps(rec) + "\n")
-
-    # plots -------------------------------------------------------------
-    try:  # pragma: no cover - plotting is best effort
-        import matplotlib.pyplot as plt
-
-        xs = list(range(1, len(history.get("acc", [])) + 1))
-        plt.figure(); plt.plot(xs, history.get("acc", [])); plt.xlabel("step"); plt.ylabel("acceptance"); plt.savefig(outdir / "plots" / "acceptance.png"); plt.close()
-        plt.figure(); plt.plot(xs, history.get("ctar1", []), label="CTAR1"); plt.plot(xs, history.get("ctar2", []), label="CTAR2"); plt.legend(); plt.savefig(outdir / "plots" / "ctar.png"); plt.close()
-        plt.figure(); plt.plot(xs, history.get("loss", []), label="loss"); plt.plot(xs, history.get("rl", []), label="rl"); plt.plot(xs, history.get("kl", []), label="kl"); plt.legend(); plt.savefig(outdir / "plots" / "losses.png"); plt.close()
-        plt.figure(); plt.plot(xs, history.get("tok_s", [])); plt.xlabel("step"); plt.ylabel("tok/s"); plt.savefig(outdir / "plots" / "throughput.png"); plt.close()
-    except Exception as exc:
-        logging.warning("Plot generation failed: %s", exc)
-
-    if mismatch_hist:
-        logging.warning("first-mismatch positions: %s", mismatch_hist)
-
-
-if __name__ == "__main__":  # pragma: no cover
+if __name__ == "__main__":
     main()

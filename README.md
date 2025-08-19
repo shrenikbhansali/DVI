@@ -196,3 +196,183 @@ We also train the verifier’s adapter (LoRA \$\phi\$) using supervised losses:
 
 
 
+Here’s a clean, paste-ready section you can drop into the README.
+
+---
+
+## Notes on Design & Implementation Choices
+
+
+### 1) Exit-Head Stabilization: Pre-Norm + Learnable Logit Scale
+
+**What we do.** Before the draft head, we apply a normalization layer (clone of the model’s final RMSNorm when available, LayerNorm fallback) and multiply logits by a learnable global scalar:
+
+* `ĥ = Norm(h_k)`
+* `z_s = α · W_exit · ĥ` with `α` learnable
+
+**Why it helps.**
+
+* **Distribution matching.** Hidden magnitudes at layer `k` drift as LoRA updates accumulate. Pre-norm keeps the exit features in the same range the original LM head expects, making KL/CE well-behaved.
+* **Single-knob calibration.** A global scale `α` prevents the exit head from becoming over-confident (or too flat) during early training, avoiding vanishing or exploding gradients without hand-tuned temperature hacks.
+
+**Alternatives.**
+
+* No pre-norm (simpler, but more likely to destabilize early training).
+* Per-class temperature / vector scale (more expressive, higher variance).
+* WeightNorm on `W_exit` (good control but slightly more plumbing).
+
+We default to **Pre-Norm + scalar scale** for minimal complexity and strong stability.
+
+---
+
+### 2) “RL” Term Uses **Log-Probability** of the Verifier’s Top-1
+
+**What we do.** The policy term optimizes `L_pg = - E[ log π_s(v_top1) ]` (draft log-prob on the verifier’s top-1 token).
+
+**Why it helps.**
+
+* **Stronger gradients when wrong.** `-π(v)` has tiny gradient when π is small; `-log π(v)` gives large corrective updates, accelerating bootstrap.
+* **Low variance.** Using the verifier top-1 as a pseudo-target is a low-variance surrogate compared to binary accept bits.
+* **Compatible with KL/CE.** Plays nicely with distillation and avoids double-counting issues better than raw probability objectives.
+
+**Alternatives.**
+
+* True REINFORCE on accept bits: `-(r - b) · log π_s(t)` (unbiased but noisy; needs a baseline `b` and/or accepted-only sampling).
+* Raw probability `-E[π_s(v)]` (simpler but weak gradients off-mode).
+* Margin losses between `v_top1` and runner-up (can help late-stage sharpening).
+
+We picked **log-prob** as the best trade-off for fast, stable bootstrap. (Extending to `(r−b)·log π` with an EMA baseline is a natural next step.)
+
+---
+
+### 3) **Sharper Teacher** (Temperature **T = 1.0** by default)
+
+**What we do.** KL uses the verifier distribution at **T=1.0** (no softening), plus a CE anchor on `v_top1`.
+
+**Why it helps.**
+
+* **Crisp signal early on.** When acceptance is near zero, a sharp teacher avoids “blurred” supervision where the mode is unclear.
+* **Better alignment with acceptance.** In DVI, acceptance is a top-1 event. A sharper teacher makes the KL/CE signals reflect the same decision boundary.
+
+**Alternatives.**
+
+* Softer teacher (T=1.1–1.5): improves mode coverage and can help if the verifier is noisy or under-confident.
+* Annealed temperature: start soft → hard as acceptance rises.
+
+We default to **T=1.0**; if you see instability, try **T≈1.2** for a few thousand steps.
+
+---
+
+### 4) **Stronger CE Anchor** During Warm-Up
+
+**What we do.** We add a CE term on the verifier’s top-1 (default weight `0.20`). Together with KL it provides dense gradients from step 1.
+
+**Why it helps.**
+
+* **Avoids cold-start collapse.** When acceptance is \~0, pure RL has no signal; CE guarantees a usable gradient.
+* **Complementary to KL.** KL shapes the full distribution; CE pins the argmax.
+
+**Alternatives.**
+
+* Decay CE weight over time (common pattern: strong early, taper late).
+* Replace CE with margin or contrastive terms (works but less plug-and-play).
+
+If your model becomes over-confident too soon, lower CE (e.g., `0.05–0.10`) or add a tiny entropy bonus.
+
+---
+
+### 5) KL Direction & Scheduling
+
+**What we do.** We use **forward KL** `D_KL(p_verify || p_draft)` and a **KL→RL** schedule (warm-up, then ramp up the policy term, keep a small KL residual).
+
+**Why it helps.**
+
+* **Mode-covering early.** Forward KL encourages the draft to match the teacher’s mass, helpful when the draft is under-trained.
+* **Residual KL** stabilizes late training and prevents drift from the verifier.
+
+**Alternatives.**
+
+* Reverse KL (mode-seeking; sharper but brittle early).
+* No residual KL in late RL (more exploration, more risk).
+
+Keep a small **KL floor** (e.g., 0.05) unless you specifically want to push exploration.
+
+---
+
+### 6) Later Split by Default (Deeper Draft)
+
+**What we do.** Default `early_layer=24` (vs very shallow layers).
+
+**Why it helps.**
+
+* **Higher acceptance ceiling.** A deeper draft is closer (representation-wise) to the verifier, raising baseline agreement and making the RL/KL objectives easier.
+* **Better gradient alignment.** Hidden features at later layers are more “LM-head ready.”
+
+**Alternatives.**
+
+* Shallower split (more speedup, lower acceptance).
+* Adaptive split (dynamic k): promising but more engineering.
+
+Start with **24** (7B scale). Tune for your speed/quality target.
+
+---
+
+### 7) No Norm Clamping by Default (But Available)
+
+**What we do.** We ship a Frobenius-norm clamp for the exit head **disabled** by default.
+
+**Why.**
+
+* The **learnable logit scale** already provides amplitude control. Hard clamping can silently fight the scale and slow learning.
+
+**Alternatives.**
+
+* Relative clamp (e.g., `‖W_exit‖ ≤ 1.5×‖W_init‖`) if you see norm blow-ups.
+* Lower weight decay on the exit head if under-fitting.
+
+Use clamps only as a **seatbelt** when you observe instability, not preemptively.
+
+---
+
+### 8) Accepted-Only Sampling (Optional)
+
+**What we do.** You can enable **accepted-only** batch sampling (with a backoff if the pool is too small). The loss still trains on the verifier target; the filter changes which states are sampled.
+
+**Why it helps.**
+
+* **Variance reduction.** Focuses updates on states where the verifier and draft already interact positively, which often stabilizes mid-training.
+
+**Trade-offs.**
+
+* **Bias.** Skews experience toward “good” states; combine with periodic full-buffer sampling to avoid over-fitting.
+* **Cold-start.** Keep it **off** during pure KL warm-up; consider turning it on once acceptance > \~10–20%.
+
+---
+
+### 9) Diagnostics Worth Watching
+
+* **`std_s` vs `std_t`** (student vs teacher logit std): large gaps → mis-calibration; if `std_s` ≫ `std_t`, reduce CE or add entropy; if `std_s` ≪ `std_t`, increase scale/CE slightly.
+* **`π_s(v)`** and **acceptance rate**: should trend upward as KL decays.
+* **Exit-head norm** and **logit scale α**: rapid growth = over-confidence; flatlined α with rising loss = under-fitting.
+
+---
+
+### 10) What We Didn’t Do (and Why)
+
+* **Direct binary-reward REINFORCE** in the default path: the accept bit is extremely sparse at bootstrap → high-variance updates. The current surrogate (`-log π_s(v_top1)`) gives most of the win with far better stability.
+  *If you want unbiased RL*, add `(r−b)` as a multiplier to the log-prob term and maintain an EMA baseline `b`.
+* **Hard temperature schedules or label smoothing**: the learnable scale plus CE were sufficient in practice; consider temperature annealing only if you see persistent over-confidence.
+
+---
+
+### TL;DR: Defaults that Make DVI Train
+
+* **Pre-Norm + logit scale** before the exit head → calibrated logits.
+* **Log-prob policy term** on verifier top-1 → strong, low-variance updates.
+* **Sharp teacher (T=1.0) + CE anchor** → dense bootstrap signal.
+* **Forward KL with residual weight** → stability as RL ramps.
+* **Later split (k≈24)** → higher acceptance ceiling.
+* **Clamps off by default**, enable only if needed.
+* **Accepted-only sampling** optional; turn on after acceptance improves.
+
+These choices aim to **maximize early learning signal** and **minimize variance**, so the draft can quickly align with the verifier and lift acceptance without babysitting.
