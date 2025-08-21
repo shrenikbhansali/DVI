@@ -195,9 +195,6 @@ We also train the verifier’s adapter (LoRA \$\phi\$) using supervised losses:
 * \$D\_{\text{KL}}\$: Ensures the verifier doesn’t change too rapidly.
 
 
-
-Here’s a clean, paste-ready section you can drop into the README.
-
 ---
 
 ## Notes on Design & Implementation Choices
