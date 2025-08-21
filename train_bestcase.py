@@ -28,6 +28,9 @@ from training.utils import (
     build_prompts_from_alpaca,
     free_cuda,
     _cuda_sync,
+    # added for compression + timing
+    count_transformer_layers,
+    theoretical_compression,
 )
 from training.modeling import prepare_dvi_trainable, build_optimizer
 from training.kv import estimate_kv_cache
@@ -48,7 +51,8 @@ def train_bestcase_kl_rl(model, tok, prompts_train: List[str], prompts_eval: Lis
                         outdir: str, accepted_only_flag: bool,
                         debug_dump_every: int, debug_topk: int,
                         max_fro: float, max_fro_ratio: float,
-                        quiet_eval: bool):
+                        quiet_eval: bool,
+                        early_layer: int):
     metrics_path = os.path.join(outdir, "logs", "train_metrics.jsonl")
     samples_path = os.path.join(outdir, "logs", "rollout_samples.jsonl")
 
@@ -61,6 +65,10 @@ def train_bestcase_kl_rl(model, tok, prompts_train: List[str], prompts_eval: Lis
         lm_norm = float(torch.linalg.vector_norm(model.lm_head.weight).item())
     print(f"[sanity] head norms: ||lm||={lm_norm:.3f} ||exit||={init_fro:.3f}", flush=True)
     wandb_log({"sanity/lm_head_norm": lm_norm, "sanity/exit_head_norm": init_fro}, step=0)
+
+    # layer count for compression estimates
+    total_layers = count_transformer_layers(model)
+    print(f"[info] total decoder layers detected: {total_layers}", flush=True)
 
     print("\n[e2e] measuring acceptance (pre-train)…", flush=True)
     free_cuda("(pre-eval)")
@@ -143,6 +151,9 @@ def train_bestcase_kl_rl(model, tok, prompts_train: List[str], prompts_eval: Lis
         step_time = (t_trn_e - t_trn_s)
 
         accept_roll = float(batch["reward"].float().mean().item())
+        # per-step compression & speedup estimate (frequent logging)
+        comp_ratio, speedup_est = theoretical_compression(accept_roll, early_layer, total_layers)
+
         buf_size = len(buf)
         buf_acc = buf.accepted_count()
         buf_rate = (buf_acc / buf_size) if buf_size else 0.0
@@ -167,7 +178,8 @@ def train_bestcase_kl_rl(model, tok, prompts_train: List[str], prompts_eval: Lis
             f"π_s(v)≈{out['pi_v']:.4f} | std_s={std_s:.3f} std_t={std_t:.3f} | "
             f"||exit||={exit_norm:.2f} | roll_acc≈{accept_roll:.4f} | "
             f"buf_size={buf_size} acc_rate≈{buf_rate:.3f} | λ_pg={lam_pg:.3f} λ_kl={lam_kl:.3f} | accepted_only={accepted_only} | "
-            f"KV={kv_mb:.2f} MB (seq≈{kv_seq}) | CUDA alloc={mem_alloc:.1f} MB",
+            f"KV={kv_mb:.2f} MB (seq≈{kv_seq}) | CUDA alloc={mem_alloc:.1f} MB | "
+            f"comp≈{comp_ratio:.3f} (speedup≈{speedup_est:.2f}×)",
             flush=True,
         )
 
@@ -183,6 +195,11 @@ def train_bestcase_kl_rl(model, tok, prompts_train: List[str], prompts_eval: Lis
             kv_bytes=kv_bytes, kv_mb=kv_mb, kv_seq_est=kv_seq,
             cuda_mem_alloc_mb=mem_alloc, cuda_mem_reserved_mb=mem_reserved, cuda_mem_max_alloc_mb=mem_max,
             tokens_total=tokens_total,
+            # added metrics
+            comp_ratio_est=comp_ratio,
+            comp_speedup_est=speedup_est,
+            total_layers=total_layers,
+            early_layer=early_layer,
         )
         with open(metrics_path, "a") as f:
             f.write(json.dumps(metrics) + "\n")
@@ -204,6 +221,9 @@ def train_bestcase_kl_rl(model, tok, prompts_train: List[str], prompts_eval: Lis
             "kv/bytes": kv_bytes, "kv/MB": kv_mb, "kv/seq_est": kv_seq,
             "cuda/mem_alloc_MB": mem_alloc, "cuda/mem_reserved_MB": mem_reserved, "cuda/mem_max_alloc_MB": mem_max,
             "tokens/total": tokens_total,
+            # added: frequent compression logging
+            "comp/ratio_est": comp_ratio,
+            "comp/speedup_est": speedup_est,
         }, step=g)
 
         if dbg_roll:
@@ -268,6 +288,15 @@ def main():
     ap.add_argument("--max-fro-ratio", type=float, default=0.0)
     ap.add_argument("--eval-every", type=int, default=50)
     ap.add_argument("--seed", type=int, default=1234)
+    # timing / compression CLI
+    ap.add_argument("--time-prompts", type=int, default=64,
+                    help="#prompts for post-train walltime measurement")
+    ap.add_argument("--time-max-new-tokens", type=int, default=64,
+                    help="new tokens to generate for timing")
+    ap.add_argument("--time-repeats", type=int, default=3,
+                    help="repeat timing and take median")
+    ap.add_argument("--timing-greedy", action="store_true",
+                    help="use greedy decoding for walltime timing (default: sampling)")
     ap.add_argument("--no-wandb", action="store_true")
     ap.add_argument("--wandb-entity", type=str, default=WANDB_DEFAULT_ENTITY)
     ap.add_argument("--wandb-project", type=str, default=WANDB_DEFAULT_PROJECT)
@@ -313,14 +342,62 @@ def main():
         outdir=args.outdir, accepted_only_flag=args.accepted_only,
         debug_dump_every=args.debug_dump_every, debug_topk=args.debug_topk,
         max_fro=args.max_fro, max_fro_ratio=args.max_fro_ratio,
-        quiet_eval=args.quiet_eval
+        quiet_eval=args.quiet_eval,
+        early_layer=args.early_layer,
     )
+
+    # -------- Post-train walltime timing --------
+    print("\n[e2e] timing DVI vs baseline…", flush=True)
+    from training.utils import measure_generate_walltime
+    timing_prompts = build_prompts_from_alpaca(args.time_prompts)
+
+    # (1) DVI timing
+    model.eval()
+    dvi_time = measure_generate_walltime(
+        model, tok, timing_prompts,
+        max_new_tokens=args.time_max_new_tokens,
+        greedy=args.timing_greedy,
+        repeats=args.time_repeats,
+    )
+    print(f"[time] DVI generate: {dvi_time:.3f}s", flush=True)
+
+    # Clear DVI before loading baseline to save memory
+    del model
+    free_cuda("(before baseline timing)")
+
+    # (2) Baseline full model timing
+    from transformers import AutoModelForCausalLM
+    baseline = AutoModelForCausalLM.from_pretrained(
+        args.model_id, torch_dtype=torch.float16, device_map="auto"
+    )
+    baseline.eval()
+    base_time = measure_generate_walltime(
+        baseline, tok, timing_prompts,
+        max_new_tokens=args.time_max_new_tokens,
+        greedy=args.timing_greedy,
+        repeats=args.time_repeats,
+    )
+    print(f"[time] Baseline generate: {base_time:.3f}s", flush=True)
+
+    speedup_wall = (base_time / dvi_time) if dvi_time > 0 else float("inf")
+    print(f"[time] Walltime speedup (baseline/DVI): {speedup_wall:.3f}×", flush=True)
+
+    wandb_log({
+        "speed/walltime_dvi_s": dvi_time,
+        "speed/walltime_base_s": base_time,
+        "speed/speedup_walltime": speedup_wall,
+    }, step=args.steps)
+
+    # Cleanup
+    del baseline
+    free_cuda("(timing done)")
 
     if run is not None:
         try:
             run.finish()
         except Exception:
             pass
+
 
 if __name__ == "__main__":
     main()
