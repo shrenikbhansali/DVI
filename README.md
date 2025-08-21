@@ -376,3 +376,17 @@ Use clamps only as a **seatbelt** when you observe instability, not preemptively
 * **Accepted-only sampling** optional; turn on after acceptance improves.
 
 These choices aim to **maximize early learning signal** and **minimize variance**, so the draft can quickly align with the verifier and lift acceptance without babysitting.
+
+## Smoketest-equivalent Training Run
+
+The original smoketest script has been modularised into `train_bestcase.py`.
+A representative run:
+
+```bash
+python train_bestcase.py --model-id meta-llama/Llama-2-7b-hf --early-layer 4 \
+    --train-prompts 512 --eval-prompts 64 --steps 300 --rollout 8 \
+    --batch-size 64 --lr-exit 5e-4 --lr-lora 5e-5 --eval-every 50
+```
+
+This launches training with W&B logging, periodic evaluations and the
+same defaults as the smoketest.
