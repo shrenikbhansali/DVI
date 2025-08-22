@@ -297,6 +297,7 @@ def main():
                     help="repeat timing and take median")
     ap.add_argument("--timing-greedy", action="store_true",
                     help="use greedy decoding for walltime timing (default: sampling)")
+    ap.add_argument("--spec-draft-k", type=int, default=4, help="block size for self-spec drafting")
     ap.add_argument("--no-wandb", action="store_true")
     ap.add_argument("--wandb-entity", type=str, default=WANDB_DEFAULT_ENTITY)
     ap.add_argument("--wandb-project", type=str, default=WANDB_DEFAULT_PROJECT)
@@ -347,45 +348,70 @@ def main():
     )
 
     # -------- Post-train walltime timing --------
-    print("\n[e2e] timing DVI vs baseline…", flush=True)
-    from training.utils import measure_generate_walltime
+    print("\n[e2e] timing DVI (SPEC) vs baseline…", flush=True)
+    from training.utils import measure_generate_walltime, theoretical_compression, count_transformer_layers
     timing_prompts = build_prompts_from_alpaca(args.time_prompts)
 
-    # (1) DVI timing
     model.eval()
-    dvi_time = measure_generate_walltime(
+    dvi_device = next(model.parameters()).device
+    dvi_dtype = next(model.parameters()).dtype
+    total_layers = count_transformer_layers(model)
+    print(f"[time] decode_mode=DVI(SPEC); device={dvi_device}; dtype={dvi_dtype}", flush=True)
+
+    dvi_res = measure_generate_walltime(
         model, tok, timing_prompts,
         max_new_tokens=args.time_max_new_tokens,
         greedy=args.timing_greedy,
         repeats=args.time_repeats,
+        use_dvi_spec=True,
+        draft_k=args.spec_draft_k,
+        temperature=max(1e-6, args.temperature),
+        early_layer_override=args.early_layer,
+        quiet=True,
     )
-    print(f"[time] DVI generate: {dvi_time:.3f}s", flush=True)
+    dvi_time, spec_metrics = dvi_res
+    print(f"[time] DVI(SPEC) generate: {dvi_time:.3f}s", flush=True)
+    if spec_metrics is None:
+        spec_metrics = {}
+    acc_rt = float(spec_metrics.get("spec/accept_rate", 0.0))
+    comp_rt, _ = theoretical_compression(acc_rt, args.early_layer, total_layers)
+    print(f"[spec] runtime_accept_rate={acc_rt:.3f} | runtime_comp_est≈{comp_rt:.3f}", flush=True)
 
-    # Clear DVI before loading baseline to save memory
     del model
     free_cuda("(before baseline timing)")
 
-    # (2) Baseline full model timing
     from transformers import AutoModelForCausalLM
     baseline = AutoModelForCausalLM.from_pretrained(
-        args.model_id, torch_dtype=torch.float16, device_map="auto"
-    )
+        args.model_id, torch_dtype=dvi_dtype
+    ).to(dvi_device)
     baseline.eval()
+    if getattr(baseline.config, "use_cache", True) is False:
+        baseline.config.use_cache = True
+
+    print(f"[time] decode_mode=BASELINE(vanilla); device={dvi_device}; dtype={dvi_dtype}", flush=True)
     base_time = measure_generate_walltime(
         baseline, tok, timing_prompts,
         max_new_tokens=args.time_max_new_tokens,
         greedy=args.timing_greedy,
         repeats=args.time_repeats,
+        use_dvi_spec=False,
     )
     print(f"[time] Baseline generate: {base_time:.3f}s", flush=True)
 
     speedup_wall = (base_time / dvi_time) if dvi_time > 0 else float("inf")
-    print(f"[time] Walltime speedup (baseline/DVI): {speedup_wall:.3f}×", flush=True)
+    print(f"[time] Walltime speedup (baseline/DVI SPEC): {speedup_wall:.3f}×", flush=True)
 
     wandb_log({
-        "speed/walltime_dvi_s": dvi_time,
+        "speed/walltime_dvi_spec_s": dvi_time,
         "speed/walltime_base_s": base_time,
-        "speed/speedup_walltime": speedup_wall,
+        "speed/speedup_walltime_spec": speedup_wall,
+        "spec/proposed": spec_metrics.get("spec/proposed", 0.0),
+        "spec/accepted": spec_metrics.get("spec/accepted", 0.0),
+        "spec/accept_rate": spec_metrics.get("spec/accept_rate", 0.0),
+        "comp/runtime_est": comp_rt,
+        "comp/theoretical_from_train": theoretical_compression(
+            spec_metrics.get("spec/accept_rate", 0.0), args.early_layer, total_layers
+        )[0],
     }, step=args.steps)
 
     # Cleanup

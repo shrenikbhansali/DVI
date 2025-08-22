@@ -9,7 +9,7 @@ import json
 import gc
 import random
 import time
-from typing import List, Optional
+from typing import List, Optional, Dict
 from statistics import median
 
 import torch
@@ -200,85 +200,56 @@ def _get_input_vocab_size(model) -> Optional[int]:
                 pass
     return None
 
-def measure_generate_walltime(model, tok, prompts: List[str],
-                              max_new_tokens: int = 64,
-                              greedy: bool = True,
-                              repeats: int = 3) -> float:
+def measure_generate_walltime(
+    model,
+    tok,
+    prompts: List[str],
+    *,
+    max_new_tokens: int = 64,
+    greedy: bool = False,
+    repeats: int = 3,
+    use_dvi_spec: bool = False,
+    draft_k: int = 4,
+    temperature: float = 1.0,
+    quiet: bool = True,
+    early_layer_override: Optional[int] = None,
+):
     """
-    Return median walltime (seconds) for a .generate() pass over `prompts`.
-    Robust to vocab/tokenizer mismatches and CUDA asserts during sampling.
+    Returns:
+      - elapsed_seconds if use_dvi_spec=False
+      - (elapsed_seconds, spec_metrics_dict) if use_dvi_spec=True
     """
-    device = next(model.parameters()).device
-    model.eval()
-
-    # Ensure decode IDs exist on model.config
-    try:
-        if getattr(model.config, "eos_token_id", None) is None and tok.eos_token_id is not None:
-            model.config.eos_token_id = tok.eos_token_id
-        if getattr(model.config, "pad_token_id", None) is None and tok.pad_token_id is not None:
-            model.config.pad_token_id = tok.pad_token_id
-        if getattr(model.config, "bos_token_id", None) is None and getattr(tok, "bos_token_id", None) is not None:
-            model.config.bos_token_id = tok.bos_token_id
-        if getattr(model.config, "use_cache", None) is False:
-            model.config.use_cache = True
-    except Exception:
-        pass
-
-    # Choose a safe context length and clamp tokenizer max_length to avoid OverflowError
-    max_ctx = _safe_max_ctx_len(tok, model, default=2048)
-    max_new_tokens = int(max(1, max_new_tokens))
-    # Leave some headroom for generation
-    max_input_len = max(8, max_ctx - max_new_tokens - 8)
-
-    # Tokenize with safe truncation/padding
-    enc = tok(
-        prompts,
-        return_tensors="pt",
-        padding=True,
-        truncation=True,
-        max_length=int(max_input_len),
-    )
-    input_ids = enc["input_ids"].to(device)
-    attention_mask = enc.get("attention_mask", None)
-    if attention_mask is not None:
-        attention_mask = attention_mask.to(device)
-
-    # Validate tokenizer/model vocab alignment (avoid device-side asserts)
-    in_vocab = _get_input_vocab_size(model)
-    if in_vocab is not None:
-        max_id = int(input_ids.max().item())
-        if max_id >= in_vocab:
-            raise RuntimeError(
-                f"Tokenizer produced id {max_id} >= input embedding vocab {in_vocab}. "
-                "Ensure tokenizer matches the model and pad_token is set (e.g., tok.pad_token = tok.eos_token)."
-            )
-
-    def _do_generate(force_greedy: bool) -> float:
+    times: List[float] = []
+    spec_last: Optional[Dict[str, float]] = None
+    for _ in range(repeats):
         _cuda_sync()
         t0 = time.perf_counter()
-        with torch.inference_mode():
-            _ = model.generate(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                max_new_tokens=max_new_tokens,
-                do_sample=not force_greedy,
-                num_beams=1,
-                pad_token_id=tok.pad_token_id,
-                eos_token_id=tok.eos_token_id,
-                bos_token_id=getattr(tok, "bos_token_id", None),
-            )
-        _cuda_sync()
-        return time.perf_counter() - t0
+        if use_dvi_spec:
+            from training.spec_decode import generate_with_dvi_spec
 
-    times: List[float] = []
-    for _ in range(max(1, repeats)):
-        try:
-            times.append(_do_generate(force_greedy=greedy))
-        except RuntimeError as e:
-            msg = str(e)
-            if "device-side assert" in msg or "CUDA error" in msg:
-                print("[time][warn] CUDA assert during sampling; retrying with greedy decode for timing.", flush=True)
-                times.append(_do_generate(force_greedy=True))
-            else:
-                raise
-    return float(median(times))
+            _, spec_metrics = generate_with_dvi_spec(
+                model, tok, prompts,
+                max_new_tokens=max_new_tokens,
+                draft_k=draft_k,
+                greedy=greedy,
+                temperature=temperature,
+                early_layer=early_layer_override or getattr(model, "early_layer", None),
+                device=next(model.parameters()).device,
+                quiet=quiet,
+            )
+            spec_last = spec_metrics.to_dict()
+        else:
+            with torch.no_grad():
+                _ = model.generate(
+                    **tok(prompts, return_tensors="pt", padding=True).to(next(model.parameters()).device),
+                    max_new_tokens=max_new_tokens,
+                    do_sample=not greedy,
+                    temperature=max(1e-6, temperature),
+                    use_cache=True,
+                )
+        _cuda_sync()
+        t1 = time.perf_counter()
+        times.append(t1 - t0)
+
+    elapsed = float(sorted(times)[len(times)//2])
+    return (elapsed, spec_last) if use_dvi_spec else elapsed
