@@ -3,11 +3,17 @@ from typing import List, Dict, Optional
 
 import json
 import torch
+import torch.nn.functional as F
 
 from training.kv import drafter_hidden_no_cache, advance_kv_with_committed, prime_kv_full
 from training.buffer import ReplayBuffer
+from training.modeling import (
+    run_shallow_until_k,
+    run_deep_from_k,
+    exit_logits_from_hidden_k,
+)
 
-__all__ = ["rollout_collect", "buf_debug"]
+__all__ = ["rollout_collect", "rollout_collect_k_spec", "buf_debug"]
 
 
 def _top1(logits: torch.Tensor) -> int:
@@ -62,6 +68,162 @@ def rollout_collect(spec, tok, prompt: str,
         advance_kv_with_committed(spec, v_token)
         last = v_token
         n_collected += 1
+    return n_collected
+
+
+def _sample_from_logits(logits: torch.Tensor, greedy: bool, temperature: float) -> torch.Tensor:
+    if greedy or temperature <= 0.0:
+        return logits.argmax(dim=-1)
+    probs = F.softmax(logits / max(1e-6, temperature), dim=-1)
+    return torch.multinomial(probs, num_samples=1).squeeze(-1)
+
+
+@torch.inference_mode()
+def rollout_collect_k_spec(
+    spec,
+    tok,
+    prompt: str,
+    buf: ReplayBuffer,
+    steps: int,
+    *,
+    k: int = 1,
+    greedy: bool = False,
+    temperature: float = 1.0,
+    debug_out: Optional[List[Dict]] = None,
+    topk: int = 5,
+) -> int:
+    """Collect rollouts using k-token speculative drafting.
+
+    This mirrors ``training/spec_decode.generate_with_dvi_spec`` but instead of
+    generating text it pushes per-token records into ``buf`` for training.
+    """
+
+    spec.eval()
+    device = next(spec.parameters()).device
+    enc = tok(prompt, return_tensors="pt")
+    input_ids = enc["input_ids"].to(device)
+    attn_mask = enc.get("attention_mask")
+    if attn_mask is not None:
+        attn_mask = attn_mask.to(device)
+
+    # --- prime KV caches on the prompt ---
+    h_k_prompt, shallow_past = run_shallow_until_k(
+        spec, input_ids=input_ids, attention_mask=attn_mask, past_key_values=None, use_cache=True
+    )
+    _, deep_past = run_deep_from_k(
+        spec, hidden_k=h_k_prompt, past_key_values=None, use_cache=True
+    )
+
+    # choose true last token (avoid PAD)
+    if attn_mask is not None:
+        lengths = attn_mask.long().sum(dim=1)
+        last_idx = torch.clamp(lengths - 1, min=0)
+    else:
+        last_idx = torch.full((input_ids.size(0),), input_ids.size(1) - 1, device=device, dtype=torch.long)
+    last_tokens = input_ids.gather(1, last_idx.unsqueeze(1)).squeeze(1)
+
+    B = input_ids.size(0)
+    n_collected = 0
+
+    while n_collected < steps:
+        draft_tokens = []
+        draft_hidden = []
+        tmp_shallow = shallow_past
+        prev = last_tokens
+        for _ in range(k):
+            h_k, tmp_shallow = run_shallow_until_k(
+                spec,
+                input_ids=prev.unsqueeze(1),
+                past_key_values=tmp_shallow,
+                attention_mask=None,
+                use_cache=True,
+            )
+            logits = exit_logits_from_hidden_k(spec, h_k)  # [B,1,V]
+            nxt = _sample_from_logits(logits[:, -1, :], greedy=greedy, temperature=temperature)
+            draft_tokens.append(nxt)
+            draft_hidden.append(h_k[:, -1, :])
+            prev = nxt
+
+        prop_seq = torch.stack(draft_tokens, dim=1)        # [B,k]
+        hidden_seq = torch.stack(draft_hidden, dim=1)      # [B,k,H]
+
+        with torch.no_grad():
+            deep_logits, deep_past_full = run_deep_from_k(
+                spec, hidden_k=hidden_seq, past_key_values=deep_past, use_cache=True
+            )
+
+        verify_argmax = deep_logits.argmax(dim=-1)         # [B,k]
+        matches = verify_argmax.eq(prop_seq)
+        rewards = matches.float()
+
+        # per-sample accepted prefix length
+        prefix_lens = []
+        for b in range(B):
+            row = matches[b]
+            nz = (~row).nonzero(as_tuple=False)
+            m = k if nz.numel() == 0 else int(nz[0].item())
+            prefix_lens.append(m)
+        prefix_lens = torch.tensor(prefix_lens, device=device)
+        accept_len = int(prefix_lens.min().item())
+
+        # append drafted positions to buffer
+        for b in range(B):
+            for d in range(k):
+                buf.append(
+                    hidden=hidden_seq[b, d].detach().cpu(),
+                    token=int(verify_argmax[b, d].item()),
+                    reward=float(rewards[b, d].item()),
+                    conf=0.0,
+                    vlogits=deep_logits[b, d].detach().cpu(),
+                )
+
+        n_collected += B * k
+
+        if debug_out is not None:
+            try:
+                v_prob, v_id = torch.topk(torch.softmax(deep_logits[0, 0].float(), dim=-1), k=topk)
+                d_logits = exit_logits_from_hidden_k(spec, hidden_seq[0:1, 0:1, :])
+                d_prob, d_id = torch.topk(torch.softmax(d_logits[0, 0].float(), dim=-1), k=topk)
+                debug_out.append({
+                    "draft_top1": int(prop_seq[0, 0]),
+                    "verifier_top1": int(verify_argmax[0, 0]),
+                    "accept": int(matches[0, 0]),
+                    "verifier_topk": [[int(i), float(p)] for p, i in zip(v_prob.tolist(), v_id.tolist())],
+                    "draft_topk": [[int(i), float(p)] for p, i in zip(d_prob.tolist(), d_id.tolist())],
+                })
+            except Exception:
+                pass
+
+        # accept common prefix
+        if accept_len > 0:
+            accepted_block = prop_seq[:, :accept_len]
+            past_len_s = shallow_past[0][0].shape[2] if shallow_past and shallow_past[0] is not None else 0
+            past_len_d = deep_past[0][0].shape[2] if deep_past and deep_past[0] is not None else 0
+            shallow_past = tuple(
+                (k_[:, :, : past_len_s + accept_len, :], v_[:, :, : past_len_s + accept_len, :])
+                for (k_, v_) in tmp_shallow
+            )
+            deep_past = tuple(
+                (k_[:, :, : past_len_d + accept_len, :], v_[:, :, : past_len_d + accept_len, :])
+                for (k_, v_) in deep_past_full
+            )
+            last_tokens = accepted_block[:, -1]
+
+        # fix single mismatch
+        if accept_len < k:
+            mismatch_tok = verify_argmax[:, accept_len]
+            h_fix, shallow_past = run_shallow_until_k(
+                spec,
+                input_ids=mismatch_tok.unsqueeze(1),
+                past_key_values=shallow_past,
+                attention_mask=None,
+                use_cache=True,
+            )
+            _, deep_past = run_deep_from_k(
+                spec, hidden_k=h_fix, past_key_values=deep_past, use_cache=True
+            )
+            last_tokens = mismatch_tok
+
     return n_collected
 
 
