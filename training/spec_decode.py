@@ -38,12 +38,12 @@ def _sample_from_logits(logits: torch.Tensor, greedy: bool, temperature: float) 
     probs = F.softmax(logits / max(1e-6, temperature), dim=-1)
     return torch.multinomial(probs, num_samples=1).squeeze(-1)
 
-
 def generate_with_dvi_spec(
     model,
     tok,
-    prompts: List[str],
+    prompts: Optional[List[str]] = None,
     *,
+    enc: Optional[Dict[str, torch.Tensor]] = None,  # can pass already-encoded batch
     max_new_tokens: int = 64,
     draft_k: int = 4,
     greedy: bool = False,
@@ -52,22 +52,46 @@ def generate_with_dvi_spec(
     device: Optional[torch.device] = None,
     quiet: bool = True,
 ) -> Tuple[List[torch.Tensor], SpecMetrics]:
-    """Self-speculative decoding using shallow/deep split."""
+    """Self-speculative decoding using shallow/deep split.
+
+    IMPORTANT: we must seed the first proposed token from the *last real
+    token* of each prompt (not the last column, which may be PAD).
+    """
     model.eval()
     device = device or next(model.parameters()).device
     k = early_layer if early_layer is not None else getattr(model, "early_layer", None)
     assert isinstance(k, int) and k > 0
 
-    enc = tok(prompts, padding=True, return_tensors="pt")
-    input_ids = enc["input_ids"].to(device)
-    attn_mask = enc.get("attention_mask")
-    if attn_mask is not None:
-        attn_mask = attn_mask.to(device)
+    # --- use pre-encoded inputs if provided; otherwise tokenize once ---
+    if enc is not None:
+        input_ids = enc["input_ids"].to(device)
+        attn_mask = enc.get("attention_mask")
+        if attn_mask is not None:
+            attn_mask = attn_mask.to(device)
+    else:
+        assert prompts is not None, "Either `enc` or `prompts` must be provided."
+        enc = tok(prompts, padding=True, return_tensors="pt")
+        input_ids = enc["input_ids"].to(device)
+        attn_mask = enc.get("attention_mask")
+        if attn_mask is not None:
+            attn_mask = attn_mask.to(device)
+
     B = input_ids.size(0)
+
+    # ---- choose the TRUE last token per sample (avoid PAD) ----
+    if attn_mask is not None:
+        # lengths = number of non-pad tokens in each row
+        lengths = attn_mask.long().sum(dim=1)                            # [B]
+        last_idx = torch.clamp(lengths - 1, min=0)                       # [B]
+    else:
+        last_idx = torch.full((B,), input_ids.size(1) - 1,
+                              device=device, dtype=torch.long)           # [B]
+    last_tokens = input_ids.gather(1, last_idx.unsqueeze(1)).squeeze(1)  # [B]
 
     generated: List[List[int]] = [[] for _ in range(B)]
 
     with torch.no_grad():
+        # prime shallow & deep KV caches on the full prompt
         h_k_prompt, shallow_past = run_shallow_until_k(
             model,
             input_ids=input_ids,
@@ -82,7 +106,6 @@ def generate_with_dvi_spec(
             use_cache=True,
         )
 
-    last_tokens = input_ids[:, -1]
     metrics = SpecMetrics()
     total_new = 0
 
@@ -91,6 +114,7 @@ def generate_with_dvi_spec(
         proposed_hidden: List[torch.Tensor] = []
         draft_shallow_past = shallow_past
 
+        # ----- draft k tokens with shallow stack -----
         for d in range(draft_k):
             prev = last_tokens if d == 0 else proposed_tokens[-1]
             h_k, draft_shallow_past = run_shallow_until_k(
@@ -107,10 +131,11 @@ def generate_with_dvi_spec(
             proposed_tokens.append(next_tok)
             proposed_hidden.append(h_k[:, -1, :])
 
-        prop_seq = torch.stack(proposed_tokens, dim=1)  # [B, draft_k]
-        hidden_seq = torch.stack(proposed_hidden, dim=1)  # [B, draft_k, H]
+        prop_seq = torch.stack(proposed_tokens, dim=1)   # [B, k]
+        hidden_seq = torch.stack(proposed_hidden, dim=1) # [B, k, H]
         metrics.proposed += int(B * draft_k)
 
+        # ----- verify with deep stack in one shot -----
         with torch.no_grad():
             deep_logits, deep_past_full = run_deep_from_k(
                 model,
@@ -118,9 +143,10 @@ def generate_with_dvi_spec(
                 past_key_values=deep_past,
                 use_cache=True,
             )
-        verify_argmax = deep_logits.argmax(dim=-1)
+        verify_argmax = deep_logits.argmax(dim=-1)  # [B, k]
 
-        matches = verify_argmax.eq(prop_seq)
+        # compute common accept prefix length (per sample)
+        matches = verify_argmax.eq(prop_seq)  # [B, k]
         prefix_lens = []
         for b in range(B):
             row = matches[b]
@@ -133,26 +159,20 @@ def generate_with_dvi_spec(
         prefix_lens = torch.tensor(prefix_lens, device=device)
         accept_len = int(prefix_lens.min().item())
 
+        # ----- accept the common prefix -----
         if accept_len > 0:
             accepted_block = prop_seq[:, :accept_len]
-            past_len_s = (
-                shallow_past[0][0].shape[2] if shallow_past and shallow_past[0] is not None else 0
-            )
-            past_len_d = (
-                deep_past[0][0].shape[2] if deep_past and deep_past[0] is not None else 0
-            )
+            past_len_s = shallow_past[0][0].shape[2] if shallow_past and shallow_past[0] is not None else 0
+            past_len_d = deep_past[0][0].shape[2] if deep_past and deep_past[0] is not None else 0
+
             shallow_past = tuple(
-                (
-                    k[:, :, : past_len_s + accept_len, :],
-                    v[:, :, : past_len_s + accept_len, :],
-                )
+                (k[:, :, : past_len_s + accept_len, :],
+                 v[:, :, : past_len_s + accept_len, :])
                 for (k, v) in draft_shallow_past
             )
             deep_past = tuple(
-                (
-                    k[:, :, : past_len_d + accept_len, :],
-                    v[:, :, : past_len_d + accept_len, :],
-                )
+                (k[:, :, : past_len_d + accept_len, :],
+                 v[:, :, : past_len_d + accept_len, :])
                 for (k, v) in deep_past_full
             )
             for b in range(B):
@@ -164,6 +184,7 @@ def generate_with_dvi_spec(
             if total_new >= max_new_tokens:
                 break
 
+        # ----- single fix token when a mismatch occurs -----
         if accept_len < draft_k:
             mismatch_tok = verify_argmax[:, accept_len]
             h_fix, shallow_past = run_shallow_until_k(
@@ -186,12 +207,8 @@ def generate_with_dvi_spec(
             metrics.steps += 1
 
     total_layers = count_transformer_layers(model)
-    comp_ratio, _ = theoretical_compression(
-        metrics.accept_rate, k, total_layers
-    )
+    comp_ratio, _ = theoretical_compression(metrics.accept_rate, k, total_layers)
     metrics.comp_ratio_runtime_est = comp_ratio
 
-    outputs = [
-        torch.tensor(seq, device=device, dtype=torch.long) for seq in generated
-    ]
+    outputs = [torch.tensor(seq, device=device, dtype=torch.long) for seq in generated]
     return outputs, metrics
