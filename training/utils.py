@@ -9,7 +9,7 @@ import json
 import gc
 import random
 import time
-from typing import List, Optional
+from typing import List, Optional, Dict
 from statistics import median
 
 import torch
@@ -199,23 +199,42 @@ def _get_input_vocab_size(model) -> Optional[int]:
             except Exception:
                 pass
     return None
-
-def measure_generate_walltime(model, tok, prompts: List[str],
-                              max_new_tokens: int = 64,
-                              greedy: bool = True,
-                              repeats: int = 3) -> float:
+def measure_generate_walltime(
+    model,
+    tok,
+    prompts: List[str],
+    *,
+    max_new_tokens: int = 64,
+    greedy: bool = False,
+    repeats: int = 3,
+    use_dvi_spec: bool = False,
+    draft_k: int = 4,
+    temperature: float = 1.0,
+    quiet: bool = True,
+    early_layer_override: Optional[int] = None,
+    # NEW: separate microbatch knobs
+    microbatch_base: int = 8,
+    microbatch_spec: int = 1,
+    # keep the safety cap
+    input_cap_tokens: int = 256,
+):
     """
-    Return median walltime (seconds) for a .generate() pass over `prompts`.
-    Robust to vocab/tokenizer mismatches and CUDA asserts during sampling.
+    Returns:
+      - elapsed_seconds if use_dvi_spec=False
+      - (elapsed_seconds, spec_metrics_dict) if use_dvi_spec=True
+
+    Notes:
+      * SPEC microbatch is forced to 1 to avoid 'min across batch' accept_len collapse.
+      * Baseline can use a larger microbatch for throughput.
     """
     device = next(model.parameters()).device
     model.eval()
 
-    # Ensure decode IDs exist on model.config
+    # Sane generation config
     try:
-        if getattr(model.config, "eos_token_id", None) is None and tok.eos_token_id is not None:
+        if getattr(model.config, "eos_token_id", None) is None and getattr(tok, "eos_token_id", None) is not None:
             model.config.eos_token_id = tok.eos_token_id
-        if getattr(model.config, "pad_token_id", None) is None and tok.pad_token_id is not None:
+        if getattr(model.config, "pad_token_id", None) is None and getattr(tok, "pad_token_id", None) is not None:
             model.config.pad_token_id = tok.pad_token_id
         if getattr(model.config, "bos_token_id", None) is None and getattr(tok, "bos_token_id", None) is not None:
             model.config.bos_token_id = tok.bos_token_id
@@ -224,61 +243,167 @@ def measure_generate_walltime(model, tok, prompts: List[str],
     except Exception:
         pass
 
-    # Choose a safe context length and clamp tokenizer max_length to avoid OverflowError
-    max_ctx = _safe_max_ctx_len(tok, model, default=2048)
-    max_new_tokens = int(max(1, max_new_tokens))
-    # Leave some headroom for generation
-    max_input_len = max(8, max_ctx - max_new_tokens - 8)
+    # --- Safe encode (cap to avoid KV OOM; keep tail) ---
+    def _safe_encode(_prompts: List[str]):
+        max_ctx = _safe_max_ctx_len(tok, model, default=2048)
+        max_gen = int(max(1, max_new_tokens))
+        margin = 8
+        max_input_len = max(8, min(int(max_ctx - max_gen - margin), int(input_cap_tokens)))
 
-    # Tokenize with safe truncation/padding
-    enc = tok(
-        prompts,
-        return_tensors="pt",
-        padding=True,
-        truncation=True,
-        max_length=int(max_input_len),
-    )
-    input_ids = enc["input_ids"].to(device)
-    attention_mask = enc.get("attention_mask", None)
-    if attention_mask is not None:
-        attention_mask = attention_mask.to(device)
-
-    # Validate tokenizer/model vocab alignment (avoid device-side asserts)
-    in_vocab = _get_input_vocab_size(model)
-    if in_vocab is not None:
-        max_id = int(input_ids.max().item())
-        if max_id >= in_vocab:
-            raise RuntimeError(
-                f"Tokenizer produced id {max_id} >= input embedding vocab {in_vocab}. "
-                "Ensure tokenizer matches the model and pad_token is set (e.g., tok.pad_token = tok.eos_token)."
+        orig_side = getattr(tok, "truncation_side", "right")
+        try:
+            tok.truncation_side = "left"
+            enc = tok(
+                _prompts,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=max_input_len,
             )
+        finally:
+            try:
+                tok.truncation_side = orig_side
+            except Exception:
+                pass
 
-    def _do_generate(force_greedy: bool) -> float:
+        enc = {k: v.to(device) for k, v in enc.items()}
+
+        # vocab sanity
+        in_vocab = _get_input_vocab_size(model)
+        if in_vocab is not None:
+            max_id = int(enc["input_ids"].max().item())
+            if max_id >= in_vocab:
+                try:
+                    if getattr(tok, "pad_token_id", None) is None and getattr(tok, "eos_token_id", None) is not None:
+                        tok.pad_token = tok.eos_token
+                        enc = tok(
+                            _prompts,
+                            return_tensors="pt",
+                            padding=True,
+                            truncation=True,
+                            max_length=max_input_len,
+                        )
+                        enc = {k: v.to(device) for k, v in enc.items()}
+                        max_id = int(enc["input_ids"].max().item())
+                except Exception:
+                    pass
+                if max_id >= in_vocab:
+                    raise RuntimeError(
+                        f"Tokenizer produced id {max_id} >= input embedding vocab {in_vocab}. "
+                        "Ensure tokenizer matches the model and that pad_token is set."
+                    )
+        return enc
+
+    def _slice_enc(enc, s, e):
+        return {k: v[s:e] for k, v in enc.items()}
+
+    @torch.inference_mode()
+    def _baseline_once(enc_chunk, force_greedy: bool) -> float:
         _cuda_sync()
         t0 = time.perf_counter()
-        with torch.inference_mode():
-            _ = model.generate(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                max_new_tokens=max_new_tokens,
-                do_sample=not force_greedy,
-                num_beams=1,
-                pad_token_id=tok.pad_token_id,
-                eos_token_id=tok.eos_token_id,
-                bos_token_id=getattr(tok, "bos_token_id", None),
-            )
+        _ = model.generate(
+            input_ids=enc_chunk["input_ids"],
+            attention_mask=enc_chunk.get("attention_mask", None),
+            max_new_tokens=max_new_tokens,
+            do_sample=not force_greedy,
+            temperature=max(1e-6, temperature),
+            num_beams=1,
+            use_cache=True,
+            pad_token_id=getattr(model.config, "pad_token_id", getattr(tok, "pad_token_id", None)),
+            eos_token_id=getattr(model.config, "eos_token_id", getattr(tok, "eos_token_id", None)),
+            bos_token_id=getattr(model.config, "bos_token_id", getattr(tok, "bos_token_id", None)),
+        )
         _cuda_sync()
         return time.perf_counter() - t0
 
+    @torch.inference_mode()
+    def _spec_once(enc_chunk) -> (float, Dict[str, float]):
+        # clear any persistent KV on wrappers
+        if hasattr(model, "past_key_values"):
+            try:
+                model.past_key_values = None
+            except Exception:
+                pass
+
+        from training.spec_decode import generate_with_dvi_spec
+
+        _cuda_sync()
+        t0 = time.perf_counter()
+        _, spec_metrics = generate_with_dvi_spec(
+            model,
+            tok,
+            enc=enc_chunk,  # use pre-encoded batch
+            max_new_tokens=max_new_tokens,
+            draft_k=draft_k,
+            greedy=greedy,
+            temperature=temperature,
+            early_layer=early_layer_override or getattr(model, "early_layer", None),
+            device=device,
+            quiet=quiet,
+        )
+        _cuda_sync()
+        return time.perf_counter() - t0, spec_metrics.to_dict()
+
+    # ----- timing loop -----
     times: List[float] = []
+    spec_last: Optional[Dict[str, float]] = None
+
+    enc_all = _safe_encode(prompts)
+    B = int(enc_all["input_ids"].size(0))
+
     for _ in range(max(1, repeats)):
-        try:
-            times.append(_do_generate(force_greedy=greedy))
-        except RuntimeError as e:
-            msg = str(e)
-            if "device-side assert" in msg or "CUDA error" in msg:
-                print("[time][warn] CUDA assert during sampling; retrying with greedy decode for timing.", flush=True)
-                times.append(_do_generate(force_greedy=True))
-            else:
-                raise
-    return float(median(times))
+        total_elapsed = 0.0
+        agg_proposed = 0
+        agg_accepted = 0
+
+        s = 0
+        # IMPORTANT: SPEC runs with mb=1; baseline can use bigger microbatches
+        # mb = 1 if use_dvi_spec else max(1, int(microbatch_base))
+        mb = 1
+
+        while s < B:
+            e = min(s + mb, B)
+            enc_chunk = _slice_enc(enc_all, s, e)
+            try:
+                if use_dvi_spec:
+                    dt, spec_dict = _spec_once(enc_chunk)
+                    total_elapsed += dt
+                    agg_proposed += int(spec_dict.get("spec/proposed", 0))
+                    agg_accepted += int(spec_dict.get("spec/accepted", 0))
+                else:
+                    total_elapsed += _baseline_once(enc_chunk, force_greedy=greedy)
+            except RuntimeError as err:
+                msg = str(err)
+                # last-resort fallback: shrink to batch=1 + greedy
+                enc_fallback = _slice_enc(enc_all, s, s + 1)
+                if ("device-side assert" in msg) or ("cuda" in msg.lower() and "memory" in msg.lower()):
+                    if use_dvi_spec:
+                        dt, spec_dict = _spec_once(enc_fallback)
+                        total_elapsed += dt
+                        agg_proposed += int(spec_dict.get("spec/proposed", 0))
+                        agg_accepted += int(spec_dict.get("spec/accepted", 0))
+                    else:
+                        total_elapsed += _baseline_once(enc_fallback, force_greedy=True)
+                    e = s + 1
+                else:
+                    raise
+            finally:
+                del enc_chunk
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+            s = e
+
+        if use_dvi_spec:
+            acc = (agg_accepted / max(1, agg_proposed)) if agg_proposed else 0.0
+            spec_last = {
+                "spec/proposed": float(agg_proposed),
+                "spec/accepted": float(agg_accepted),
+                "spec/accept_rate": float(acc),
+            }
+
+        times.append(total_elapsed)
+
+    times.sort()
+    elapsed_med = float(times[len(times) // 2])
+    return (elapsed_med, spec_last) if use_dvi_spec else elapsed_med

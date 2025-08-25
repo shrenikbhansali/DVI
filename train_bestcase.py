@@ -34,7 +34,7 @@ from training.utils import (
 )
 from training.modeling import prepare_dvi_trainable, build_optimizer
 from training.kv import estimate_kv_cache
-from training.rollout import rollout_collect, buf_debug
+from training.rollout import rollout_collect, rollout_collect_k_spec, buf_debug
 from training.objectives import one_mixed_step
 from training.schedule import mix_schedule, phase_of_step
 from training.logging import init_wandb, wandb_watch_model, wandb_log, WANDB_DEFAULT_ENTITY, WANDB_DEFAULT_PROJECT
@@ -52,7 +52,11 @@ def train_bestcase_kl_rl(model, tok, prompts_train: List[str], prompts_eval: Lis
                         debug_dump_every: int, debug_topk: int,
                         max_fro: float, max_fro_ratio: float,
                         quiet_eval: bool,
-                        early_layer: int):
+                        early_layer: int,
+                        train_k_spec: int = 1,
+                        spec_train_greedy: bool = False,
+                        spec_train_temp: float = 1.0,
+                        ):
     metrics_path = os.path.join(outdir, "logs", "train_metrics.jsonl")
     samples_path = os.path.join(outdir, "logs", "rollout_samples.jsonl")
 
@@ -92,7 +96,23 @@ def train_bestcase_kl_rl(model, tok, prompts_train: List[str], prompts_eval: Lis
         dbg_roll = [] if (debug_dump_every and (g % debug_dump_every == 0)) else None
         _cuda_sync()
         t_roll_s = time.perf_counter()
-        n_collected = rollout_collect(model, tok, p, buf, steps=rollout_len, debug_out=dbg_roll, topk=debug_topk)
+        if train_k_spec and train_k_spec > 1:
+            n_collected = rollout_collect_k_spec(
+                model,
+                tok,
+                p,
+                buf,
+                steps=rollout_len,
+                k=train_k_spec,
+                greedy=spec_train_greedy,
+                temperature=spec_train_temp,
+                debug_out=dbg_roll,
+                topk=debug_topk,
+            )
+        else:
+            n_collected = rollout_collect(
+                model, tok, p, buf, steps=rollout_len, debug_out=dbg_roll, topk=debug_topk
+            )
         _cuda_sync()
         t_roll_e = time.perf_counter()
         elapsed = max(1e-6, (t_roll_e - t_roll_s))
@@ -297,6 +317,10 @@ def main():
                     help="repeat timing and take median")
     ap.add_argument("--timing-greedy", action="store_true",
                     help="use greedy decoding for walltime timing (default: sampling)")
+    ap.add_argument("--spec-draft-k", type=int, default=4, help="block size for self-spec drafting")
+    ap.add_argument("--train-k-spec", type=int, default=1, help="k tokens per speculative draft during training")
+    ap.add_argument("--spec-train-greedy", action="store_true", help="use greedy drafting during spec training")
+    ap.add_argument("--spec-train-temp", type=float, default=1.0, help="temperature for spec training drafting")
     ap.add_argument("--no-wandb", action="store_true")
     ap.add_argument("--wandb-entity", type=str, default=WANDB_DEFAULT_ENTITY)
     ap.add_argument("--wandb-project", type=str, default=WANDB_DEFAULT_PROJECT)
@@ -344,48 +368,76 @@ def main():
         max_fro=args.max_fro, max_fro_ratio=args.max_fro_ratio,
         quiet_eval=args.quiet_eval,
         early_layer=args.early_layer,
+        train_k_spec=args.train_k_spec,
+        spec_train_greedy=args.spec_train_greedy,
+        spec_train_temp=args.spec_train_temp,
     )
 
     # -------- Post-train walltime timing --------
-    print("\n[e2e] timing DVI vs baseline…", flush=True)
-    from training.utils import measure_generate_walltime
+    print("\n[e2e] timing DVI (SPEC) vs baseline…", flush=True)
+    from training.utils import measure_generate_walltime, theoretical_compression, count_transformer_layers
     timing_prompts = build_prompts_from_alpaca(args.time_prompts)
 
-    # (1) DVI timing
     model.eval()
-    dvi_time = measure_generate_walltime(
+    dvi_device = next(model.parameters()).device
+    dvi_dtype = next(model.parameters()).dtype
+    total_layers = count_transformer_layers(model)
+    print(f"[time] decode_mode=DVI(SPEC); device={dvi_device}; dtype={dvi_dtype}", flush=True)
+
+    dvi_res = measure_generate_walltime(
         model, tok, timing_prompts,
         max_new_tokens=args.time_max_new_tokens,
         greedy=args.timing_greedy,
         repeats=args.time_repeats,
+        use_dvi_spec=True,
+        draft_k=args.spec_draft_k,
+        temperature=max(1e-6, args.temperature),
+        early_layer_override=args.early_layer,
+        quiet=True,
     )
-    print(f"[time] DVI generate: {dvi_time:.3f}s", flush=True)
+    dvi_time, spec_metrics = dvi_res
+    print(f"[time] DVI(SPEC) generate: {dvi_time:.3f}s", flush=True)
+    if spec_metrics is None:
+        spec_metrics = {}
+    acc_rt = float(spec_metrics.get("spec/accept_rate", 0.0))
+    comp_rt, _ = theoretical_compression(acc_rt, args.early_layer, total_layers)
+    print(f"[spec] runtime_accept_rate={acc_rt:.3f} | runtime_comp_est≈{comp_rt:.3f}", flush=True)
 
-    # Clear DVI before loading baseline to save memory
     del model
     free_cuda("(before baseline timing)")
 
-    # (2) Baseline full model timing
     from transformers import AutoModelForCausalLM
     baseline = AutoModelForCausalLM.from_pretrained(
-        args.model_id, torch_dtype=torch.float16, device_map="auto"
-    )
+        args.model_id, torch_dtype=dvi_dtype
+    ).to(dvi_device)
     baseline.eval()
+    if getattr(baseline.config, "use_cache", True) is False:
+        baseline.config.use_cache = True
+
+    print(f"[time] decode_mode=BASELINE(vanilla); device={dvi_device}; dtype={dvi_dtype}", flush=True)
     base_time = measure_generate_walltime(
         baseline, tok, timing_prompts,
         max_new_tokens=args.time_max_new_tokens,
         greedy=args.timing_greedy,
         repeats=args.time_repeats,
+        use_dvi_spec=False,
     )
     print(f"[time] Baseline generate: {base_time:.3f}s", flush=True)
 
     speedup_wall = (base_time / dvi_time) if dvi_time > 0 else float("inf")
-    print(f"[time] Walltime speedup (baseline/DVI): {speedup_wall:.3f}×", flush=True)
+    print(f"[time] Walltime speedup (baseline/DVI SPEC): {speedup_wall:.3f}×", flush=True)
 
     wandb_log({
-        "speed/walltime_dvi_s": dvi_time,
+        "speed/walltime_dvi_spec_s": dvi_time,
         "speed/walltime_base_s": base_time,
-        "speed/speedup_walltime": speedup_wall,
+        "speed/speedup_walltime_spec": speedup_wall,
+        "spec/proposed": spec_metrics.get("spec/proposed", 0.0),
+        "spec/accepted": spec_metrics.get("spec/accepted", 0.0),
+        "spec/accept_rate": spec_metrics.get("spec/accept_rate", 0.0),
+        "comp/runtime_est": comp_rt,
+        "comp/theoretical_from_train": theoretical_compression(
+            spec_metrics.get("spec/accept_rate", 0.0), args.early_layer, total_layers
+        )[0],
     }, step=args.steps)
 
     # Cleanup
