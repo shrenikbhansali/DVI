@@ -34,7 +34,7 @@ from training.utils import (
 )
 from training.modeling import prepare_dvi_trainable, build_optimizer
 from training.kv import estimate_kv_cache
-from training.rollout import rollout_collect, buf_debug
+from training.rollout import rollout_collect, rollout_collect_k_spec, buf_debug
 from training.objectives import one_mixed_step
 from training.schedule import mix_schedule, phase_of_step
 from training.logging import init_wandb, wandb_watch_model, wandb_log, WANDB_DEFAULT_ENTITY, WANDB_DEFAULT_PROJECT
@@ -52,7 +52,11 @@ def train_bestcase_kl_rl(model, tok, prompts_train: List[str], prompts_eval: Lis
                         debug_dump_every: int, debug_topk: int,
                         max_fro: float, max_fro_ratio: float,
                         quiet_eval: bool,
-                        early_layer: int):
+                        early_layer: int,
+                        train_k_spec: int = 1,
+                        spec_train_greedy: bool = False,
+                        spec_train_temp: float = 1.0,
+                        ):
     metrics_path = os.path.join(outdir, "logs", "train_metrics.jsonl")
     samples_path = os.path.join(outdir, "logs", "rollout_samples.jsonl")
 
@@ -92,7 +96,23 @@ def train_bestcase_kl_rl(model, tok, prompts_train: List[str], prompts_eval: Lis
         dbg_roll = [] if (debug_dump_every and (g % debug_dump_every == 0)) else None
         _cuda_sync()
         t_roll_s = time.perf_counter()
-        n_collected = rollout_collect(model, tok, p, buf, steps=rollout_len, debug_out=dbg_roll, topk=debug_topk)
+        if train_k_spec and train_k_spec > 1:
+            n_collected = rollout_collect_k_spec(
+                model,
+                tok,
+                p,
+                buf,
+                steps=rollout_len,
+                k=train_k_spec,
+                greedy=spec_train_greedy,
+                temperature=spec_train_temp,
+                debug_out=dbg_roll,
+                topk=debug_topk,
+            )
+        else:
+            n_collected = rollout_collect(
+                model, tok, p, buf, steps=rollout_len, debug_out=dbg_roll, topk=debug_topk
+            )
         _cuda_sync()
         t_roll_e = time.perf_counter()
         elapsed = max(1e-6, (t_roll_e - t_roll_s))
@@ -298,6 +318,9 @@ def main():
     ap.add_argument("--timing-greedy", action="store_true",
                     help="use greedy decoding for walltime timing (default: sampling)")
     ap.add_argument("--spec-draft-k", type=int, default=4, help="block size for self-spec drafting")
+    ap.add_argument("--train-k-spec", type=int, default=1, help="k tokens per speculative draft during training")
+    ap.add_argument("--spec-train-greedy", action="store_true", help="use greedy drafting during spec training")
+    ap.add_argument("--spec-train-temp", type=float, default=1.0, help="temperature for spec training drafting")
     ap.add_argument("--no-wandb", action="store_true")
     ap.add_argument("--wandb-entity", type=str, default=WANDB_DEFAULT_ENTITY)
     ap.add_argument("--wandb-project", type=str, default=WANDB_DEFAULT_PROJECT)
@@ -345,6 +368,9 @@ def main():
         max_fro=args.max_fro, max_fro_ratio=args.max_fro_ratio,
         quiet_eval=args.quiet_eval,
         early_layer=args.early_layer,
+        train_k_spec=args.train_k_spec,
+        spec_train_greedy=args.spec_train_greedy,
+        spec_train_temp=args.spec_train_temp,
     )
 
     # -------- Post-train walltime timing --------

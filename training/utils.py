@@ -358,7 +358,8 @@ def measure_generate_walltime(
 
         s = 0
         # IMPORTANT: SPEC runs with mb=1; baseline can use bigger microbatches
-        mb = 1 if use_dvi_spec else max(1, int(microbatch_base))
+        # mb = 1 if use_dvi_spec else max(1, int(microbatch_base))
+        mb = 1
 
         while s < B:
             e = min(s + mb, B)
