@@ -285,7 +285,7 @@ def train_bestcase_kl_rl(model, tok, prompts_train: List[str], prompts_eval: Lis
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model-id", type=str, default="meta-llama/Llama-2-7b-hf")
-    ap.add_argument("--early-layer", type=int, default=4)
+    ap.add_argument("--early-layer", type=int, default=16, help="Early-exit split layer k (prefer deeper, e.g. 16 or 24 on 7B)")
     ap.add_argument("--train-prompts", type=int, default=512)
     ap.add_argument("--eval-prompts", type=int, default=64)
     ap.add_argument("--steps", type=int, default=300)
@@ -293,6 +293,8 @@ def main():
     ap.add_argument("--batch-size", type=int, default=64)
     ap.add_argument("--lr-exit", type=float, default=5e-4)
     ap.add_argument("--lr-lora", type=float, default=5e-5)
+    ap.add_argument("--lora-s-rank", type=int, default=8)
+    ap.add_argument("--lora-v-rank", type=int, default=0)
     ap.add_argument("--temperature", type=float, default=1.0)
     ap.add_argument("--ce-weight", type=float, default=0.20)
     ap.add_argument("--ent-weight", type=float, default=0.00)
@@ -342,7 +344,13 @@ def main():
     prompts_eval  = build_prompts_from_alpaca(args.eval_prompts)
 
     print("[e2e] loading model…", flush=True)
-    model = prepare_dvi_trainable(args.model_id, args.early_layer, dtype=torch.float16)
+    model = prepare_dvi_trainable(
+        args.model_id,
+        args.early_layer,
+        rank_s=args.lora_s_rank,
+        rank_v=args.lora_v_rank,
+        dtype=torch.float16,
+    )
 
     with torch.no_grad():
         lm_nrm   = model.lm_head.weight.detach().float().norm().item()
@@ -382,7 +390,10 @@ def main():
     dvi_device = next(model.parameters()).device
     dvi_dtype = next(model.parameters()).dtype
     total_layers = count_transformer_layers(model)
-    print(f"[time] decode_mode=DVI(SPEC); device={dvi_device}; dtype={dvi_dtype}", flush=True)
+    print(
+        f"[time] decode_mode=DVI(SPEC); device={dvi_device}; dtype={dvi_dtype}; temperature={args.temperature}",
+        flush=True,
+    )
 
     dvi_res = measure_generate_walltime(
         model, tok, timing_prompts,
@@ -414,13 +425,19 @@ def main():
     if getattr(baseline.config, "use_cache", True) is False:
         baseline.config.use_cache = True
 
-    print(f"[time] decode_mode=BASELINE(vanilla); device={dvi_device}; dtype={dvi_dtype}", flush=True)
+    print(
+        f"[time] decode_mode=BASELINE(vanilla); device={dvi_device}; dtype={dvi_dtype}; temperature={args.temperature}",
+        flush=True,
+    )
     base_time = measure_generate_walltime(
-        baseline, tok, timing_prompts,
+        baseline,
+        tok,
+        timing_prompts,
         max_new_tokens=args.time_max_new_tokens,
         greedy=args.timing_greedy,
         repeats=args.time_repeats,
         use_dvi_spec=False,
+        temperature=max(1e-6, args.temperature),
     )
     print(f"[time] Baseline generate: {base_time:.3f}s", flush=True)
 

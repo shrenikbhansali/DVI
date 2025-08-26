@@ -110,9 +110,10 @@ def rollout_collect_k_spec(
     h_k_prompt, shallow_past = run_shallow_until_k(
         spec, input_ids=input_ids, attention_mask=attn_mask, past_key_values=None, use_cache=True
     )
-    _, deep_past = run_deep_from_k(
-        spec, hidden_k=h_k_prompt, past_key_values=None, use_cache=True
-    )
+    with torch.no_grad():
+        _, deep_past = run_deep_from_k(
+            spec, hidden_k=h_k_prompt, past_key_values=None, use_cache=True
+        )
 
     # choose true last token (avoid PAD)
     if attn_mask is not None:
@@ -219,9 +220,10 @@ def rollout_collect_k_spec(
                 attention_mask=None,
                 use_cache=True,
             )
-            _, deep_past = run_deep_from_k(
-                spec, hidden_k=h_fix, past_key_values=deep_past, use_cache=True
-            )
+            with torch.no_grad():
+                _, deep_past = run_deep_from_k(
+                    spec, hidden_k=h_fix, past_key_values=deep_past, use_cache=True
+                )
             last_tokens = mismatch_tok
 
     return n_collected
