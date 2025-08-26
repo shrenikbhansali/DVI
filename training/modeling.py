@@ -1,5 +1,6 @@
 """Model assembly helpers for DVI training."""
 import copy
+import os
 from typing import Optional, Tuple
 
 import torch
@@ -201,36 +202,50 @@ def run_shallow_until_k(
     """Run embedding + layers [:k] to obtain hidden at split and updated KVs."""
     set_active_adapter(model, "draft")
     early = _early_model(model)
-    if early is not None:
-        out = early.forward_draft_or_large_model(
-            in_tokens_small=input_ids,
-            position_ids=None,
-        )
-        if use_cache:
+
+    # Try fast-path only if enabled and KV is actually produced
+    if early is not None and not os.getenv("DVI_DISABLE_EARLY_FASTPATH"):
+        try:
+            out = early.forward_draft_or_large_model(
+                in_tokens_small=input_ids, position_ids=None, use_cache=use_cache
+            )
+        except TypeError:
+            # older signatures without use_cache
+            out = early.forward_draft_or_large_model(
+                in_tokens_small=input_ids, position_ids=None
+            )
+        kvs = getattr(early, "past_key_values", None)
+        if use_cache and kvs is not None:
             k = _resolve_early_layer(early)
-            new_past = tuple(early.past_key_values[:k])
-        else:
-            new_past = None
-        return out, new_past
+            return out, tuple(kvs[:k])
+        # else: fall through to manual path
 
     # fallback manual path
     k = _resolve_early_layer(model)
     lm = _llama_model(model)
     B, T = input_ids.shape
     device = input_ids.device
+
     hidden_states = lm.embed_tokens(input_ids)
+
     past_len = 0
     if past_key_values and past_key_values[0] is not None:
         past_len = past_key_values[0][0].shape[2]
+
     if attention_mask is None:
         attention_mask = torch.ones((B, past_len + T), dtype=torch.bool, device=device)
+
     attn_mask = lm._prepare_decoder_attention_mask(
         attention_mask,
         (B, T),
-        hidden_states, past_len)
+        hidden_states,
+        past_len,
+    )
     position_ids = torch.arange(past_len, past_len + T, device=device).unsqueeze(0).expand(B, T)
+
     if past_key_values is None:
         past_key_values = tuple([None] * k)
+
     new_past = []
     for i, block in enumerate(lm.layers[:k]):
         pkv = past_key_values[i] if i < len(past_key_values) else None
@@ -245,6 +260,7 @@ def run_shallow_until_k(
         hidden_states = out[0]
         if use_cache:
             new_past.append(out[1])
+
     return hidden_states, tuple(new_past) if use_cache else None
 
 
@@ -258,36 +274,47 @@ def run_deep_from_k(
     """Run only layers [k:] given hidden states at split layer."""
     set_active_adapter(model, "verify")
     early = _early_model(model)
-    if early is not None:
-        deep_hidden, norm = early.forward_draft_or_large_model(
-            in_features_large=hidden_k
-        )
-        logits = model.lm_head(norm)
-        if use_cache:
+
+    # Try fast-path only if enabled and KV is actually produced
+    if early is not None and not os.getenv("DVI_DISABLE_EARLY_FASTPATH"):
+        try:
+            deep_hidden, norm = early.forward_draft_or_large_model(
+                in_features_large=hidden_k, use_cache=use_cache
+            )
+        except TypeError:
+            deep_hidden, norm = early.forward_draft_or_large_model(
+                in_features_large=hidden_k
+            )
+        kvs = getattr(early, "past_key_values", None)
+        if use_cache and kvs is not None:
             k = _resolve_early_layer(early)
-            new_past = tuple(early.past_key_values[k:])
-        else:
-            new_past = None
-        return logits, new_past
+            logits = model.lm_head(norm)
+            return logits, tuple(kvs[k:])
+        # else: fall through to manual path
 
     # fallback manual path
     k = _resolve_early_layer(model)
     lm = _llama_model(model)
     B, T, _ = hidden_k.shape
     device = hidden_k.device
+
     past_len = 0
     if past_key_values and past_key_values[0] is not None:
         past_len = past_key_values[0][0].shape[2]
+
     attention_mask = torch.ones((B, past_len + T), dtype=torch.bool, device=device)
     attn_mask = lm._prepare_decoder_attention_mask(
         attention_mask,
         (B, T),
-        hidden_k, past_len
+        hidden_k,
+        past_len,
     )
     position_ids = torch.arange(past_len, past_len + T, device=device).unsqueeze(0).expand(B, T)
+
     deep_layers = lm.layers[k:]
     if past_key_values is None:
         past_key_values = tuple([None] * len(deep_layers))
+
     new_past = []
     hidden_states = hidden_k
     for idx, block in enumerate(deep_layers):
@@ -303,6 +330,7 @@ def run_deep_from_k(
         hidden_states = out[0]
         if use_cache:
             new_past.append(out[1])
+
     normed = lm.norm(hidden_states)
     logits = model.lm_head(normed)
     return logits, tuple(new_past) if use_cache else None
