@@ -17,6 +17,7 @@ import argparse
 import json
 import math
 import time
+import gc
 from typing import List
 
 import torch
@@ -32,6 +33,7 @@ from training.utils import (
     count_transformer_layers,
     theoretical_compression,
 )
+from training.mem import deep_kv_purge
 from training.modeling import prepare_dvi_trainable, build_optimizer
 from training.kv import estimate_kv_cache
 from training.rollout import rollout_collect, rollout_collect_k_spec, buf_debug
@@ -281,6 +283,8 @@ def train_bestcase_kl_rl(model, tok, prompts_train: List[str], prompts_eval: Lis
                "eval/post/ctar3": ctar1[3], "eval/post/ctar4": ctar1[4],
                "eval/delta_acc": (acc1 - acc0)}, step=steps)
 
+    deep_kv_purge(model, tag="post_train_bestcase")
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -381,6 +385,10 @@ def main():
         spec_train_temp=args.spec_train_temp,
     )
 
+    deep_kv_purge(model, tag="pre_spec_timing")
+    gc.collect()
+    torch.cuda.empty_cache()
+
     # -------- Post-train walltime timing --------
     print("\n[e2e] timing DVI (SPEC) vs baseline…", flush=True)
     from training.utils import measure_generate_walltime, theoretical_compression, count_transformer_layers
@@ -414,7 +422,25 @@ def main():
     comp_rt, _ = theoretical_compression(acc_rt, args.early_layer, total_layers)
     print(f"[spec] runtime_accept_rate={acc_rt:.3f} | runtime_comp_est≈{comp_rt:.3f}", flush=True)
 
+    deep_kv_purge(model, tag="pre_baseline_teardown")
+    if run is not None:
+        try:
+            import wandb
+            wandb.unwatch(model)
+        except Exception:
+            pass
+        if os.getenv("DVI_TIMING_TRACE"):
+            print("[trace] wandb unwatch called", flush=True)
+        try:
+            run.finish()
+        except Exception:
+            pass
+        if os.getenv("DVI_TIMING_TRACE"):
+            print("[trace] wandb run finished", flush=True)
+        run = None
     del model
+    gc.collect()
+    torch.cuda.empty_cache()
     free_cuda("(before baseline timing)")
 
     from transformers import AutoModelForCausalLM
@@ -424,6 +450,7 @@ def main():
     baseline.eval()
     if getattr(baseline.config, "use_cache", True) is False:
         baseline.config.use_cache = True
+    deep_kv_purge(baseline, tag="baseline_loaded")
 
     print(
         f"[time] decode_mode=BASELINE(vanilla); device={dvi_device}; dtype={dvi_dtype}; temperature={args.temperature}",
@@ -458,7 +485,10 @@ def main():
     }, step=args.steps)
 
     # Cleanup
+    deep_kv_purge(baseline, tag="baseline_teardown")
     del baseline
+    gc.collect()
+    torch.cuda.empty_cache()
     free_cuda("(timing done)")
 
     if run is not None:

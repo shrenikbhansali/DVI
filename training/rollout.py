@@ -13,6 +13,10 @@ from training.modeling import (
     exit_logits_from_hidden_k,
 )
 
+import os
+
+_TRACE = bool(os.getenv("DVI_TIMING_TRACE"))
+
 __all__ = ["rollout_collect", "rollout_collect_k_spec", "buf_debug"]
 
 
@@ -201,13 +205,28 @@ def rollout_collect_k_spec(
             past_len_s = shallow_past[0][0].shape[2] if shallow_past and shallow_past[0] is not None else 0
             past_len_d = deep_past[0][0].shape[2] if deep_past and deep_past[0] is not None else 0
             shallow_past = tuple(
-                (k_[:, :, : past_len_s + accept_len, :], v_[:, :, : past_len_s + accept_len, :])
+                (
+                    k_[:, :, : past_len_s + accept_len, :].clone(),
+                    v_[:, :, : past_len_s + accept_len, :].clone(),
+                )
                 for (k_, v_) in tmp_shallow
             )
             deep_past = tuple(
-                (k_[:, :, : past_len_d + accept_len, :], v_[:, :, : past_len_d + accept_len, :])
+                (
+                    k_[:, :, : past_len_d + accept_len, :].clone(),
+                    v_[:, :, : past_len_d + accept_len, :].clone(),
+                )
                 for (k_, v_) in deep_past_full
             )
+            if _TRACE:
+                try:
+                    k0 = shallow_past[0][0]
+                    print(
+                        f"[trace] rollout compact layer0 shape={tuple(k0.shape)} storage={k0.storage().size()}",
+                        flush=True,
+                    )
+                except Exception:
+                    pass
             last_tokens = accepted_block[:, -1]
 
         # fix single mismatch

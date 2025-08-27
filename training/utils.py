@@ -15,8 +15,7 @@ from statistics import median
 import torch
 from datasets import load_dataset
 from transformers import __version__ as transformers_ver
-import time
-from statistics import median
+from .mem import deep_kv_purge
 
 
 __all__ = [
@@ -299,6 +298,7 @@ def measure_generate_walltime(
 
     @torch.inference_mode()
     def _baseline_once(enc_chunk, force_greedy: bool) -> float:
+        deep_kv_purge(model, tag="pre-baseline_once")
         _cuda_sync()
         t0 = time.perf_counter()
         _ = model.generate(
@@ -314,17 +314,12 @@ def measure_generate_walltime(
             bos_token_id=getattr(model.config, "bos_token_id", getattr(tok, "bos_token_id", None)),
         )
         _cuda_sync()
+        deep_kv_purge(model, tag="post-baseline_once")
         return time.perf_counter() - t0
 
     @torch.inference_mode()
     def _spec_once(enc_chunk) -> (float, Dict[str, float]):
-        # clear any persistent KV on wrappers
-        if hasattr(model, "past_key_values"):
-            try:
-                model.past_key_values = None
-            except Exception:
-                pass
-
+        deep_kv_purge(model, tag="pre-spec_once")
         from training.spec_decode import generate_with_dvi_spec
 
         _cuda_sync()
@@ -342,6 +337,7 @@ def measure_generate_walltime(
             quiet=quiet,
         )
         _cuda_sync()
+        deep_kv_purge(model, tag="post-spec_once")
         return time.perf_counter() - t0, spec_metrics.to_dict()
 
     # ----- timing loop -----
@@ -351,7 +347,8 @@ def measure_generate_walltime(
     enc_all = _safe_encode(prompts)
     B = int(enc_all["input_ids"].size(0))
 
-    for _ in range(max(1, repeats)):
+    for rep in range(max(1, repeats)):
+        deep_kv_purge(model, tag=f"repeat{rep}-start")
         total_elapsed = 0.0
         agg_proposed = 0
         agg_accepted = 0
@@ -389,8 +386,6 @@ def measure_generate_walltime(
                     raise
             finally:
                 del enc_chunk
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
 
             s = e
 
@@ -403,6 +398,9 @@ def measure_generate_walltime(
             }
 
         times.append(total_elapsed)
+        deep_kv_purge(model, tag=f"repeat{rep}-end")
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     times.sort()
     elapsed_med = float(times[len(times) // 2])

@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Dict
 
+import os
 import torch
 import torch.nn.functional as F
 
@@ -10,6 +11,9 @@ from .modeling import (
     exit_logits_from_hidden_k,
 )
 from .utils import theoretical_compression, count_transformer_layers
+from .mem import deep_kv_purge
+
+_TRACE = bool(os.getenv("DVI_TIMING_TRACE"))
 
 
 @dataclass
@@ -38,6 +42,7 @@ def _sample_from_logits(logits: torch.Tensor, greedy: bool, temperature: float) 
     probs = F.softmax(logits / max(1e-6, temperature), dim=-1)
     return torch.multinomial(probs, num_samples=1).squeeze(-1)
 
+@torch.inference_mode()
 def generate_with_dvi_spec(
     model,
     tok,
@@ -90,21 +95,20 @@ def generate_with_dvi_spec(
 
     generated: List[List[int]] = [[] for _ in range(B)]
 
-    with torch.no_grad():
-        # prime shallow & deep KV caches on the full prompt
-        h_k_prompt, shallow_past = run_shallow_until_k(
-            model,
-            input_ids=input_ids,
-            attention_mask=attn_mask,
-            past_key_values=None,
-            use_cache=True,
-        )
-        _, deep_past = run_deep_from_k(
-            model,
-            hidden_k=h_k_prompt,
-            past_key_values=None,
-            use_cache=True,
-        )
+    # prime shallow & deep KV caches on the full prompt
+    h_k_prompt, shallow_past = run_shallow_until_k(
+        model,
+        input_ids=input_ids,
+        attention_mask=attn_mask,
+        past_key_values=None,
+        use_cache=True,
+    )
+    _, deep_past = run_deep_from_k(
+        model,
+        hidden_k=h_k_prompt,
+        past_key_values=None,
+        use_cache=True,
+    )
 
     metrics = SpecMetrics()
     total_new = 0
@@ -166,15 +170,28 @@ def generate_with_dvi_spec(
             past_len_d = deep_past[0][0].shape[2] if deep_past and deep_past[0] is not None else 0
 
             shallow_past = tuple(
-                (k[:, :, : past_len_s + accept_len, :],
-                 v[:, :, : past_len_s + accept_len, :])
+                (
+                    k[:, :, : past_len_s + accept_len, :].clone(),
+                    v[:, :, : past_len_s + accept_len, :].clone(),
+                )
                 for (k, v) in draft_shallow_past
             )
             deep_past = tuple(
-                (k[:, :, : past_len_d + accept_len, :],
-                 v[:, :, : past_len_d + accept_len, :])
+                (
+                    k[:, :, : past_len_d + accept_len, :].clone(),
+                    v[:, :, : past_len_d + accept_len, :].clone(),
+                )
                 for (k, v) in deep_past_full
             )
+            if _TRACE:
+                try:
+                    k0 = shallow_past[0][0]
+                    print(
+                        f"[trace] compact shallow layer0 shape={tuple(k0.shape)} storage={k0.storage().size()}",
+                        flush=True,
+                    )
+                except Exception:
+                    pass
             for b in range(B):
                 generated[b].extend(accepted_block[b].tolist())
             last_tokens = accepted_block[:, -1]
@@ -211,4 +228,5 @@ def generate_with_dvi_spec(
     metrics.comp_ratio_runtime_est = comp_ratio
 
     outputs = [torch.tensor(seq, device=device, dtype=torch.long) for seq in generated]
+    deep_kv_purge(model, tag="generate_with_dvi_spec-end")
     return outputs, metrics
