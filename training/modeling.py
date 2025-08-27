@@ -8,6 +8,7 @@ import torch.nn as nn
 
 from kangaroo.earlyexit import EarlyExitLlamaForCausalLM
 from kangaroo.sgp_lora import attach_dual_lora, enable_lora_grads, set_active_adapter
+from .mem import timing_trace
 
 __all__ = [
     "prepare_dvi_trainable",
@@ -232,15 +233,18 @@ def run_shallow_until_k(
     if past_key_values and past_key_values[0] is not None:
         past_len = past_key_values[0][0].shape[2]
 
-    if attention_mask is None:
-        attention_mask = torch.ones((B, past_len + T), dtype=torch.bool, device=device)
-
-    attn_mask = lm._prepare_decoder_attention_mask(
-        attention_mask,
-        (B, T),
-        hidden_states,
-        past_len,
-    )
+    if past_len > 0 and attention_mask is None:
+        attn_mask = None
+        timing_trace("run_shallow_until_k: cached fast-path mask skip")
+    else:
+        if attention_mask is None:
+            attention_mask = torch.ones((B, past_len + T), dtype=torch.bool, device=device)
+        attn_mask = lm._prepare_decoder_attention_mask(
+            attention_mask,
+            (B, T),
+            hidden_states,
+            past_len,
+        )
     position_ids = torch.arange(past_len, past_len + T, device=device).unsqueeze(0).expand(B, T)
 
     if past_key_values is None:
@@ -302,13 +306,17 @@ def run_deep_from_k(
     if past_key_values and past_key_values[0] is not None:
         past_len = past_key_values[0][0].shape[2]
 
-    attention_mask = torch.ones((B, past_len + T), dtype=torch.bool, device=device)
-    attn_mask = lm._prepare_decoder_attention_mask(
-        attention_mask,
-        (B, T),
-        hidden_k,
-        past_len,
-    )
+    if past_len > 0 and past_key_values is not None:
+        attn_mask = None
+        timing_trace("run_deep_from_k: cached fast-path mask skip")
+    else:
+        attention_mask = torch.ones((B, past_len + T), dtype=torch.bool, device=device)
+        attn_mask = lm._prepare_decoder_attention_mask(
+            attention_mask,
+            (B, T),
+            hidden_k,
+            past_len,
+        )
     position_ids = torch.arange(past_len, past_len + T, device=device).unsqueeze(0).expand(B, T)
 
     deep_layers = lm.layers[k:]
