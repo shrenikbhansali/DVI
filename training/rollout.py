@@ -159,22 +159,22 @@ def rollout_collect_k_spec(
         rewards = matches.float()
 
         # per-sample accepted prefix length
-        prefix_lens = []
-        for b in range(B):
-            row = matches[b]
-            nz = (~row).nonzero(as_tuple=False)
-            m = k if nz.numel() == 0 else int(nz[0].item())
-            prefix_lens.append(m)
-        prefix_lens = torch.tensor(prefix_lens, device=device)
+        all_matched = matches.all(dim=1)
+        first_mismatch = (~matches).float().argmax(dim=1)
+        prefix_lens = torch.where(
+            all_matched, torch.full_like(first_mismatch, k), first_mismatch
+        )
         accept_len = int(prefix_lens.min().item())
 
         # append drafted positions to buffer
+        va_list = verify_argmax.detach().cpu().tolist()
+        rw_list = rewards.detach().cpu().tolist()
         for b in range(B):
             for d in range(k):
                 buf.append(
                     hidden=hidden_seq[b, d].detach().cpu(),
-                    token=int(verify_argmax[b, d].item()),
-                    reward=float(rewards[b, d].item()),
+                    token=int(va_list[b][d]),
+                    reward=float(rw_list[b][d]),
                     conf=0.0,
                     vlogits=deep_logits[b, d].detach().cpu(),
                 )
