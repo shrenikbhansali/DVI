@@ -3,80 +3,36 @@ from typing import List, Dict, Optional
 
 import json
 import torch
-import torch.nn.functional as F
+from typing import List, Dict, Optional
 
-from training.kv import drafter_hidden_no_cache, advance_kv_with_committed, prime_kv_full
 from training.buffer import ReplayBuffer
 from training.modeling import (
     run_shallow_until_k,
     run_deep_from_k,
     exit_logits_from_hidden_k,
 )
-from training.mem import timing_trace
+from training.sampling import sample_from_logits
 
 __all__ = ["rollout_collect", "rollout_collect_k_spec", "buf_debug"]
-
-
-def _top1(logits: torch.Tensor) -> int:
-    return int(torch.argmax(logits, dim=-1, keepdim=True)[0, 0].item())
 
 
 @torch.inference_mode()
 def rollout_collect(spec, tok, prompt: str,
                     buf: ReplayBuffer, steps: int,
                     debug_out: Optional[List[Dict]] = None, topk: int = 5) -> int:
-    spec.eval()
-    dev = next(spec.parameters()).device
-    enc = tok(prompt, return_tensors="pt").to(dev)
-    prime_kv_full(spec, enc["input_ids"])
-    last = enc["input_ids"][:, -1:]
-    n_collected = 0
-    for _ in range(steps):
-        v_logits = spec.verifier_logits_for_next(last)
-        if not torch.isfinite(v_logits).all():
-            break
-        v_top1 = _top1(v_logits)
-        d_hidden = drafter_hidden_no_cache(spec, last)
-        h = d_hidden.squeeze(1).float()
-        if hasattr(spec, "exit_pre_norm") and spec.exit_pre_norm is not None:
-            h = spec.exit_pre_norm(h)
-        d_logits = spec.exit_proj(h)
-        if hasattr(spec, "exit_logit_scale"):
-            d_logits = spec.exit_logit_scale * d_logits
-        d_top1 = _top1(d_logits) if torch.isfinite(d_logits).all() else -1
-        accept_bit = int(d_top1 == v_top1)
-        buf.append(
-            hidden=d_hidden.squeeze(0).squeeze(0).cpu(),
-            token=int(v_top1),
-            reward=float(accept_bit),
-            conf=0.0,
-            vlogits=v_logits.squeeze(0).cpu(),
-        )
-        if debug_out is not None:
-            try:
-                v_prob, v_id = torch.topk(torch.softmax(v_logits.float(), dim=-1)[0], k=topk)
-                d_prob, d_id = torch.topk(torch.softmax(d_logits.float(), dim=-1)[0], k=topk)
-                debug_out.append({
-                    "draft_top1": int(d_top1),
-                    "verifier_top1": int(v_top1),
-                    "accept": accept_bit,
-                    "verifier_topk": [[int(i), float(p)] for p, i in zip(v_prob.tolist(), v_id.tolist())],
-                    "draft_topk": [[int(i), float(p)] for p, i in zip(d_prob.tolist(), d_id.tolist())],
-                })
-            except Exception:
-                pass
-        v_token = torch.tensor([[v_top1]], device=last.device, dtype=last.dtype)
-        advance_kv_with_committed(spec, v_token)
-        last = v_token
-        n_collected += 1
-    return n_collected
-
-
-def _sample_from_logits(logits: torch.Tensor, greedy: bool, temperature: float) -> torch.Tensor:
-    if greedy or temperature <= 0.0:
-        return logits.argmax(dim=-1)
-    probs = F.softmax(logits / max(1e-6, temperature), dim=-1)
-    return torch.multinomial(probs, num_samples=1).squeeze(-1)
+    """Legacy single-token rollout forwarded to k-spec path."""
+    return rollout_collect_k_spec(
+        spec,
+        tok,
+        prompt,
+        buf,
+        steps,
+        k=1,
+        greedy=True,
+        temperature=1.0,
+        debug_out=debug_out,
+        topk=topk,
+    )
 
 
 @torch.inference_mode()
@@ -132,6 +88,7 @@ def rollout_collect_k_spec(
         draft_hidden = []
         tmp_shallow = shallow_past
         prev = last_tokens
+        shallow_snaps = []
         for _ in range(k):
             h_k, tmp_shallow = run_shallow_until_k(
                 spec,
@@ -140,14 +97,15 @@ def rollout_collect_k_spec(
                 attention_mask=None,
                 use_cache=True,
             )
-            logits = exit_logits_from_hidden_k(spec, h_k)  # [B,1,V]
-            nxt = _sample_from_logits(logits[:, -1, :], greedy=greedy, temperature=temperature)
+            logits = exit_logits_from_hidden_k(spec, h_k)
+            nxt = sample_from_logits(logits[:, -1, :], greedy=greedy, temperature=temperature)
             draft_tokens.append(nxt)
             draft_hidden.append(h_k[:, -1, :])
+            shallow_snaps.append(tmp_shallow)
             prev = nxt
 
-        prop_seq = torch.stack(draft_tokens, dim=1)        # [B,k]
-        hidden_seq = torch.stack(draft_hidden, dim=1)      # [B,k,H]
+        prop_seq = torch.stack(draft_tokens, dim=1)
+        hidden_seq = torch.stack(draft_hidden, dim=1)
 
         with torch.no_grad():
             deep_logits, deep_past_full = run_deep_from_k(
@@ -199,27 +157,19 @@ def rollout_collect_k_spec(
         # accept common prefix
         if accept_len > 0:
             accepted_block = prop_seq[:, :accept_len]
-            past_len_s = shallow_past[0][0].shape[2] if shallow_past and shallow_past[0] is not None else 0
-            past_len_d = deep_past[0][0].shape[2] if deep_past and deep_past[0] is not None else 0
+            snap = shallow_snaps[accept_len - 1]
             new_shallow = []
-            for (k_, v_) in tmp_shallow:
-                ks = k_[:, :, : past_len_s + accept_len, :].contiguous().clone()
-                vs = v_[:, :, : past_len_s + accept_len, :].contiguous().clone()
+            for (k_, v_) in snap:
+                ks = k_.contiguous().clone()
+                vs = v_.contiguous().clone()
                 new_shallow.append((ks, vs))
-                storage_elems = ks.untyped_storage().nbytes() // ks.element_size()
-                timing_trace(
-                    f"rollout compact shallow KV to {ks.shape} storage={storage_elems}"
-                )
             shallow_past = tuple(new_shallow)
+            past_len_d = deep_past[0][0].shape[2] if deep_past and deep_past[0] is not None else 0
             new_deep = []
             for (k_, v_) in deep_past_full:
                 ks = k_[:, :, : past_len_d + accept_len, :].contiguous().clone()
                 vs = v_[:, :, : past_len_d + accept_len, :].contiguous().clone()
                 new_deep.append((ks, vs))
-                storage_elems = ks.untyped_storage().nbytes() // ks.element_size()
-                timing_trace(
-                    f"rollout compact deep KV to {ks.shape} storage={storage_elems}"
-                )
             deep_past = tuple(new_deep)
             last_tokens = accepted_block[:, -1]
 
