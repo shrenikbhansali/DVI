@@ -12,6 +12,7 @@ from training.modeling import (
     run_deep_from_k,
     exit_logits_from_hidden_k,
 )
+from training.mem import timing_trace
 
 __all__ = ["rollout_collect", "rollout_collect_k_spec", "buf_debug"]
 
@@ -200,14 +201,26 @@ def rollout_collect_k_spec(
             accepted_block = prop_seq[:, :accept_len]
             past_len_s = shallow_past[0][0].shape[2] if shallow_past and shallow_past[0] is not None else 0
             past_len_d = deep_past[0][0].shape[2] if deep_past and deep_past[0] is not None else 0
-            shallow_past = tuple(
-                (k_[:, :, : past_len_s + accept_len, :], v_[:, :, : past_len_s + accept_len, :])
-                for (k_, v_) in tmp_shallow
-            )
-            deep_past = tuple(
-                (k_[:, :, : past_len_d + accept_len, :], v_[:, :, : past_len_d + accept_len, :])
-                for (k_, v_) in deep_past_full
-            )
+            new_shallow = []
+            for (k_, v_) in tmp_shallow:
+                ks = k_[:, :, : past_len_s + accept_len, :].contiguous().clone()
+                vs = v_[:, :, : past_len_s + accept_len, :].contiguous().clone()
+                new_shallow.append((ks, vs))
+                storage_elems = ks.untyped_storage().nbytes() // ks.element_size()
+                timing_trace(
+                    f"rollout compact shallow KV to {ks.shape} storage={storage_elems}"
+                )
+            shallow_past = tuple(new_shallow)
+            new_deep = []
+            for (k_, v_) in deep_past_full:
+                ks = k_[:, :, : past_len_d + accept_len, :].contiguous().clone()
+                vs = v_[:, :, : past_len_d + accept_len, :].contiguous().clone()
+                new_deep.append((ks, vs))
+                storage_elems = ks.untyped_storage().nbytes() // ks.element_size()
+                timing_trace(
+                    f"rollout compact deep KV to {ks.shape} storage={storage_elems}"
+                )
+            deep_past = tuple(new_deep)
             last_tokens = accepted_block[:, -1]
 
         # fix single mismatch
