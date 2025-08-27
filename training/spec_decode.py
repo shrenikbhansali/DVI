@@ -1,8 +1,7 @@
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Dict
+from typing import Dict, List, Optional, Tuple
 
 import torch
-import torch.nn.functional as F
 
 from .modeling import (
     run_shallow_until_k,
@@ -10,7 +9,9 @@ from .modeling import (
     exit_logits_from_hidden_k,
     cast_exit_to_base_dtype,
 )
+from .sampling import sample_from_logits
 from .utils import theoretical_compression, count_transformer_layers
+# timing_trace is kept for compatibility; may be used externally
 from .mem import timing_trace
 
 
@@ -19,26 +20,26 @@ class SpecMetrics:
     proposed: int = 0
     accepted: int = 0
     steps: int = 0
+    deep_tokens: int = 0
     comp_ratio_runtime_est: float = 1.0
 
     @property
     def accept_rate(self) -> float:
         return self.accepted / max(1, self.proposed)
 
+    @property
+    def deep_to_commit(self) -> float:
+        return self.deep_tokens / max(1, self.accepted)
+
     def to_dict(self) -> Dict[str, float]:
         return {
             "spec/proposed": float(self.proposed),
             "spec/accepted": float(self.accepted),
             "spec/accept_rate": float(self.accept_rate),
+            "spec/deep_tokens": float(self.deep_tokens),
+            "spec/deep_to_commit": float(self.deep_to_commit),
             "spec/comp_rt_est": float(self.comp_ratio_runtime_est),
         }
-
-
-def _sample_from_logits(logits: torch.Tensor, greedy: bool, temperature: float) -> torch.Tensor:
-    if greedy or temperature <= 0:
-        return logits.argmax(dim=-1)
-    probs = F.softmax(logits / max(1e-6, temperature), dim=-1)
-    return torch.multinomial(probs, num_samples=1).squeeze(-1)
 
 @torch.inference_mode()
 def generate_with_dvi_spec(
@@ -46,7 +47,7 @@ def generate_with_dvi_spec(
     tok,
     prompts: Optional[List[str]] = None,
     *,
-    enc: Optional[Dict[str, torch.Tensor]] = None,  # can pass already-encoded batch
+    enc: Optional[Dict[str, torch.Tensor]] = None,
     max_new_tokens: int = 64,
     draft_k: int = 4,
     greedy: bool = False,
@@ -55,18 +56,15 @@ def generate_with_dvi_spec(
     device: Optional[torch.device] = None,
     quiet: bool = True,
 ) -> Tuple[List[torch.Tensor], SpecMetrics]:
-    """Self-speculative decoding using shallow/deep split.
+    """Self-speculative decoding using vectorised block verification."""
 
-    IMPORTANT: we must seed the first proposed token from the *last real
-    token* of each prompt (not the last column, which may be PAD).
-    """
     model.eval()
     cast_exit_to_base_dtype(model)
     device = device or next(model.parameters()).device
     k = early_layer if early_layer is not None else getattr(model, "early_layer", None)
     assert isinstance(k, int) and k > 0
 
-    # --- use pre-encoded inputs if provided; otherwise tokenize once ---
+    # Encode inputs once if needed
     if enc is not None:
         input_ids = enc["input_ids"].to(device)
         attn_mask = enc.get("attention_mask")
@@ -80,21 +78,19 @@ def generate_with_dvi_spec(
         if attn_mask is not None:
             attn_mask = attn_mask.to(device)
 
-    B = input_ids.size(0)
+    B = int(input_ids.size(0))
 
-    # ---- choose the TRUE last token per sample (avoid PAD) ----
+    # Choose the true last token per sample (avoid PAD)
     if attn_mask is not None:
-        # lengths = number of non-pad tokens in each row
-        lengths = attn_mask.long().sum(dim=1)                            # [B]
-        last_idx = torch.clamp(lengths - 1, min=0)                       # [B]
+        lengths = attn_mask.long().sum(dim=1)
+        last_idx = torch.clamp(lengths - 1, min=0)
     else:
-        last_idx = torch.full((B,), input_ids.size(1) - 1,
-                              device=device, dtype=torch.long)           # [B]
-    last_tokens = input_ids.gather(1, last_idx.unsqueeze(1)).squeeze(1)  # [B]
+        last_idx = torch.full((B,), input_ids.size(1) - 1, device=device, dtype=torch.long)
+    last_tokens = input_ids.gather(1, last_idx.unsqueeze(1)).squeeze(1)
 
     generated: List[List[int]] = [[] for _ in range(B)]
 
-    # prime shallow & deep KV caches on the full prompt
+    # Prime KV caches on the prompt
     h_k_prompt, shallow_past = run_shallow_until_k(
         model,
         input_ids=input_ids,
@@ -113,83 +109,107 @@ def generate_with_dvi_spec(
     total_new = 0
 
     while total_new < max_new_tokens:
-        proposed_tokens: List[torch.Tensor] = []
-        proposed_hidden: List[torch.Tensor] = []
-        draft_shallow_past = shallow_past
-        draft_pasts: List[Tuple] = []
-
-        # ----- draft k tokens with shallow stack -----
+        draft_tokens: List[torch.Tensor] = []
+        draft_hidden: List[torch.Tensor] = []
+        shallow_snapshots: List[Tuple] = []
+        tmp_shallow = shallow_past
         prev = last_tokens
+
+        # ---- draft k tokens ----
         for _ in range(draft_k):
-            h_k, draft_shallow_past = run_shallow_until_k(
+            h_k, tmp_shallow = run_shallow_until_k(
                 model,
                 input_ids=prev.unsqueeze(1),
-                past_key_values=draft_shallow_past,
+                past_key_values=tmp_shallow,
                 attention_mask=None,
                 use_cache=True,
             )
-            logits_draft = exit_logits_from_hidden_k(model, h_k)
-            nxt = _sample_from_logits(logits_draft[:, -1, :], greedy=greedy, temperature=temperature)
-            proposed_tokens.append(nxt)
-            proposed_hidden.append(h_k[:, -1, :])
-            draft_pasts.append(draft_shallow_past)
+            logits = exit_logits_from_hidden_k(model, h_k)
+            nxt = sample_from_logits(logits[:, -1, :], greedy=greedy, temperature=temperature)
+            draft_tokens.append(nxt)
+            draft_hidden.append(h_k[:, -1, :])
+            shallow_snapshots.append(tmp_shallow)
             prev = nxt
 
+        prop_seq = torch.stack(draft_tokens, dim=1)  # [B,k]
+        hidden_seq = torch.stack(draft_hidden, dim=1)  # [B,k,H]
         metrics.proposed += int(B * draft_k)
 
-        # ----- sequentially verify each drafted token -----
-        commit_all = True
-        for d in range(draft_k):
-            h_d = proposed_hidden[d].unsqueeze(1)
-            deep_logits, deep_past_next = run_deep_from_k(
+        # ---- verify entire block ----
+        deep_logits, deep_past_full = run_deep_from_k(
+            model,
+            hidden_k=hidden_seq,
+            past_key_values=deep_past,
+            use_cache=True,
+        )
+        metrics.steps += 1
+        metrics.deep_tokens += int(B * draft_k)
+        deep_calls = 1
+
+        verify_argmax = deep_logits.argmax(dim=-1)  # [B,k]
+        matches = verify_argmax.eq(prop_seq)
+
+        all_matched = matches.all(dim=1)
+        first_mismatch = (~matches).float().argmax(dim=1)
+        prefix_lens = torch.where(all_matched, torch.full_like(first_mismatch, draft_k), first_mismatch)
+        accept_len = int(prefix_lens.min().item())
+
+        # commit accepted prefix
+        if accept_len > 0:
+            accepted_block = prop_seq[:, :accept_len]
+            snap = shallow_snapshots[accept_len - 1]
+            new_shallow = []
+            for (k_, v_) in snap:
+                new_shallow.append((k_.contiguous().clone(), v_.contiguous().clone()))
+            shallow_past = tuple(new_shallow)
+
+            past_len_d = deep_past[0][0].shape[2] if deep_past and deep_past[0] is not None else 0
+            new_deep = []
+            for (k_, v_) in deep_past_full:
+                ks = k_[:, :, : past_len_d + accept_len, :].contiguous().clone()
+                vs = v_[:, :, : past_len_d + accept_len, :].contiguous().clone()
+                new_deep.append((ks, vs))
+            deep_past = tuple(new_deep)
+
+            acc_list = accepted_block.tolist()
+            for b in range(B):
+                generated[b].extend(acc_list[b])
+            last_tokens = accepted_block[:, -1]
+            total_new += accept_len
+            metrics.accepted += int(B * accept_len)
+
+        if total_new >= max_new_tokens:
+            break
+
+        # ---- optional single-token fix ----
+        if accept_len < draft_k:
+            mismatch_tok = verify_argmax[:, accept_len]
+            h_fix, shallow_past = run_shallow_until_k(
                 model,
-                hidden_k=h_d,
+                input_ids=mismatch_tok.unsqueeze(1),
+                past_key_values=shallow_past,
+                attention_mask=None,
+                use_cache=True,
+            )
+            _, deep_past = run_deep_from_k(
+                model,
+                hidden_k=h_fix,
                 past_key_values=deep_past,
                 use_cache=True,
             )
             metrics.steps += 1
-            v_tok = deep_logits[:, -1, :].argmax(dim=-1)
-            match = v_tok.eq(proposed_tokens[d])
-            if bool(match.all()):
-                shallow_past = draft_pasts[d]
-                deep_past = deep_past_next
-                tok_list = proposed_tokens[d].tolist()
-                for b in range(B):
-                    generated[b].append(tok_list[b])
-                last_tokens = proposed_tokens[d]
-                total_new += 1
-                metrics.accepted += int(B)
-                if total_new >= max_new_tokens:
-                    commit_all = False
-                    break
-            else:
-                # mismatch: fix with verifier token
-                commit_all = False
-                tok_list = v_tok.tolist()
-                h_fix, shallow_past = run_shallow_until_k(
-                    model,
-                    input_ids=v_tok.unsqueeze(1),
-                    past_key_values=shallow_past,
-                    attention_mask=None,
-                    use_cache=True,
-                )
-                _, deep_past = run_deep_from_k(
-                    model,
-                    hidden_k=h_fix,
-                    past_key_values=deep_past,
-                    use_cache=True,
-                )
-                metrics.steps += 1
-                for b in range(B):
-                    generated[b].append(tok_list[b])
-                last_tokens = v_tok
-                total_new += 1
-                break
+            metrics.deep_tokens += int(B)
+            deep_calls += 1
 
-        if total_new >= max_new_tokens or not commit_all:
-            if total_new >= max_new_tokens:
-                break
-            continue
+            tok_list = mismatch_tok.tolist()
+            for b in range(B):
+                generated[b].append(tok_list[b])
+            last_tokens = mismatch_tok
+            total_new += 1
+            metrics.accepted += int(B)
+
+        # safety: ensure ≤ 2 deep calls per block
+        assert deep_calls <= 2, "Deep called more than twice in a block"
 
     total_layers = count_transformer_layers(model)
     comp_ratio, _ = theoretical_compression(metrics.accept_rate, k, total_layers)

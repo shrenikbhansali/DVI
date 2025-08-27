@@ -231,8 +231,8 @@ def run_shallow_until_k(
     _ensure_active_adapter(model, "draft")
     early = _early_model(model)
 
-    # Try fast-path only if enabled and KV is actually produced
-    if early is not None and not os.getenv("DVI_DISABLE_EARLY_FASTPATH"):
+    # Try fast-path only if enabled and no external KV is provided
+    if early is not None and past_key_values is None and not os.getenv("DVI_DISABLE_EARLY_FASTPATH"):
         try:
             out = early.forward_draft_or_large_model(
                 in_tokens_small=input_ids, position_ids=None, use_cache=use_cache
@@ -311,8 +311,8 @@ def run_deep_from_k(
     _ensure_active_adapter(model, "verify")
     early = _early_model(model)
 
-    # Try fast-path only if enabled and KV is actually produced
-    if early is not None and not os.getenv("DVI_DISABLE_EARLY_FASTPATH"):
+    # Try fast-path only if enabled and no external KV is provided
+    if early is not None and past_key_values is None and not os.getenv("DVI_DISABLE_EARLY_FASTPATH"):
         try:
             deep_hidden, norm = early.forward_draft_or_large_model(
                 in_features_large=hidden_k, use_cache=use_cache
