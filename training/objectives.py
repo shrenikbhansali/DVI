@@ -32,9 +32,10 @@ def _logit_stats(s_logits: torch.Tensor, t_logits: torch.Tensor) -> Tuple[float,
 
 def one_mixed_step(model, opt, batch,
                    temperature=1.0, clip=1.0,
-                   ce_weight=0.20,
+                   ce_weight=0.10,
                    lam_pg=0.0, lam_kl=1.0, ent_weight=0.0,
-                   init_fro: float = None, max_fro: float = 0.0, max_fro_ratio: float = 0.0):
+                   init_fro: float = None, max_fro: float = 0.0, max_fro_ratio: float = 0.0,
+                   ce_mask_by_reward: bool = False):
     dev = next(model.parameters()).device
     hidden = batch["hidden"].to(dev)
     vlogits = batch["vlogits"].to(dev)
@@ -46,20 +47,32 @@ def one_mixed_step(model, opt, batch,
         h = model.exit_pre_norm(h)
     slogits = model.exit_proj(h)
     if hasattr(model, "exit_logit_scale"):
-        slogits = model.exit_logit_scale * slogits
+        slogits = model.exit_logit_scale.to(slogits.dtype) * slogits
 
     slogp = F.log_softmax(slogits, dim=-1)
     sp = slogp.exp()
 
     pi_v = sp.gather(1, tokens.view(-1, 1)).squeeze(1)
-    loss_pg = -(rewards * torch.log(pi_v.clamp_min(1e-8))).mean()
+    pos = rewards.gt(0)
+    count_pos = pos.float().sum().clamp_min(1.0)
+    loss_pg = -(rewards * torch.log(pi_v.clamp_min(1e-8))).sum() / count_pos
 
     tlogits = vlogits.float() / float(temperature)
     tlogp = F.log_softmax(tlogits, dim=-1)
     tp = tlogp.exp()
     kl = F.kl_div(input=slogp, target=tp, reduction="batchmean", log_target=False)
 
-    ce = F.nll_loss(slogp, tokens, reduction="mean") if ce_weight > 0.0 else torch.tensor(0.0, device=dev)
+    if ce_weight > 0.0:
+        if ce_mask_by_reward:
+            mask = rewards > 0
+            if mask.any():
+                ce = F.nll_loss(slogp[mask], tokens[mask], reduction="mean")
+            else:
+                ce = torch.tensor(0.0, device=dev)
+        else:
+            ce = F.nll_loss(slogp, tokens, reduction="mean")
+    else:
+        ce = torch.tensor(0.0, device=dev)
     ent = -(sp * slogp).sum(-1).mean()
 
     loss = lam_pg * loss_pg + lam_kl * kl + ce_weight * ce - ent_weight * ent

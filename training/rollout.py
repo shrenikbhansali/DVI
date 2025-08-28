@@ -10,6 +10,8 @@ from training.modeling import (
     run_shallow_until_k,
     run_deep_from_k,
     exit_logits_from_hidden_k,
+    cast_exit_to_base_dtype,
+    adapter_guard,
 )
 from training.sampling import sample_from_logits
 
@@ -56,6 +58,7 @@ def rollout_collect_k_spec(
     """
 
     spec.eval()
+    cast_exit_to_base_dtype(spec)
     device = next(spec.parameters()).device
     enc = tok(prompt, return_tensors="pt")
     input_ids = enc["input_ids"].to(device)
@@ -64,10 +67,11 @@ def rollout_collect_k_spec(
         attn_mask = attn_mask.to(device)
 
     # --- prime KV caches on the prompt ---
-    h_k_prompt, shallow_past = run_shallow_until_k(
-        spec, input_ids=input_ids, attention_mask=attn_mask, past_key_values=None, use_cache=True
-    )
-    with torch.no_grad():
+    with adapter_guard(spec, "draft"):
+        h_k_prompt, shallow_past = run_shallow_until_k(
+            spec, input_ids=input_ids, attention_mask=attn_mask, past_key_values=None, use_cache=True
+        )
+    with adapter_guard(spec, "verify"), torch.no_grad():
         _, deep_past = run_deep_from_k(
             spec, hidden_k=h_k_prompt, past_key_values=None, use_cache=True
         )
@@ -90,14 +94,15 @@ def rollout_collect_k_spec(
         prev = last_tokens
         shallow_snaps = []
         for _ in range(k):
-            h_k, tmp_shallow = run_shallow_until_k(
-                spec,
-                input_ids=prev.unsqueeze(1),
-                past_key_values=tmp_shallow,
-                attention_mask=None,
-                use_cache=True,
-            )
-            logits = exit_logits_from_hidden_k(spec, h_k)
+            with adapter_guard(spec, "draft"):
+                h_k, tmp_shallow = run_shallow_until_k(
+                    spec,
+                    input_ids=prev.unsqueeze(1),
+                    past_key_values=tmp_shallow,
+                    attention_mask=None,
+                    use_cache=True,
+                )
+                logits = exit_logits_from_hidden_k(spec, h_k)
             nxt = sample_from_logits(logits[:, -1, :], greedy=greedy, temperature=temperature)
             draft_tokens.append(nxt)
             draft_hidden.append(h_k[:, -1, :])
@@ -107,7 +112,7 @@ def rollout_collect_k_spec(
         prop_seq = torch.stack(draft_tokens, dim=1)
         hidden_seq = torch.stack(draft_hidden, dim=1)
 
-        with torch.no_grad():
+        with adapter_guard(spec, "verify"), torch.no_grad():
             deep_logits, deep_past_full = run_deep_from_k(
                 spec, hidden_k=hidden_seq, past_key_values=deep_past, use_cache=True
             )
@@ -176,14 +181,15 @@ def rollout_collect_k_spec(
         # fix single mismatch
         if accept_len < k:
             mismatch_tok = verify_argmax[:, accept_len]
-            h_fix, shallow_past = run_shallow_until_k(
-                spec,
-                input_ids=mismatch_tok.unsqueeze(1),
-                past_key_values=shallow_past,
-                attention_mask=None,
-                use_cache=True,
-            )
-            with torch.no_grad():
+            with adapter_guard(spec, "draft"):
+                h_fix, shallow_past = run_shallow_until_k(
+                    spec,
+                    input_ids=mismatch_tok.unsqueeze(1),
+                    past_key_values=shallow_past,
+                    attention_mask=None,
+                    use_cache=True,
+                )
+            with adapter_guard(spec, "verify"), torch.no_grad():
                 _, deep_past = run_deep_from_k(
                     spec, hidden_k=h_fix, past_key_values=deep_past, use_cache=True
                 )
