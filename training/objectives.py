@@ -20,7 +20,7 @@ def _maybe_clamp_exit_head(model, init_fro: float, max_fro: float, max_fro_ratio
         if max_fro_ratio and max_fro_ratio > 0:
             bound_rel = init_fro * max_fro_ratio
             bound = min(bound, bound_rel) if bound is not None else bound_rel
-        if bound is not None and math.isfinite(n) and n > bound:
+        if bound is not None and matzh.isfinite(n) and n > bound:
             W.mul_(bound / n)
 
 
@@ -37,7 +37,7 @@ def one_mixed_step(model, opt, batch,
                    init_fro: float = None, max_fro: float = 0.0, max_fro_ratio: float = 0.0,
                    ce_mask_by_reward: bool = False):
     dev = next(model.parameters()).device
-    hidden = batch["hidden"].to(dev)
+    hidden = batch["hidden"].clone().to(dev) 
     vlogits = batch["vlogits"].to(dev)
     tokens = batch["token"].to(dev).view(-1)
     rewards = batch.get("reward", torch.ones_like(tokens, dtype=torch.float32, device=dev)).to(dev).view(-1)

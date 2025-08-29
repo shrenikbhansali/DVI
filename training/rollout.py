@@ -18,7 +18,7 @@ from training.sampling import sample_from_logits
 __all__ = ["rollout_collect", "rollout_collect_k_spec", "buf_debug"]
 
 
-@torch.inference_mode()
+@torch.no_grad()
 def rollout_collect(spec, tok, prompt: str,
                     buf: ReplayBuffer, steps: int,
                     debug_out: Optional[List[Dict]] = None, topk: int = 5) -> int:
@@ -37,7 +37,7 @@ def rollout_collect(spec, tok, prompt: str,
     )
 
 
-@torch.inference_mode()
+@torch.no_grad()
 def rollout_collect_k_spec(
     spec,
     tok,
@@ -134,12 +134,15 @@ def rollout_collect_k_spec(
         rw_list = rewards.detach().cpu().tolist()
         for b in range(B):
             for d in range(k):
+                with torch.inference_mode(False):          # leave inference mode
+                    hidden  = hidden_seq[b, d].detach().clone().cpu()
+                    vlogits = deep_logits[b, d].detach().clone().cpu()
                 buf.append(
-                    hidden=hidden_seq[b, d].detach().cpu(),
+                    hidden=hidden,
                     token=int(va_list[b][d]),
                     reward=float(rw_list[b][d]),
                     conf=0.0,
-                    vlogits=deep_logits[b, d].detach().cpu(),
+                    vlogits=vlogits,
                 )
 
         n_collected += B * k
