@@ -90,7 +90,10 @@ def clear_all_kv(spec, verbose: bool = False, tag: str = "") -> None:
         print(f"[kv-clear]{(' '+tag) if tag else ''} -> {msg}", flush=True)
 
 
-@torch.inference_mode()
+# These helpers are used during evaluation and rollout to manipulate KV caches.
+# We only need gradients disabled, so ``torch.no_grad`` suffices and avoids
+# generating inference tensors that might later leak into training.
+@torch.no_grad()
 def prime_kv_full(spec: EarlyExitLlamaForCausalLM, input_ids: torch.Tensor) -> None:
     clear_all_kv(spec)
     with adapter_guard(spec, "draft"):
@@ -99,7 +102,7 @@ def prime_kv_full(spec: EarlyExitLlamaForCausalLM, input_ids: torch.Tensor) -> N
         _ , _ = spec.forward_draft_or_large_model(in_features_large=h)
 
 
-@torch.inference_mode()
+@torch.no_grad()
 def advance_kv_with_committed(spec: EarlyExitLlamaForCausalLM, token_ids: torch.Tensor) -> None:
     with adapter_guard(spec, "draft"):
         h = spec.forward_draft_or_large_model(in_tokens_small=token_ids)
@@ -107,7 +110,7 @@ def advance_kv_with_committed(spec: EarlyExitLlamaForCausalLM, token_ids: torch.
         _ , _ = spec.forward_draft_or_large_model(in_features_large=h)
 
 
-@torch.inference_mode()
+@torch.no_grad()
 def drafter_hidden_no_cache(spec: EarlyExitLlamaForCausalLM, ids_last: torch.Tensor) -> torch.Tensor:
     slots = _kv_snapshot(spec)
     try:

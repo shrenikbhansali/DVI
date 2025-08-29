@@ -306,7 +306,9 @@ def measure_generate_walltime(
     def _slice_enc(enc, s, e):
         return {k: v[s:e] for k, v in enc.items()}
 
-    @torch.inference_mode()
+    # ``torch.no_grad`` is sufficient for generation benchmarking here and
+    # avoids returning tensors marked as inference.
+    @torch.no_grad()
     def _baseline_once(enc_chunk, force_greedy: bool) -> float:
         _cuda_sync()
         t0 = time.perf_counter()
@@ -325,7 +327,7 @@ def measure_generate_walltime(
         _cuda_sync()
         return time.perf_counter() - t0
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def _spec_once(enc_chunk) -> (float, Dict[str, float]):
         deep_kv_purge(model)
         from training.spec_decode import generate_with_dvi_spec
