@@ -153,6 +153,34 @@ def generate_with_dvi_spec(
         metrics.steps += 1
         metrics.deep_tokens += int(B * draft_k)
         deep_calls = 1
+        import os
+
+        # --- Misalignment debug (prints to stdout) ---
+        if os.getenv("DVI_ALIGN_DEBUG", ""):
+            # Argmax predictions from the deep verifier for the k drafted positions
+            _va = deep_logits.argmax(dim=-1)  # [B, k]
+
+            # Sanity matches:
+            #   m00: deep[:,0] vs draft[:,0]  <-- should roughly match CTAR1 if aligned
+            #   m10: deep[:,1] vs draft[:,0]  <-- if this ≈CTAR1 instead, you're +1 shifted
+            m00 = (_va[:, 0] == prop_seq[:, 0]).float().mean().item()
+            m10 = float("nan")
+            m11 = float("nan")
+            if _va.size(1) > 1:
+                m10 = (_va[:, 1] == prop_seq[:, 0]).float().mean().item()
+                m11 = (_va[:, 1] == prop_seq[:, 1]).float().mean().item()
+
+            # Print only a few times to avoid spam
+            if not hasattr(generate_with_dvi_spec, "_align_prints"):
+                generate_with_dvi_spec._align_prints = 0
+            if generate_with_dvi_spec._align_prints < 3:
+                print(
+                    f"[align/spec] k={draft_k} match(0↔0)={m00:.3f} "
+                    f"match(1↔0)={m10:.3f} match(1↔1)={m11:.3f}",
+                    flush=True,
+                )
+                generate_with_dvi_spec._align_prints += 1
+        # --- end misalignment debug ---
 
         verify_argmax = deep_logits.argmax(dim=-1)  # [B,k]
         matches = verify_argmax.eq(prop_seq)

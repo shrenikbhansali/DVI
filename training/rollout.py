@@ -114,6 +114,26 @@ def rollout_collect_k_spec(
             deep_logits, deep_past_full = run_deep_from_k(
                 spec, hidden_k=hidden_seq, past_key_values=deep_past, use_cache=True
             )
+        import os
+
+        if os.getenv("DVI_ALIGN_DEBUG", ""):
+            _va = deep_logits.argmax(dim=-1)  # [B, k]
+            m00 = (_va[:, 0] == prop_seq[:, 0]).float().mean().item()
+            m10 = float("nan")
+            m11 = float("nan")
+            if _va.size(1) > 1:
+                m10 = (_va[:, 1] == prop_seq[:, 0]).float().mean().item()
+                m11 = (_va[:, 1] == prop_seq[:, 1]).float().mean().item()
+
+            if not hasattr(rollout_collect_k_spec, "_align_prints"):
+                rollout_collect_k_spec._align_prints = 0
+            if rollout_collect_k_spec._align_prints < 3:
+                print(
+                    f"[align/rollout] k={k} match(0↔0)={m00:.3f} "
+                    f"match(1↔0)={m10:.3f} match(1↔1)={m11:.3f}",
+                    flush=True,
+                )
+                rollout_collect_k_spec._align_prints += 1
 
         verify_argmax = deep_logits.argmax(dim=-1)         # [B,k]
         matches = verify_argmax.eq(prop_seq)
