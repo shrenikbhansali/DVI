@@ -10,6 +10,7 @@ from .modeling import (
     exit_logits_from_hidden_k,
 )
 from .utils import theoretical_compression, count_transformer_layers
+from .mem import timing_trace
 
 
 @dataclass
@@ -38,6 +39,7 @@ def _sample_from_logits(logits: torch.Tensor, greedy: bool, temperature: float) 
     probs = F.softmax(logits / max(1e-6, temperature), dim=-1)
     return torch.multinomial(probs, num_samples=1).squeeze(-1)
 
+@torch.inference_mode()
 def generate_with_dvi_spec(
     model,
     tok,
@@ -90,21 +92,20 @@ def generate_with_dvi_spec(
 
     generated: List[List[int]] = [[] for _ in range(B)]
 
-    with torch.no_grad():
-        # prime shallow & deep KV caches on the full prompt
-        h_k_prompt, shallow_past = run_shallow_until_k(
-            model,
-            input_ids=input_ids,
-            attention_mask=attn_mask,
-            past_key_values=None,
-            use_cache=True,
-        )
-        _, deep_past = run_deep_from_k(
-            model,
-            hidden_k=h_k_prompt,
-            past_key_values=None,
-            use_cache=True,
-        )
+    # prime shallow & deep KV caches on the full prompt
+    h_k_prompt, shallow_past = run_shallow_until_k(
+        model,
+        input_ids=input_ids,
+        attention_mask=attn_mask,
+        past_key_values=None,
+        use_cache=True,
+    )
+    _, deep_past = run_deep_from_k(
+        model,
+        hidden_k=h_k_prompt,
+        past_key_values=None,
+        use_cache=True,
+    )
 
     metrics = SpecMetrics()
     total_new = 0
@@ -136,13 +137,12 @@ def generate_with_dvi_spec(
         metrics.proposed += int(B * draft_k)
 
         # ----- verify with deep stack in one shot -----
-        with torch.no_grad():
-            deep_logits, deep_past_full = run_deep_from_k(
-                model,
-                hidden_k=hidden_seq,
-                past_key_values=deep_past,
-                use_cache=True,
-            )
+        deep_logits, deep_past_full = run_deep_from_k(
+            model,
+            hidden_k=hidden_seq,
+            past_key_values=deep_past,
+            use_cache=True,
+        )
         verify_argmax = deep_logits.argmax(dim=-1)  # [B, k]
 
         # compute common accept prefix length (per sample)
@@ -165,16 +165,26 @@ def generate_with_dvi_spec(
             past_len_s = shallow_past[0][0].shape[2] if shallow_past and shallow_past[0] is not None else 0
             past_len_d = deep_past[0][0].shape[2] if deep_past and deep_past[0] is not None else 0
 
-            shallow_past = tuple(
-                (k[:, :, : past_len_s + accept_len, :],
-                 v[:, :, : past_len_s + accept_len, :])
-                for (k, v) in draft_shallow_past
-            )
-            deep_past = tuple(
-                (k[:, :, : past_len_d + accept_len, :],
-                 v[:, :, : past_len_d + accept_len, :])
-                for (k, v) in deep_past_full
-            )
+            new_shallow = []
+            for (k, v) in draft_shallow_past:
+                ks = k[:, :, : past_len_s + accept_len, :].contiguous().clone()
+                vs = v[:, :, : past_len_s + accept_len, :].contiguous().clone()
+                new_shallow.append((ks, vs))
+                storage_elems = ks.untyped_storage().nbytes() // ks.element_size()
+                timing_trace(
+                    f"compact shallow KV to {ks.shape} storage={storage_elems}"
+                )
+            shallow_past = tuple(new_shallow)
+            new_deep = []
+            for (k, v) in deep_past_full:
+                ks = k[:, :, : past_len_d + accept_len, :].contiguous().clone()
+                vs = v[:, :, : past_len_d + accept_len, :].contiguous().clone()
+                new_deep.append((ks, vs))
+                storage_elems = ks.untyped_storage().nbytes() // ks.element_size()
+                timing_trace(
+                    f"compact deep KV to {ks.shape} storage={storage_elems}"
+                )
+            deep_past = tuple(new_deep)
             for b in range(B):
                 generated[b].extend(accepted_block[b].tolist())
             last_tokens = accepted_block[:, -1]

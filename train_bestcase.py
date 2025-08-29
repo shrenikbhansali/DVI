@@ -17,6 +17,7 @@ import argparse
 import json
 import math
 import time
+import gc
 from typing import List
 
 import torch
@@ -32,6 +33,7 @@ from training.utils import (
     count_transformer_layers,
     theoretical_compression,
 )
+from training.mem import deep_kv_purge, timing_trace
 from training.modeling import prepare_dvi_trainable, build_optimizer
 from training.kv import estimate_kv_cache
 from training.rollout import rollout_collect, rollout_collect_k_spec, buf_debug
@@ -281,11 +283,16 @@ def train_bestcase_kl_rl(model, tok, prompts_train: List[str], prompts_eval: Lis
                "eval/post/ctar3": ctar1[3], "eval/post/ctar4": ctar1[4],
                "eval/delta_acc": (acc1 - acc0)}, step=steps)
 
+    deep_kv_purge(model)
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model-id", type=str, default="meta-llama/Llama-2-7b-hf")
-    ap.add_argument("--early-layer", type=int, default=4)
+    ap.add_argument("--early-layer", type=int, default=16, help="Early-exit split layer k (prefer deeper, e.g. 16 or 24 on 7B)")
     ap.add_argument("--train-prompts", type=int, default=512)
     ap.add_argument("--eval-prompts", type=int, default=64)
     ap.add_argument("--steps", type=int, default=300)
@@ -293,6 +300,8 @@ def main():
     ap.add_argument("--batch-size", type=int, default=64)
     ap.add_argument("--lr-exit", type=float, default=5e-4)
     ap.add_argument("--lr-lora", type=float, default=5e-5)
+    ap.add_argument("--lora-s-rank", type=int, default=8)
+    ap.add_argument("--lora-v-rank", type=int, default=0)
     ap.add_argument("--temperature", type=float, default=1.0)
     ap.add_argument("--ce-weight", type=float, default=0.20)
     ap.add_argument("--ent-weight", type=float, default=0.00)
@@ -342,7 +351,13 @@ def main():
     prompts_eval  = build_prompts_from_alpaca(args.eval_prompts)
 
     print("[e2e] loading model…", flush=True)
-    model = prepare_dvi_trainable(args.model_id, args.early_layer, dtype=torch.float16)
+    model = prepare_dvi_trainable(
+        args.model_id,
+        args.early_layer,
+        rank_s=args.lora_s_rank,
+        rank_v=args.lora_v_rank,
+        dtype=torch.float16,
+    )
 
     with torch.no_grad():
         lm_nrm   = model.lm_head.weight.detach().float().norm().item()
@@ -372,6 +387,10 @@ def main():
         spec_train_greedy=args.spec_train_greedy,
         spec_train_temp=args.spec_train_temp,
     )
+    deep_kv_purge(model)
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     # -------- Post-train walltime timing --------
     print("\n[e2e] timing DVI (SPEC) vs baseline…", flush=True)
@@ -382,7 +401,10 @@ def main():
     dvi_device = next(model.parameters()).device
     dvi_dtype = next(model.parameters()).dtype
     total_layers = count_transformer_layers(model)
-    print(f"[time] decode_mode=DVI(SPEC); device={dvi_device}; dtype={dvi_dtype}", flush=True)
+    print(
+        f"[time] decode_mode=DVI(SPEC); device={dvi_device}; dtype={dvi_dtype}; temperature={args.temperature}",
+        flush=True,
+    )
 
     dvi_res = measure_generate_walltime(
         model, tok, timing_prompts,
@@ -403,7 +425,26 @@ def main():
     comp_rt, _ = theoretical_compression(acc_rt, args.early_layer, total_layers)
     print(f"[spec] runtime_accept_rate={acc_rt:.3f} | runtime_comp_est≈{comp_rt:.3f}", flush=True)
 
+    deep_kv_purge(model)
+    try:
+        import wandb as _wandb
+        if _wandb is not None:
+            try:
+                _wandb.unwatch(model)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    if run is not None:
+        try:
+            run.finish()
+            timing_trace("wandb run finished before baseline load")
+        except Exception:
+            pass
     del model
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     free_cuda("(before baseline timing)")
 
     from transformers import AutoModelForCausalLM
@@ -414,13 +455,21 @@ def main():
     if getattr(baseline.config, "use_cache", True) is False:
         baseline.config.use_cache = True
 
-    print(f"[time] decode_mode=BASELINE(vanilla); device={dvi_device}; dtype={dvi_dtype}", flush=True)
+    deep_kv_purge(baseline)
+
+    print(
+        f"[time] decode_mode=BASELINE(vanilla); device={dvi_device}; dtype={dvi_dtype}; temperature={args.temperature}",
+        flush=True,
+    )
     base_time = measure_generate_walltime(
-        baseline, tok, timing_prompts,
+        baseline,
+        tok,
+        timing_prompts,
         max_new_tokens=args.time_max_new_tokens,
         greedy=args.timing_greedy,
         repeats=args.time_repeats,
         use_dvi_spec=False,
+        temperature=max(1e-6, args.temperature),
     )
     print(f"[time] Baseline generate: {base_time:.3f}s", flush=True)
 
@@ -440,15 +489,12 @@ def main():
         )[0],
     }, step=args.steps)
 
-    # Cleanup
+    deep_kv_purge(baseline)
     del baseline
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     free_cuda("(timing done)")
-
-    if run is not None:
-        try:
-            run.finish()
-        except Exception:
-            pass
 
 
 if __name__ == "__main__":
