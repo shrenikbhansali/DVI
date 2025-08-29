@@ -492,6 +492,7 @@ def main():
         repeats=args.time_repeats,
         use_dvi_spec=False,
         temperature=max(1e-6, args.temperature),
+        microbatch_base=1
     )
     print(f"[time] Baseline generate: {base_time:.3f}s", flush=True)
 
