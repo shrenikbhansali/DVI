@@ -10,7 +10,13 @@ except Exception:  # pragma: no cover - wandb optional
 WANDB_DEFAULT_ENTITY = "sbhansali8-georgia-institute-of-technology"
 WANDB_DEFAULT_PROJECT = "DVI-Testing"
 
-__all__ = ["init_wandb", "wandb_watch_model", "wandb_log"]
+__all__ = [
+    "init_wandb",
+    "wandb_watch_model",
+    "wandb_log",
+    "wandb_summary_update",
+    "finish_wandb",
+]
 
 
 def init_wandb(args) -> Optional[object]:
@@ -52,10 +58,40 @@ def wandb_watch_model(model, log_freq: int = 25) -> None:
         print(f"[wandb] watch skipped: {e}", flush=True)
 
 
+def _to_python_scalar(v):
+    """Best-effort convert tensors/ndarrays to Python scalars."""
+    try:
+        if hasattr(v, "item"):
+            return v.item()
+    except Exception:
+        pass
+    return v
+
+
 def wandb_log(d: Dict, step: Optional[int] = None) -> None:
     if _wandb is None or _wandb.run is None:
         return
+    clean = {k: _to_python_scalar(v) for k, v in d.items()}
     try:
-        _wandb.log(d, step=step)
+        _wandb.log(clean, step=step)
+    except Exception:
+        pass
+
+
+def wandb_summary_update(d: Dict) -> None:
+    if _wandb is None or _wandb.run is None:
+        return
+    try:
+        for k, v in d.items():
+            _wandb.run.summary[k] = _to_python_scalar(v)
+    except Exception:
+        pass
+
+
+def finish_wandb() -> None:
+    if _wandb is None or _wandb.run is None:
+        return
+    try:
+        _wandb.finish()
     except Exception:
         pass

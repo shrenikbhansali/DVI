@@ -39,7 +39,15 @@ from training.kv import estimate_kv_cache
 from training.rollout import rollout_collect, rollout_collect_k_spec, buf_debug
 from training.objectives import one_mixed_step
 from training.schedule import mix_schedule, phase_of_step
-from training.logging import init_wandb, wandb_watch_model, wandb_log, WANDB_DEFAULT_ENTITY, WANDB_DEFAULT_PROJECT
+from training.logging import (
+    init_wandb,
+    wandb_watch_model,
+    wandb_log,
+    wandb_summary_update,
+    finish_wandb,
+    WANDB_DEFAULT_ENTITY,
+    WANDB_DEFAULT_PROJECT,
+)
 from training.buffer import ReplayBuffer
 from evaluation.acceptance import eval_acceptance
 
@@ -257,8 +265,7 @@ def train_bestcase_kl_rl(model, tok, prompts_train: List[str], prompts_eval: Lis
             "cuda/mem_alloc_MB": mem_alloc, "cuda/mem_reserved_MB": mem_reserved, "cuda/mem_max_alloc_MB": mem_max,
             "tokens/total": tokens_total,
             # added: frequent compression logging
-            "comp/ratio_est": comp_ratio,
-            "comp/speedup_est": speedup_est,
+            "comp/theoretical_from_train": comp_ratio,
         }, step=g)
 
         if dbg_roll:
@@ -297,11 +304,14 @@ def train_bestcase_kl_rl(model, tok, prompts_train: List[str], prompts_eval: Lis
     for w in range(1, eval_k_max + 1):
         log_post[f"eval/post/ctar{w}"] = ctar1.get(w, 0)
     wandb_log(log_post, step=steps)
+    wandb_summary_update(log_post)
 
     deep_kv_purge(model)
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+
+    return acc1
 
 
 def main():
@@ -390,7 +400,7 @@ def main():
                "sanity/head_parity_diff": diff_nrm}, step=0)
     wandb_watch_model(model, log_freq=25)
 
-    train_bestcase_kl_rl(
+    acc1 = train_bestcase_kl_rl(
         model, tok, prompts_train, prompts_eval,
         steps=args.steps, rollout_len=args.rollout, batch_size=args.batch_size,
         lr_exit=args.lr_exit, lr_lora=args.lr_lora, temperature=args.temperature,
@@ -458,12 +468,6 @@ def main():
                 pass
     except Exception:
         pass
-    if run is not None:
-        try:
-            run.finish()
-            timing_trace("wandb run finished before baseline load")
-        except Exception:
-            pass
     del model
     gc.collect()
     if torch.cuda.is_available():
@@ -500,7 +504,8 @@ def main():
     speedup_wall = (base_time / dvi_time) if dvi_time > 0 else float("inf")
     print(f"[time] Walltime speedup (baseline/DVI SPEC): {speedup_wall:.3f}×", flush=True)
 
-    wandb_log({
+    comp_train, _ = theoretical_compression(acc1, args.early_layer, total_layers)
+    final_metrics = {
         "speed/walltime_dvi_spec_s": dvi_time,
         "speed/walltime_base_s": base_time,
         "speed/speedup_walltime_spec": speedup_wall,
@@ -511,10 +516,10 @@ def main():
         "spec/deep_tokens": spec_metrics.get("spec/deep_tokens", 0.0),
         "spec/deep_to_commit": spec_metrics.get("spec/deep_to_commit", 0.0),
         "comp/runtime_est": comp_rt,
-        "comp/theoretical_from_train": theoretical_compression(
-            spec_metrics.get("spec/accept_rate", 0.0), args.early_layer, total_layers
-        )[0],
-    }, step=args.steps)
+        "comp/theoretical_from_train": comp_train,
+    }
+    wandb_log(final_metrics, step=args.steps)
+    wandb_summary_update(final_metrics)
 
     deep_kv_purge(baseline)
     del baseline
@@ -522,6 +527,7 @@ def main():
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     free_cuda("(timing done)")
+    finish_wandb()
 
 
 if __name__ == "__main__":
