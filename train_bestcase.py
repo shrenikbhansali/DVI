@@ -438,6 +438,7 @@ def main():
         temperature=max(1e-6, args.temperature),
         early_layer_override=args.early_layer,
         quiet=True,
+        microbatch_base=1
     )
     dvi_time, spec_metrics = dvi_res
     print(f"[time] DVI(SPEC) generate: {dvi_time:.3f}s", flush=True)
