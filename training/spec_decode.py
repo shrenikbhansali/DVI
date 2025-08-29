@@ -44,7 +44,10 @@ class SpecMetrics:
             "spec/comp_rt_est": float(self.comp_ratio_runtime_est),
         }
 
-@torch.inference_mode()
+# Generation only requires gradients disabled; using ``torch.no_grad`` avoids
+# producing inference tensors that could accidentally leak into later
+# optimisation steps.
+@torch.no_grad()
 def generate_with_dvi_spec(
     model,
     tok,

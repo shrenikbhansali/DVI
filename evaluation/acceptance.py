@@ -25,7 +25,11 @@ def _top1(logits: torch.Tensor) -> int:
     return int(torch.argmax(logits, dim=-1, keepdim=True)[0, 0].item())
 
 
-@torch.inference_mode()
+# ``torch.inference_mode`` creates tensors that carry an "inference" flag and
+# cannot participate in autograd.  Evaluation only needs gradients disabled, so
+# we use ``torch.no_grad`` here to avoid producing inference tensors that could
+# leak into later training phases.
+@torch.no_grad()
 def eval_acceptance(spec: EarlyExitLlamaForCausalLM, tok, prompts: List[str],
                    rollout_len: int, steps_per_prompt: int = 1,
                    dump_debug: bool = False, dump_path: Optional[str] = None, topk: int = 5,
