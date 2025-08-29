@@ -65,7 +65,6 @@ def train_bestcase_kl_rl(model, tok, prompts_train: List[str], prompts_eval: Lis
     metrics_path = os.path.join(outdir, "logs", "train_metrics.jsonl")
     samples_path = os.path.join(outdir, "logs", "rollout_samples.jsonl")
 
-    opt = build_optimizer(model, lr_exit=lr_exit, lr_lora=lr_lora, wd_exit=1e-2, wd_lora=0.0)
     buf = ReplayBuffer(capacity=max(4096, batch_size * rollout_len * 8), device=torch.device("cpu"))
 
     model.eval()
@@ -95,6 +94,9 @@ def train_bestcase_kl_rl(model, tok, prompts_train: List[str], prompts_eval: Lis
     for w in range(1, eval_k_max + 1):
         log_dict[f"eval/pre/ctar{w}"] = ctar0.get(w, 0)
     wandb_log(log_dict, step=0)
+
+    # Build optimizer after any dtype casting that may occur during evaluation.
+    opt = build_optimizer(model, lr_exit=lr_exit, lr_lora=lr_lora, wd_exit=1e-2, wd_lora=0.0)
 
     ptr = 0
     tokens_total = 0

@@ -13,7 +13,7 @@ from training.kv import (
     clear_all_kv,
 )
 from training.utils import ctar, free_cuda
-from training.modeling import exit_logits_from_hidden_k, cast_exit_to_base_dtype, adapter_guard
+from training.modeling import exit_logits_from_hidden_k, adapter_guard
 
 __all__ = ["eval_acceptance"]
 
@@ -36,7 +36,6 @@ def eval_acceptance(spec: EarlyExitLlamaForCausalLM, tok, prompts: List[str],
                    quiet: bool = False, k_max: int = 4) -> Tuple[float, Dict[int, float]]:
     global _KV_WARN_COUNT
     spec.eval()
-    cast_exit_to_base_dtype(spec)
     dev = next(spec.parameters()).device
     accepts_seq: List[List[int]] = []
     dbg_out: List[Dict] = []

@@ -7,7 +7,6 @@ from .modeling import (
     run_shallow_until_k,
     run_deep_from_k,
     exit_logits_from_hidden_k,
-    cast_exit_to_base_dtype,
     adapter_guard,
 )
 from .sampling import sample_from_logits
@@ -65,7 +64,6 @@ def generate_with_dvi_spec(
     """Self-speculative decoding using vectorised block verification."""
 
     model.eval()
-    cast_exit_to_base_dtype(model)
     device = device or next(model.parameters()).device
     k = early_layer if early_layer is not None else getattr(model, "early_layer", None)
     assert isinstance(k, int) and k > 0

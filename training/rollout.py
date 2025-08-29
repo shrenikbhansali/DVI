@@ -10,7 +10,6 @@ from training.modeling import (
     run_shallow_until_k,
     run_deep_from_k,
     exit_logits_from_hidden_k,
-    cast_exit_to_base_dtype,
     adapter_guard,
 )
 from training.sampling import sample_from_logits
@@ -58,7 +57,6 @@ def rollout_collect_k_spec(
     """
 
     spec.eval()
-    cast_exit_to_base_dtype(spec)
     device = next(spec.parameters()).device
     enc = tok(prompt, return_tensors="pt")
     input_ids = enc["input_ids"].to(device)
