@@ -39,6 +39,7 @@ def one_mixed_step(model, opt, batch,
     hidden = batch["hidden"].to(dev)
     vlogits = batch["vlogits"].to(dev)
     tokens = batch["token"].to(dev).view(-1)
+    rewards = batch.get("reward", torch.ones_like(tokens, dtype=torch.float32, device=dev)).to(dev).view(-1)
 
     h = hidden.float()
     if hasattr(model, "exit_pre_norm") and model.exit_pre_norm is not None:
@@ -51,7 +52,7 @@ def one_mixed_step(model, opt, batch,
     sp = slogp.exp()
 
     pi_v = sp.gather(1, tokens.view(-1, 1)).squeeze(1)
-    loss_pg = -torch.log(pi_v.clamp_min(1e-8)).mean()
+    loss_pg = -(rewards * torch.log(pi_v.clamp_min(1e-8))).mean()
 
     tlogits = vlogits.float() / float(temperature)
     tlogp = F.log_softmax(tlogits, dim=-1)

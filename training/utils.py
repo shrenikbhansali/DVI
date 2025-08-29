@@ -354,7 +354,7 @@ def measure_generate_walltime(
         agg_accepted = 0
 
         s = 0
-        mb = 1
+        mb = max(1, int(microbatch_spec if use_dvi_spec else microbatch_base))
 
         while s < B:
             e = min(s + mb, B)
