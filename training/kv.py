@@ -9,8 +9,6 @@ from typing import List, Tuple, Optional
 import torch
 
 from kangaroo.earlyexit import EarlyExitLlamaForCausalLM
-# Use modeling helpers to avoid KV mutation during probes
-from training.modeling import run_shallow_until_k
 
 __all__ = [
     "_kv_snapshot",
@@ -73,6 +71,7 @@ def estimate_kv_cache(spec: EarlyExitLlamaForCausalLM) -> Tuple[int, int]:
     return int(total_bytes), int(est_seq_len)
 
 
+
 def clear_all_kv(spec, verbose: bool = False, tag: str = "") -> None:
     touched = []
     for obj in (spec, getattr(spec, "model", None)):
@@ -92,37 +91,44 @@ def clear_all_kv(spec, verbose: bool = False, tag: str = "") -> None:
 
 @torch.inference_mode()
 def prime_kv_full(spec: EarlyExitLlamaForCausalLM, input_ids: torch.Tensor) -> None:
-    """Prime both shallow and deep KVs on a full prompt."""
     clear_all_kv(spec)
     h = spec.forward_draft_or_large_model(in_tokens_small=input_ids)
-    _, _ = spec.forward_draft_or_large_model(in_features_large=h)
+    _ , _ = spec.forward_draft_or_large_model(in_features_large=h)
 
 
 @torch.inference_mode()
 def advance_kv_with_committed(spec: EarlyExitLlamaForCausalLM, token_ids: torch.Tensor) -> None:
-    """Advance both KVs by exactly one position using the committed verifier token."""
     h = spec.forward_draft_or_large_model(in_tokens_small=token_ids)
-    _, _ = spec.forward_draft_or_large_model(in_features_large=h)
+    _ , _ = spec.forward_draft_or_large_model(in_features_large=h)
 
 
 @torch.inference_mode()
 def drafter_hidden_no_cache(spec: EarlyExitLlamaForCausalLM, ids_last: torch.Tensor) -> torch.Tensor:
-    """
-    Obtain the drafter hidden for a single step WITHOUT mutating any KV.
+    slots = _kv_snapshot(spec)
+    try:
+        out = spec.forward_draft_or_large_model(in_tokens_small=ids_last, use_cache=False)
+        return out
+    except TypeError:
+        pass
+    except Exception:
+        pass
+    finally:
+        _kv_restore(slots)
 
-    We force the manual modeling path by passing a non-None (empty) PKV and
-    disabling cache; this guarantees no writes to any `past_key_values`.
-    """
-    # Ensure shape [B, 1]
-    if ids_last.ndim == 1:
-        ids_last = ids_last.unsqueeze(1)
-
-    # Skip fast-path completely (past_key_values != None) and disable cache
-    hidden_1, _ = run_shallow_until_k(
-        spec,
-        input_ids=ids_last,
-        past_key_values=(),       # non-None → bypass early fast-path
-        attention_mask=None,
-        use_cache=False,          # do not record any KV
-    )
-    return hidden_1
+    toggled = []
+    def _toggle(obj):
+        if obj is not None and hasattr(obj, "config") and hasattr(obj.config, "use_cache"):
+            toggled.append((obj, obj.config.use_cache))
+            obj.config.use_cache = False
+    _toggle(spec)
+    _toggle(getattr(spec, "model", None))
+    try:
+        out = spec.forward_draft_or_large_model(in_tokens_small=ids_last)
+    finally:
+        for obj, prev in toggled:
+            try:
+                obj.config.use_cache = prev
+            except Exception:
+                pass
+        _kv_restore(slots)
+    return out
