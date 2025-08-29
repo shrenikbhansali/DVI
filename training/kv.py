@@ -9,6 +9,7 @@ from typing import List, Tuple, Optional
 import torch
 
 from kangaroo.earlyexit import EarlyExitLlamaForCausalLM
+from training.modeling import adapter_guard
 
 __all__ = [
     "_kv_snapshot",
@@ -92,21 +93,26 @@ def clear_all_kv(spec, verbose: bool = False, tag: str = "") -> None:
 @torch.inference_mode()
 def prime_kv_full(spec: EarlyExitLlamaForCausalLM, input_ids: torch.Tensor) -> None:
     clear_all_kv(spec)
-    h = spec.forward_draft_or_large_model(in_tokens_small=input_ids)
-    _ , _ = spec.forward_draft_or_large_model(in_features_large=h)
+    with adapter_guard(spec, "draft"):
+        h = spec.forward_draft_or_large_model(in_tokens_small=input_ids)
+    with adapter_guard(spec, "verify"):
+        _ , _ = spec.forward_draft_or_large_model(in_features_large=h)
 
 
 @torch.inference_mode()
 def advance_kv_with_committed(spec: EarlyExitLlamaForCausalLM, token_ids: torch.Tensor) -> None:
-    h = spec.forward_draft_or_large_model(in_tokens_small=token_ids)
-    _ , _ = spec.forward_draft_or_large_model(in_features_large=h)
+    with adapter_guard(spec, "draft"):
+        h = spec.forward_draft_or_large_model(in_tokens_small=token_ids)
+    with adapter_guard(spec, "verify"):
+        _ , _ = spec.forward_draft_or_large_model(in_features_large=h)
 
 
 @torch.inference_mode()
 def drafter_hidden_no_cache(spec: EarlyExitLlamaForCausalLM, ids_last: torch.Tensor) -> torch.Tensor:
     slots = _kv_snapshot(spec)
     try:
-        out = spec.forward_draft_or_large_model(in_tokens_small=ids_last, use_cache=False)
+        with adapter_guard(spec, "draft"):
+            out = spec.forward_draft_or_large_model(in_tokens_small=ids_last, use_cache=False)
         return out
     except TypeError:
         pass
@@ -123,7 +129,8 @@ def drafter_hidden_no_cache(spec: EarlyExitLlamaForCausalLM, ids_last: torch.Ten
     _toggle(spec)
     _toggle(getattr(spec, "model", None))
     try:
-        out = spec.forward_draft_or_large_model(in_tokens_small=ids_last)
+        with adapter_guard(spec, "draft"):
+            out = spec.forward_draft_or_large_model(in_tokens_small=ids_last)
     finally:
         for obj, prev in toggled:
             try:

@@ -1,6 +1,7 @@
 """Model assembly helpers for DVI training."""
 import copy
 import os
+import contextlib
 from typing import Optional, Tuple
 
 import torch
@@ -17,6 +18,7 @@ __all__ = [
     "run_deep_from_k",
     "exit_logits_from_hidden_k",
     "cast_exit_to_base_dtype",
+    "adapter_guard",
 ]
 
 # ---------------------------------------------------------------------------
@@ -206,6 +208,29 @@ def cast_exit_to_base_dtype(model) -> None:
         model._exit_cast_dtype = base_dtype
     except Exception:
         pass
+
+
+@contextlib.contextmanager
+def adapter_guard(model, name: str):
+    """Temporarily switch LoRA adapter, restoring previous on exit."""
+    prev = getattr(model, "_dvi_active_adapter", None)
+    try:
+        _ensure_active_adapter(model, name)
+        yield
+    finally:
+        cur = getattr(model, "_dvi_active_adapter", None)
+        if prev != cur:
+            if prev is not None:
+                set_active_adapter(model, prev)
+            else:
+                try:
+                    set_active_adapter(model, None)
+                except Exception:
+                    pass
+            try:
+                model._dvi_active_adapter = prev
+            except Exception:
+                pass
 
 
 def _ensure_active_adapter(model, name: str) -> None:

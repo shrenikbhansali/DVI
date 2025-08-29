@@ -58,6 +58,9 @@ def train_bestcase_kl_rl(model, tok, prompts_train: List[str], prompts_eval: Lis
                         train_k_spec: int = 1,
                         spec_train_greedy: bool = False,
                         spec_train_temp: float = 1.0,
+                        ce_mask_by_reward: bool = False,
+                        kl_warmup_scale: float = 1.0,
+                        eval_k_max: int = None,
                         ):
     metrics_path = os.path.join(outdir, "logs", "train_metrics.jsonl")
     samples_path = os.path.join(outdir, "logs", "rollout_samples.jsonl")
@@ -76,16 +79,22 @@ def train_bestcase_kl_rl(model, tok, prompts_train: List[str], prompts_eval: Lis
     total_layers = count_transformer_layers(model)
     print(f"[info] total decoder layers detected: {total_layers}", flush=True)
 
+    eval_k_max = eval_k_max or train_k_spec
+    if eval_k_max > train_k_spec:
+        print(f"[warn] eval_k_max {eval_k_max} > train_k_spec {train_k_spec}", flush=True)
+
     print("\n[e2e] measuring acceptance (pre-train)…", flush=True)
     free_cuda("(pre-eval)")
     acc0, ctar0 = eval_acceptance(
         model, tok, prompts_eval, rollout_len, steps_per_prompt=1,
-        dump_debug=True, dump_path=samples_path, topk=debug_topk, quiet=quiet_eval
+        dump_debug=True, dump_path=samples_path, topk=debug_topk, quiet=quiet_eval, k_max=eval_k_max
     )
-    print(f"[e2e] PRE  | acc={acc0:.3f} | CTAR1={ctar0[1]:.3f} CTAR2={ctar0[2]:.3f} CTAR3={ctar0[3]:.3f} CTAR4={ctar0[4]:.3f}", flush=True)
-    wandb_log({"eval/pre/acc": acc0,
-               "eval/pre/ctar1": ctar0[1], "eval/pre/ctar2": ctar0[2],
-               "eval/pre/ctar3": ctar0[3], "eval/pre/ctar4": ctar0[4]}, step=0)
+    ctar_msg = " ".join([f"CTAR{w}={ctar0.get(w,0):.3f}" for w in range(1, eval_k_max + 1)])
+    print(f"[e2e] PRE  | acc={acc0:.3f} | {ctar_msg}", flush=True)
+    log_dict = {"eval/pre/acc": acc0}
+    for w in range(1, eval_k_max + 1):
+        log_dict[f"eval/pre/ctar{w}"] = ctar0.get(w, 0)
+    wandb_log(log_dict, step=0)
 
     ptr = 0
     tokens_total = 0
@@ -146,6 +155,7 @@ def train_bestcase_kl_rl(model, tok, prompts_train: List[str], prompts_eval: Lis
             continue
 
         lam_pg, lam_kl = mix_schedule(g, warmup_kl, ramp_steps, kl_min, pg_max)
+        lam_kl *= kl_warmup_scale
         phase = phase_of_step(g, warmup_kl, ramp_steps)
         accepted_only = accepted_only_flag and (phase != "WARMUP(KL)") and (lam_pg > 0.0)
         try:
@@ -166,7 +176,8 @@ def train_bestcase_kl_rl(model, tok, prompts_train: List[str], prompts_eval: Lis
             temperature=temperature, clip=1.0,
             ce_weight=ce_weight, lam_pg=lam_pg, lam_kl=lam_kl,
             ent_weight=ent_weight,
-            init_fro=init_fro, max_fro=max_fro, max_fro_ratio=max_fro_ratio
+            init_fro=init_fro, max_fro=max_fro, max_fro_ratio=max_fro_ratio,
+            ce_mask_by_reward=ce_mask_by_reward,
         )
         _cuda_sync()
         t_trn_e = time.perf_counter()
@@ -259,13 +270,14 @@ def train_bestcase_kl_rl(model, tok, prompts_train: List[str], prompts_eval: Lis
             print("[e2e] measuring acceptance (mid-train)…", flush=True)
             acc_mid, ctar_mid = eval_acceptance(
                 model, tok, prompts_eval, rollout_len, steps_per_prompt=1,
-                dump_debug=True, dump_path=samples_path, topk=debug_topk, quiet=quiet_eval
+                dump_debug=True, dump_path=samples_path, topk=debug_topk, quiet=quiet_eval, k_max=eval_k_max
             )
-            print(f"[e2e] MID  | step {g+1:04d} | acc={acc_mid:.3f} | "
-                  f"CTAR1={ctar_mid[1]:.3f} CTAR2={ctar_mid[2]:.3f} CTAR3={ctar_mid[3]:.3f} CTAR4={ctar_mid[4]:.3f}", flush=True)
-            wandb_log({"eval/mid/acc": acc_mid,
-                       "eval/mid/ctar1": ctar_mid[1], "eval/mid/ctar2": ctar_mid[2],
-                       "eval/mid/ctar3": ctar_mid[3], "eval/mid/ctar4": ctar_mid[4]}, step=g + 1)
+            ctar_msg = " ".join([f"CTAR{w}={ctar_mid.get(w,0):.3f}" for w in range(1, eval_k_max + 1)])
+            print(f"[e2e] MID  | step {g+1:04d} | acc={acc_mid:.3f} | {ctar_msg}", flush=True)
+            log_mid = {"eval/mid/acc": acc_mid}
+            for w in range(1, eval_k_max + 1):
+                log_mid[f"eval/mid/ctar{w}"] = ctar_mid.get(w, 0)
+            wandb_log(log_mid, step=g + 1)
 
     del opt
     del buf
@@ -274,14 +286,15 @@ def train_bestcase_kl_rl(model, tok, prompts_train: List[str], prompts_eval: Lis
     print("\n[e2e] measuring acceptance (post-train)…", flush=True)
     acc1, ctar1 = eval_acceptance(
         model, tok, prompts_eval, rollout_len, steps_per_prompt=1,
-        dump_debug=True, dump_path=samples_path, topk=debug_topk, quiet=quiet_eval
+        dump_debug=True, dump_path=samples_path, topk=debug_topk, quiet=quiet_eval, k_max=eval_k_max
     )
-    print(f"[e2e] POST | acc={acc1:.3f} | Δ={acc1-acc0:+.3f} | "
-          f"CTAR1={ctar1[1]:.3f} CTAR2={ctar1[2]:.3f} CTAR3={ctar1[3]:.3f} CTAR4={ctar1[4]:.3f}", flush=True)
-    wandb_log({"eval/post/acc": acc1,
-               "eval/post/ctar1": ctar1[1], "eval/post/ctar2": ctar1[2],
-               "eval/post/ctar3": ctar1[3], "eval/post/ctar4": ctar1[4],
-               "eval/delta_acc": (acc1 - acc0)}, step=steps)
+    ctar_msg = " ".join([f"CTAR{w}={ctar1.get(w,0):.3f}" for w in range(1, eval_k_max + 1)])
+    print(f"[e2e] POST | acc={acc1:.3f} | Δ={acc1-acc0:+.3f} | {ctar_msg}", flush=True)
+    log_post = {"eval/post/acc": acc1,
+                "eval/delta_acc": (acc1 - acc0)}
+    for w in range(1, eval_k_max + 1):
+        log_post[f"eval/post/ctar{w}"] = ctar1.get(w, 0)
+    wandb_log(log_post, step=steps)
 
     deep_kv_purge(model)
     gc.collect()
@@ -303,12 +316,14 @@ def main():
     ap.add_argument("--lora-s-rank", type=int, default=8)
     ap.add_argument("--lora-v-rank", type=int, default=0)
     ap.add_argument("--temperature", type=float, default=1.0)
-    ap.add_argument("--ce-weight", type=float, default=0.20)
+    ap.add_argument("--ce-weight", type=float, default=0.10)
+    ap.add_argument("--ce-mask-by-reward", action="store_true")
     ap.add_argument("--ent-weight", type=float, default=0.00)
     ap.add_argument("--warmup-kl", type=int, default=40)
     ap.add_argument("--ramp-steps", type=int, default=80)
     ap.add_argument("--kl-min", type=float, default=0.05)
     ap.add_argument("--pg-max", type=float, default=1.0)
+    ap.add_argument("--kl-warmup-scale", type=float, default=1.0)
     ap.add_argument("--outdir", type=str, default="minbench_out")
     ap.add_argument("--debug-dump-every", type=int, default=25)
     ap.add_argument("--debug-topk", type=int, default=5)
@@ -330,12 +345,14 @@ def main():
     ap.add_argument("--train-k-spec", type=int, default=1, help="k tokens per speculative draft during training")
     ap.add_argument("--spec-train-greedy", action="store_true", help="use greedy drafting during spec training")
     ap.add_argument("--spec-train-temp", type=float, default=1.0, help="temperature for spec training drafting")
+    ap.add_argument("--eval-k-max", type=int, default=None, help="max CTAR depth to report")
     ap.add_argument("--no-wandb", action="store_true")
     ap.add_argument("--wandb-entity", type=str, default=WANDB_DEFAULT_ENTITY)
     ap.add_argument("--wandb-project", type=str, default=WANDB_DEFAULT_PROJECT)
     ap.add_argument("--run-name", type=str, default=None)
     ap.add_argument("--quiet-eval", action="store_true")
     args = ap.parse_args()
+    args.eval_k_max = args.eval_k_max or args.train_k_spec
 
     ensure_dirs(args.outdir)
     env_dump(args.outdir)
@@ -386,6 +403,9 @@ def main():
         train_k_spec=args.train_k_spec,
         spec_train_greedy=args.spec_train_greedy,
         spec_train_temp=args.spec_train_temp,
+        ce_mask_by_reward=args.ce_mask_by_reward,
+        kl_warmup_scale=args.kl_warmup_scale,
+        eval_k_max=args.eval_k_max,
     )
     deep_kv_purge(model)
     gc.collect()
@@ -482,7 +502,10 @@ def main():
         "speed/speedup_walltime_spec": speedup_wall,
         "spec/proposed": spec_metrics.get("spec/proposed", 0.0),
         "spec/accepted": spec_metrics.get("spec/accepted", 0.0),
+        "spec/committed": spec_metrics.get("spec/committed", 0.0),
         "spec/accept_rate": spec_metrics.get("spec/accept_rate", 0.0),
+        "spec/deep_tokens": spec_metrics.get("spec/deep_tokens", 0.0),
+        "spec/deep_to_commit": spec_metrics.get("spec/deep_to_commit", 0.0),
         "comp/runtime_est": comp_rt,
         "comp/theoretical_from_train": theoretical_compression(
             spec_metrics.get("spec/accept_rate", 0.0), args.early_layer, total_layers
