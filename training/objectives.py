@@ -20,7 +20,7 @@ def _maybe_clamp_exit_head(model, init_fro: float, max_fro: float, max_fro_ratio
         if max_fro_ratio and max_fro_ratio > 0:
             bound_rel = init_fro * max_fro_ratio
             bound = min(bound, bound_rel) if bound is not None else bound_rel
-        if bound is not None and matzh.isfinite(n) and n > bound:
+        if bound is not None and math.isfinite(n) and n > bound:
             W.mul_(bound / n)
 
 
