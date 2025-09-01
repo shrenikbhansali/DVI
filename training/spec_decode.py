@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
+import os
 import torch
 
 from .modeling import (
@@ -11,8 +12,8 @@ from .modeling import (
 )
 from .sampling import sample_from_logits
 from .utils import theoretical_compression, count_transformer_layers
-# timing_trace is kept for compatibility; may be used externally
-from .mem import timing_trace
+from .mem import timing_trace  # kept for compatibility
+from .kv import clear_all_kv, prime_kv_full, advance_kv_with_committed
 
 
 @dataclass
@@ -42,6 +43,7 @@ class SpecMetrics:
             "spec/deep_to_commit": float(self.deep_to_commit),
             "spec/comp_rt_est": float(self.comp_ratio_runtime_est),
         }
+
 
 # Generation only requires gradients disabled; using ``torch.no_grad`` avoids
 # producing inference tensors that could accidentally leak into later
@@ -94,7 +96,7 @@ def generate_with_dvi_spec(
 
     generated: List[List[int]] = [[] for _ in range(B)]
 
-    # Prime KV caches on the prompt
+    # Prime KV caches on the prompt (strict adapter separation)
     with adapter_guard(model, "draft"):
         h_k_prompt, shallow_past = run_shallow_until_k(
             model,
@@ -113,6 +115,11 @@ def generate_with_dvi_spec(
 
     metrics = SpecMetrics()
     total_new = 0
+
+    # align debug throttling
+    if not hasattr(generate_with_dvi_spec, "_align_prints"):
+        generate_with_dvi_spec._align_prints = 0
+    max_align_prints = int(os.getenv("DVI_ALIGN_PRINTS", "3"))
 
     while total_new < max_new_tokens:
         draft_tokens: List[torch.Tensor] = []
@@ -138,8 +145,8 @@ def generate_with_dvi_spec(
             shallow_snapshots.append(tmp_shallow)
             prev = nxt
 
-        prop_seq = torch.stack(draft_tokens, dim=1)  # [B,k]
-        hidden_seq = torch.stack(draft_hidden, dim=1)  # [B,k,H]
+        prop_seq = torch.stack(draft_tokens, dim=1)   # [B,k]
+        hidden_seq = torch.stack(draft_hidden, dim=1) # [B,k,H]
         metrics.proposed += int(B * draft_k)
 
         # ---- verify entire block ----
@@ -153,16 +160,10 @@ def generate_with_dvi_spec(
         metrics.steps += 1
         metrics.deep_tokens += int(B * draft_k)
         deep_calls = 1
-        import os
 
-        # --- Misalignment debug (prints to stdout) ---
+        # --- Misalignment debug (prints to stdout if requested) ---
         if os.getenv("DVI_ALIGN_DEBUG", ""):
-            # Argmax predictions from the deep verifier for the k drafted positions
             _va = deep_logits.argmax(dim=-1)  # [B, k]
-
-            # Sanity matches:
-            #   m00: deep[:,0] vs draft[:,0]  <-- should roughly match CTAR1 if aligned
-            #   m10: deep[:,1] vs draft[:,0]  <-- if this ≈CTAR1 instead, you're +1 shifted
             m00 = (_va[:, 0] == prop_seq[:, 0]).float().mean().item()
             m10 = float("nan")
             m11 = float("nan")
@@ -170,21 +171,60 @@ def generate_with_dvi_spec(
                 m10 = (_va[:, 1] == prop_seq[:, 0]).float().mean().item()
                 m11 = (_va[:, 1] == prop_seq[:, 1]).float().mean().item()
 
-            # Print only a few times to avoid spam
-            if not hasattr(generate_with_dvi_spec, "_align_prints"):
-                generate_with_dvi_spec._align_prints = 0
-            if generate_with_dvi_spec._align_prints < 3:
+            if generate_with_dvi_spec._align_prints < max_align_prints:
                 print(
                     f"[align/spec] k={draft_k} match(0↔0)={m00:.3f} "
                     f"match(1↔0)={m10:.3f} match(1↔1)={m11:.3f}",
                     flush=True,
                 )
                 generate_with_dvi_spec._align_prints += 1
+
+            # Optional: deeper "gold" check for B==1
+            if os.getenv("DVI_ALIGN_GOLD", "") and B == 1 and generate_with_dvi_spec._align_prints <= max_align_prints:
+                try:
+                    with adapter_guard(model, "verify"):
+                        # Build current prefix for sample 0
+                        prefix_ids = input_ids[0].detach().tolist() + generated[0]
+                        prefix = torch.tensor([prefix_ids], device=device, dtype=input_ids.dtype)
+                        clear_all_kv(model)
+                        if prefix.size(1) >= 1:
+                            prime_kv_full(model, prefix[:, :-1])
+                            last = prefix[:, -1:]
+                        else:
+                            prime_kv_full(model, prefix)
+                            last = prefix[:, -1:]
+
+                        gold = []
+                        steps_to_check = min(2, prop_seq.size(1))
+                        for _ in range(steps_to_check):
+                            g_logits = model.verifier_logits_for_next(last)
+                            g_top1 = int(g_logits.argmax(dim=-1)[0, 0].item())
+                            gold.append(g_top1)
+                            nxt = torch.tensor([[g_top1]], device=last.device, dtype=last.dtype)
+                            advance_kv_with_committed(model, nxt)
+                            last = nxt
+
+                    v_arg = deep_logits.argmax(dim=-1)  # [1,k]
+                    d0 = int(prop_seq[0, 0].item())
+                    d1 = int(prop_seq[0, 1].item()) if prop_seq.size(1) > 1 else -1
+                    v0 = int(v_arg[0, 0].item())
+                    v1 = int(v_arg[0, 1].item()) if v_arg.size(1) > 1 else -1
+                    g0 = gold[0] if len(gold) > 0 else -1
+                    g1 = gold[1] if len(gold) > 1 else -1
+                    print(
+                        f"[align/spec] gold k={draft_k} "
+                        f"deep≈gold: {(v0==g0):d}/{(v1==g1):d} | "
+                        f"draft={d0},{d1} deep={v0},{v1} gold={g0},{g1}",
+                        flush=True,
+                    )
+                except Exception as e:
+                    print(f"[align/spec] gold-check error: {e}", flush=True)
         # --- end misalignment debug ---
 
         verify_argmax = deep_logits.argmax(dim=-1)  # [B,k]
         matches = verify_argmax.eq(prop_seq)
 
+        # compute accepted prefix length across batch (min)
         all_matched = matches.all(dim=1)
         first_mismatch = (~matches).float().argmax(dim=1)
         prefix_lens = torch.where(all_matched, torch.full_like(first_mismatch, draft_k), first_mismatch)
@@ -218,7 +258,7 @@ def generate_with_dvi_spec(
         if total_new >= max_new_tokens:
             break
 
-        # ---- optional single-token fix ----
+        # ---- optional single-token fix (commit one deep token when mismatch) ----
         if accept_len < draft_k:
             mismatch_tok = verify_argmax[:, accept_len]
             with adapter_guard(model, "draft"):

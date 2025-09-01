@@ -364,8 +364,33 @@ def main():
     ap.add_argument("--run-name", type=str, default=None)
     ap.add_argument("--quiet-eval", action="store_true")
     args = ap.parse_args()
-    args.eval_k_max = args.eval_k_max or args.train_k_spec
 
+    # --- Initialize W&B and merge sweep overrides back into args ---
+    run = init_wandb(args)
+    try:
+        import wandb  # local import to avoid hard dependency if --no-wandb
+        if (not getattr(args, "no_wandb", False)) and wandb.run is not None:
+            # Merge config -> args so the rest of the script uses sweep values
+            for k, v in dict(wandb.config).items():
+                if hasattr(args, k):
+                    setattr(args, k, v)
+            # (Re)compute any dependent args AFTER merge
+            args.eval_k_max = args.eval_k_max or args.train_k_spec
+            # Log resolved args once for convenience
+            arg_log = {}
+            for k, v in vars(args).items():
+                if isinstance(v, (int, float, str, bool)) or v is None:
+                    arg_log[f"args/{k}"] = v
+            wandb_log(arg_log, step=0)
+    except Exception:
+        # If wandb not available or disabled, fall back silently
+        args.eval_k_max = args.eval_k_max or args.train_k_spec
+
+    # Make sure eval_k_max is set even if W&B is disabled
+    if getattr(args, "eval_k_max", None) is None:
+        args.eval_k_max = args.train_k_spec
+
+    # Now that sweep overrides are applied, set up run directories, env snapshot, and seed
     ensure_dirs(args.outdir)
     env_dump(args.outdir)
     set_seed(args.seed)
@@ -394,7 +419,6 @@ def main():
         diff_nrm = (model.lm_head.weight.detach().float() - model.exit_proj.weight.detach().float()).norm().item()
     print("[sanity] head parity:", {"||lm||": lm_nrm, "||exit||": exit_nrm, "||lm-exit||": diff_nrm}, flush=True)
 
-    run = init_wandb(args)
     wandb_log({"sanity/head_parity_lm": lm_nrm,
                "sanity/head_parity_exit": exit_nrm,
                "sanity/head_parity_diff": diff_nrm}, step=0)

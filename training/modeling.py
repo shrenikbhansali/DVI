@@ -234,14 +234,32 @@ def adapter_guard(model, name: str):
 
 
 def _ensure_active_adapter(model, name: str) -> None:
-    """Switch LoRA adapter only when necessary to avoid redundant work."""
+    """Switch LoRA adapter only when necessary; try aliases."""
     cur = getattr(model, "_dvi_active_adapter", None)
-    if cur != name:
-        set_active_adapter(model, name)
+    if cur == name:
+        return
+    tried = [name]
+    if not name.startswith("lora_"):
+        tried.append(f"lora_{name}")
+    if name.startswith("lora_"):
+        tried.append(name.replace("lora_", ""))
+    last_err = None
+    for alias in tried:
         try:
-            model._dvi_active_adapter = name
-        except Exception:
-            pass
+            set_active_adapter(model, alias)
+            model._dvi_active_adapter = alias
+            if getattr(model, "_dvi_adapter_debug_printed", None) != alias:
+                print(f"[adapter] active={alias}", flush=True)
+                model._dvi_adapter_debug_printed = alias
+            return
+        except Exception as e:
+            last_err = e
+            continue
+    # If we couldn't switch, mark None (base weights)
+    model._dvi_active_adapter = None
+    if getattr(model, "_dvi_adapter_debug_printed", None) != "NONE":
+        print(f"[adapter] WARNING: could not activate adapter '{name}' (tried {tried}); using base weights", flush=True)
+        model._dvi_adapter_debug_printed = "NONE"
 
 
 def run_shallow_until_k(
@@ -325,101 +343,117 @@ def run_shallow_until_k(
     return hidden_states, tuple(new_past) if use_cache else None
 
 
+def run_shallow_until_k(
+    model,
+    *,
+    input_ids: torch.Tensor,                    # [B,T]
+    past_key_values: Optional[Tuple] = None,
+    attention_mask: Optional[torch.Tensor] = None,
+    use_cache: bool = True,
+):
+    """
+    Manual shallow pass over layers [:k], sequential in T.
+    No early/fast-path. Produces hidden at split and shallow KV.
+    """
+    _ensure_active_adapter(model, "draft")
+    k = _resolve_early_layer(model)
+    lm = _llama_model(model)
+
+    B, T = input_ids.shape
+    device = input_ids.device
+
+    # Embed all tokens at once (safe), but we still step KV/pos one by one
+    hidden_all = lm.embed_tokens(input_ids)
+
+    if past_key_values is None:
+        past_key_values = tuple([None] * k)
+
+    new_past = []
+    # We walk T positions; for each layer 0..k-1 we feed a length-1 slice
+    # so rotary/position and KV advance identically to generation.
+    # We carry per-layer PKV across the time loop.
+    layer_pkv = list(past_key_values)
+
+    for layer_idx in range(k):
+        block = lm.layers[layer_idx]
+        pkv_i = layer_pkv[layer_idx]
+        cur_pkv = pkv_i
+
+        outputs_t = []
+        for t in range(T):
+            hs = hidden_all[:, t:t+1, :]  # [B,1,H]
+            # compute past_len from current pkv of this layer
+            past_len = 0
+            if cur_pkv is not None:
+                past_len = cur_pkv[0].shape[2]
+            position_ids = torch.full((B, 1), past_len, device=device, dtype=torch.long)
+
+            if past_len > 0:
+                attn_mask_t = None
+                timing_trace("run_shallow_until_k(seq): cached mask skip")
+            else:
+                attn_1 = torch.ones((B, 1), dtype=torch.bool, device=device)
+                attn_mask_t = lm._prepare_decoder_attention_mask(attn_1, (B, 1), hs, 0)
+
+            out = block(
+                hs,
+                attention_mask=attn_mask_t,
+                position_ids=position_ids,
+                past_key_value=cur_pkv,
+                output_attentions=False,
+                use_cache=use_cache,
+            )
+            outputs_t.append(out[0])      # [B,1,H]
+            if use_cache:
+                cur_pkv = out[1]          # advance PKV for this layer
+
+        # stack back time dimension for next layer input
+        hidden_all = torch.cat(outputs_t, dim=1)     # [B,T,H]
+        if use_cache:
+            layer_pkv[layer_idx] = cur_pkv
+
+    if use_cache:
+        new_past = tuple(layer_pkv)
+    else:
+        new_past = None
+    return hidden_all, new_past
+
+
 def run_deep_from_k(
     model,
     *,
-    hidden_k: torch.Tensor,                 # [B, T, H] where T can be k (block size) or 1
+    hidden_k: torch.Tensor,                 # [B, T, H]
     past_key_values: Optional[Tuple] = None,
     use_cache: bool = True,
 ):
     """
-    Advance the deep path (layers [k:]) given hidden states at the split.
-    IMPORTANT: When T>1 we advance **sequentially** one token at a time so that
-    KV cache and positions move forward correctly and logits align with the
-    drafted positions.
-    Returns:
-        logits: [B, T, V]
-        deep_past: updated KV after consuming T positions
+    Manual deep pass over layers [k:], strictly one token at a time.
+    No early/fast-path. Returns [B,T,V] and updated deep KV.
     """
-    # Always run deep path under the verify adapter and restore afterwards.
     with adapter_guard(model, "verify"):
-        early = _early_model(model)
-        B, T, H = hidden_k.shape
-        device = hidden_k.device
-
-        # -------------------------
-        # Try "early" fast-path API
-        # -------------------------
-        if early is not None and not os.getenv("DVI_DISABLE_EARLY_FASTPATH"):
-            # If there's more than one position, unroll one by one using the model's API.
-            logits_chunks = []
-            pkv = past_key_values
-            try:
-                for t in range(T):
-                    h_i = hidden_k[:, t:t+1, :]  # [B,1,H]
-                    try:
-                        deep_hidden_i, norm_i = early.forward_draft_or_large_model(
-                            in_features_large=h_i,
-                            past_key_values=pkv,
-                            use_cache=use_cache,
-                        )
-                    except TypeError:
-                        deep_hidden_i, norm_i = early.forward_draft_or_large_model(
-                            in_features_large=h_i,
-                            past_key_values=pkv,
-                        )
-                    # logits for the *next* token at this position
-                    logits_i = model.lm_head(norm_i)
-                    logits_chunks.append(logits_i)  # [B,1,V]
-                    # advance cache
-                    kvs = getattr(early, "past_key_values", None)
-                    if use_cache and kvs is not None:
-                        k = _resolve_early_layer(early)
-                        pkv = tuple(kvs[k:])
-                if logits_chunks:
-                    logits = torch.cat(logits_chunks, dim=1)  # [B,T,V]
-                    return logits, pkv if use_cache else None
-            except Exception:
-                # Fall back to manual path if the fast-path cannot be safely unrolled
-                pass
-
-        # -------------------------
-        # Manual path: step by step
-        # -------------------------
         k = _resolve_early_layer(model)
         lm = _llama_model(model)
         deep_layers = lm.layers[k:]
 
-        # Initialize per-layer PKV for deep stack
-        if past_key_values is None:
-            pkv = tuple([None] * len(deep_layers))
-        else:
-            pkv = past_key_values
+        B, T, _ = hidden_k.shape
+        device = hidden_k.device
 
+        pkv = tuple([None] * len(deep_layers)) if past_key_values is None else past_key_values
         logits_chunks = []
 
         for t in range(T):
-            hs = hidden_k[:, t:t+1, :]  # one position
-            # Determine current past length from the first layer's K
+            hs = hidden_k[:, t:t+1, :]  # [B,1,H]
             past_len = 0
             if pkv and pkv[0] is not None:
                 past_len = pkv[0][0].shape[2]
-
-            # Build position ids for this single step
             position_ids = torch.full((B, 1), past_len, device=device, dtype=torch.long)
 
-            # Attention mask: if we already have KV (past_len>0) we can skip building an explicit mask
             if past_len > 0:
                 attn_mask = None
-                timing_trace("run_deep_from_k(seq): cached fast-path mask skip (single step)")
+                timing_trace("run_deep_from_k(seq): cached mask skip")
             else:
-                attention_mask = torch.ones((B, 1), dtype=torch.bool, device=device)
-                attn_mask = lm._prepare_decoder_attention_mask(
-                    attention_mask,
-                    (B, 1),
-                    hs,
-                    0,
-                )
+                attn_1 = torch.ones((B, 1), dtype=torch.bool, device=device)
+                attn_mask = lm._prepare_decoder_attention_mask(attn_1, (B, 1), hs, 0)
 
             new_past_step = []
             hidden_states = hs
