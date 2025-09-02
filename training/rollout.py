@@ -3,7 +3,6 @@ from typing import List, Dict, Optional
 
 import json
 import torch
-from typing import List, Dict, Optional
 
 from training.buffer import ReplayBuffer
 from training.modeling import (
@@ -14,6 +13,7 @@ from training.modeling import (
 )
 from training.kv import advance_kv_with_committed
 from training.sampling import sample_from_logits
+from training.align_telemetry import AlignLogger, AlignTelemetryParams
 
 __all__ = ["rollout_collect", "rollout_collect_k_spec", "buf_debug"]
 
@@ -50,6 +50,7 @@ def rollout_collect_k_spec(
     temperature: float = 1.0,
     debug_out: Optional[List[Dict]] = None,
     topk: int = 5,
+    telemetry: Optional[AlignTelemetryParams] = None,
 ) -> int:
     """Collect rollouts using k-token speculative drafting.
 
@@ -74,6 +75,9 @@ def rollout_collect_k_spec(
         _, deep_past = run_deep_from_k(
             spec, hidden_k=h_k_prompt, past_key_values=None, use_cache=True
         )
+    logger = AlignLogger(telemetry)
+    kv_len_shallow = logger.kv_len_from_past(shallow_past)
+    kv_len_deep = logger.kv_len_from_past(deep_past)
 
     # choose true last token (avoid PAD)
     if attn_mask is not None:
@@ -85,8 +89,9 @@ def rollout_collect_k_spec(
 
     B = input_ids.size(0)
     n_collected = 0
+    steps_done = 0
 
-    while n_collected < steps:
+    while steps_done < steps:
         draft_tokens = []
         draft_hidden = []
         tmp_shallow = shallow_past
@@ -111,48 +116,47 @@ def rollout_collect_k_spec(
         prop_seq = torch.stack(draft_tokens, dim=1)
         hidden_seq = torch.stack(draft_hidden, dim=1)
 
+        kv_len_shallow_before = kv_len_shallow
+        kv_len_deep_before = kv_len_deep
+
         with adapter_guard(spec, "verify"), torch.no_grad():
             deep_logits, deep_past_full = run_deep_from_k(
                 spec, hidden_k=hidden_seq, past_key_values=deep_past, use_cache=True
             )
-        import os
 
-        if os.getenv("DVI_ALIGN_DEBUG", ""):
-            _va = deep_logits.argmax(dim=-1)  # [B, k]
-            m00 = (_va[:, 0] == prop_seq[:, 0]).float().mean().item()
-            m10 = float("nan")
-            m11 = float("nan")
-            if _va.size(1) > 1:
-                m10 = (_va[:, 1] == prop_seq[:, 0]).float().mean().item()
-                m11 = (_va[:, 1] == prop_seq[:, 1]).float().mean().item()
+        if not torch.isfinite(deep_logits).all():
+            deep_logits = torch.nan_to_num(deep_logits)
 
-            if not hasattr(rollout_collect_k_spec, "_align_prints"):
-                rollout_collect_k_spec._align_prints = 0
-            if rollout_collect_k_spec._align_prints < 3:
-                print(
-                    f"[align/rollout] k={k} match(0↔0)={m00:.3f} "
-                    f"match(1↔0)={m10:.3f} match(1↔1)={m11:.3f}",
-                    flush=True,
-                )
-                rollout_collect_k_spec._align_prints += 1
+        deep_argmax = deep_logits.argmax(dim=-1)
 
-        verify_argmax = deep_logits.argmax(dim=-1)         # [B,k]
-        matches = verify_argmax.eq(prop_seq)
-
-        # per-sample accepted prefix length
-        all_matched = matches.all(dim=1)
-        first_mismatch = (~matches).float().argmax(dim=1)
-        prefix_lens = torch.where(
-            all_matched, torch.full_like(first_mismatch, k), first_mismatch
+        matches0 = deep_argmax.eq(prop_seq)
+        all_matched0 = matches0.all(dim=1)
+        first_mismatch0 = (~matches0).float().argmax(dim=1)
+        prefix_lens0 = torch.where(
+            all_matched0, torch.full_like(first_mismatch0, k), first_mismatch0
         )
-        accept_len = int(prefix_lens.min().item())
+        accept_len_default = int(prefix_lens0.min().item())
 
-        # append only accepted prefix (+1 mismatch token) to buffer
-        va_list = verify_argmax.detach().cpu().tolist()
+        accept_len = accept_len_default
+        prefix_lens = prefix_lens0
+
+        if logger.cfg.auto_offset > 0 and deep_argmax.size(1) > 1:
+            matches1 = deep_argmax[:, 1:].eq(prop_seq[:, :-1])
+            all_matched1 = matches1.all(dim=1)
+            first_mismatch1 = (~matches1).float().argmax(dim=1)
+            prefix_lens1 = torch.where(
+                all_matched1, torch.full_like(first_mismatch1, k - 1), first_mismatch1
+            )
+            accept_len_p1 = int(prefix_lens1.min().item())
+            if accept_len_p1 > accept_len:
+                accept_len = accept_len_p1
+                prefix_lens = prefix_lens1
+
+        va_list = deep_argmax.detach().cpu().tolist()
         for b in range(B):
             m = int(prefix_lens[b].item())
-            kept = m + (1 if m < k else 0)
-            for d in range(m):
+            if m == k:
+                d = k - 1
                 with torch.inference_mode(False):
                     hidden = hidden_seq[b, d].detach().clone().cpu()
                     vlogits = deep_logits[b, d].detach().clone().cpu()
@@ -163,7 +167,19 @@ def rollout_collect_k_spec(
                     conf=0.0,
                     vlogits=vlogits,
                 )
-            if m < k:
+                kept = 1
+            else:
+                for d in range(m):
+                    with torch.inference_mode(False):
+                        hidden = hidden_seq[b, d].detach().clone().cpu()
+                        vlogits = deep_logits[b, d].detach().clone().cpu()
+                    buf.append(
+                        hidden=hidden,
+                        token=int(va_list[b][d]),
+                        reward=1.0,
+                        conf=0.0,
+                        vlogits=vlogits,
+                    )
                 d = m
                 with torch.inference_mode(False):
                     hidden = hidden_seq[b, d].detach().clone().cpu()
@@ -175,6 +191,7 @@ def rollout_collect_k_spec(
                     conf=0.0,
                     vlogits=vlogits,
                 )
+                kept = m + 1
             n_collected += kept
 
         if debug_out is not None:
@@ -184,8 +201,8 @@ def rollout_collect_k_spec(
                 d_prob, d_id = torch.topk(torch.softmax(d_logits[0, 0].float(), dim=-1), k=topk)
                 debug_out.append({
                     "draft_top1": int(prop_seq[0, 0]),
-                    "verifier_top1": int(verify_argmax[0, 0]),
-                    "accept": int(matches[0, 0]),
+                    "verifier_top1": int(deep_argmax[0, 0]),
+                    "accept": int(matches0[0, 0]),
                     "verifier_topk": [[int(i), float(p)] for p, i in zip(v_prob.tolist(), v_id.tolist())],
                     "draft_topk": [[int(i), float(p)] for p, i in zip(d_prob.tolist(), d_id.tolist())],
                 })
@@ -211,9 +228,39 @@ def rollout_collect_k_spec(
             deep_past = tuple(new_deep)
             last_tokens = accepted_block[:, -1]
         else:
-            mismatch_tok = verify_argmax[:, 0]
+            mismatch_tok = deep_argmax[:, 0]
             advance_kv_with_committed(spec, mismatch_tok.unsqueeze(1))
             last_tokens = mismatch_tok
+
+        kv_len_shallow = logger.kv_len_from_past(shallow_past)
+        kv_len_deep = logger.kv_len_from_past(deep_past)
+
+        sample0 = {}
+        try:
+            sample0["hidden0"] = hidden_seq[0, 0]
+            sample0["deep_logits0"] = deep_logits[0, 0]
+        except Exception:
+            pass
+
+        steps_done += 1
+        logger.block_report(
+            phase="rollout",
+            step_idx=steps_done,
+            k=k,
+            B=B,
+            greedy=greedy,
+            temperature=temperature,
+            prop_seq=prop_seq,
+            deep_logits=deep_logits,
+            deep_argmax=deep_argmax,
+            accept_len_default=accept_len_default,
+            kv_len_shallow_before=kv_len_shallow_before,
+            kv_len_deep_before=kv_len_deep_before,
+            kv_len_shallow_after=kv_len_shallow,
+            kv_len_deep_after=kv_len_deep,
+            gold=None,
+            sample0_tensors=sample0,
+        )
 
     return n_collected
 
