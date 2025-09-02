@@ -1,7 +1,6 @@
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
-import os
 import torch
 
 from .modeling import (
@@ -14,6 +13,7 @@ from .sampling import sample_from_logits
 from .utils import theoretical_compression, count_transformer_layers
 from .mem import timing_trace  # kept for compatibility
 from .kv import clear_all_kv, prime_kv_full, advance_kv_with_committed
+from .align_telemetry import AlignLogger, AlignTelemetryParams
 
 
 @dataclass
@@ -100,6 +100,7 @@ def generate_with_dvi_spec(
     early_layer: Optional[int] = None,
     device: Optional[torch.device] = None,
     quiet: bool = True,
+    telemetry: Optional[AlignTelemetryParams] = None,
 ) -> Tuple[List[torch.Tensor], SpecMetrics]:
     """Self-speculative decoding using vectorised block verification."""
 
@@ -151,14 +152,13 @@ def generate_with_dvi_spec(
             use_cache=True,
         )
 
+    logger = AlignLogger(telemetry)
+    kv_len_shallow = logger.kv_len_from_past(shallow_past)
+    kv_len_deep = logger.kv_len_from_past(deep_past)
+
     metrics = SpecMetrics(draft_k=draft_k)
     metrics.prefix_hist = [0 for _ in range(draft_k + 1)]
     total_new = 0
-
-    # align debug throttling
-    if not hasattr(generate_with_dvi_spec, "_align_prints"):
-        generate_with_dvi_spec._align_prints = 0
-    max_align_prints = int(os.getenv("DVI_ALIGN_PRINTS", "3"))
 
     while total_new < max_new_tokens:
         draft_tokens: List[torch.Tensor] = []
@@ -189,6 +189,9 @@ def generate_with_dvi_spec(
         metrics.proposed += int(B * draft_k)
 
         # ---- verify entire block ----
+        kv_len_shallow_before = kv_len_shallow
+        kv_len_deep_before = kv_len_deep
+
         with adapter_guard(model, "verify"):
             deep_logits, deep_past_full = run_deep_from_k(
                 model,
@@ -199,81 +202,38 @@ def generate_with_dvi_spec(
         metrics.steps += 1
         metrics.deep_tokens += int(B * draft_k)
 
-        # --- Misalignment debug (prints to stdout if requested) ---
-        if os.getenv("DVI_ALIGN_DEBUG", ""):
-            _va = deep_logits.argmax(dim=-1)  # [B, k]
-            m00 = (_va[:, 0] == prop_seq[:, 0]).float().mean().item()
-            m10 = float("nan")
-            m11 = float("nan")
-            if _va.size(1) > 1:
-                m10 = (_va[:, 1] == prop_seq[:, 0]).float().mean().item()
-                m11 = (_va[:, 1] == prop_seq[:, 1]).float().mean().item()
-
-            if generate_with_dvi_spec._align_prints < max_align_prints:
-                print(
-                    f"[align/spec] k={draft_k} match(0↔0)={m00:.3f} "
-                    f"match(1↔0)={m10:.3f} match(1↔1)={m11:.3f}",
-                    flush=True,
-                )
-                generate_with_dvi_spec._align_prints += 1
-
-            # Optional: deeper "gold" check for B==1
-            if os.getenv("DVI_ALIGN_GOLD", "") and B == 1 and generate_with_dvi_spec._align_prints <= max_align_prints:
-                try:
-                    with adapter_guard(model, "verify"):
-                        # Build current prefix for sample 0
-                        prefix_ids = input_ids[0].detach().tolist() + generated[0]
-                        prefix = torch.tensor([prefix_ids], device=device, dtype=input_ids.dtype)
-                        clear_all_kv(model)
-                        if prefix.size(1) >= 1:
-                            prime_kv_full(model, prefix[:, :-1])
-                            last = prefix[:, -1:]
-                        else:
-                            prime_kv_full(model, prefix)
-                            last = prefix[:, -1:]
-
-                        gold = []
-                        steps_to_check = min(2, prop_seq.size(1))
-                        for _ in range(steps_to_check):
-                            g_logits = model.verifier_logits_for_next(last)
-                            g_top1 = int(g_logits.argmax(dim=-1)[0, 0].item())
-                            gold.append(g_top1)
-                            nxt = torch.tensor([[g_top1]], device=last.device, dtype=last.dtype)
-                            advance_kv_with_committed(model, nxt)
-                            last = nxt
-
-                    v_arg = deep_logits.argmax(dim=-1)  # [1,k]
-                    d0 = int(prop_seq[0, 0].item())
-                    d1 = int(prop_seq[0, 1].item()) if prop_seq.size(1) > 1 else -1
-                    v0 = int(v_arg[0, 0].item())
-                    v1 = int(v_arg[0, 1].item()) if v_arg.size(1) > 1 else -1
-                    g0 = gold[0] if len(gold) > 0 else -1
-                    g1 = gold[1] if len(gold) > 1 else -1
-                    print(
-                        f"[align/spec] gold k={draft_k} "
-                        f"deep≈gold: {(v0==g0):d}/{(v1==g1):d} | "
-                        f"draft={d0},{d1} deep={v0},{v1} gold={g0},{g1}",
-                        flush=True,
-                    )
-                except Exception as e:
-                    print(f"[align/spec] gold-check error: {e}", flush=True)
-        # --- end misalignment debug ---
-
         if not torch.isfinite(deep_logits).all():
             metrics.nan_events += 1
             deep_logits = torch.nan_to_num(deep_logits)
+            deep_argmax = deep_logits.argmax(dim=-1)
+            matches0 = torch.zeros_like(prop_seq, dtype=torch.bool)
+        else:
+            deep_argmax = deep_logits.argmax(dim=-1)  # [B,k]
+            matches0 = deep_argmax.eq(prop_seq)
 
-        verify_argmax = deep_logits.argmax(dim=-1)  # [B,k]
-        matches = verify_argmax.eq(prop_seq)
-
-        # compute accepted prefix length across batch (min)
-        all_matched = matches.all(dim=1)
-        first_mismatch = (~matches).float().argmax(dim=1)
-        prefix_lens = torch.where(all_matched, torch.full_like(first_mismatch, draft_k), first_mismatch)
-        counts = torch.bincount(prefix_lens.to(dtype=torch.long, device="cpu"), minlength=draft_k + 1)
+        all_matched0 = matches0.all(dim=1)
+        first_mismatch0 = (~matches0).float().argmax(dim=1)
+        prefix_lens0 = torch.where(all_matched0, torch.full_like(first_mismatch0, draft_k), first_mismatch0)
+        counts = torch.bincount(prefix_lens0.to(dtype=torch.long, device="cpu"), minlength=draft_k + 1)
         for i in range(draft_k + 1):
             metrics.prefix_hist[i] += int(counts[i])
-        accept_len = int(prefix_lens.min().item())
+        accept_len_default = int(prefix_lens0.min().item())
+
+        accept_len = accept_len_default
+
+        if logger.cfg.auto_offset > 0 and deep_argmax.size(1) > 1:
+            matches1 = deep_argmax[:, 1:].eq(prop_seq[:, :-1])
+            all_matched1 = matches1.all(dim=1)
+            first_mismatch1 = (~matches1).float().argmax(dim=1)
+            prefix_lens1 = torch.where(
+                all_matched1, torch.full_like(first_mismatch1, draft_k - 1), first_mismatch1
+            )
+            accept_len_p1 = int(prefix_lens1.min().item())
+            if accept_len_p1 > accept_len:
+                accept_len = accept_len_p1
+
+        if deep_past_full is None and accept_len > 0:
+            accept_len = 0
 
         metrics.accepted += int(B * accept_len)
 
@@ -301,7 +261,7 @@ def generate_with_dvi_spec(
             total_new += accept_len
             metrics.committed += int(B * accept_len)
         else:
-            v1 = verify_argmax[:, 0]
+            v1 = deep_argmax[:, 0]
             for b in range(B):
                 generated[b].append(int(v1[b]))
             last_tokens = v1
@@ -322,6 +282,36 @@ def generate_with_dvi_spec(
                 )
             total_new += 1
             metrics.committed += int(B)
+
+        kv_len_shallow = logger.kv_len_from_past(shallow_past)
+        kv_len_deep = logger.kv_len_from_past(deep_past)
+
+        sample0 = {}
+        try:
+            sample0["prop_seq0"] = prop_seq[0]
+            sample0["deep_argmax0"] = deep_argmax[0]
+            sample0["deep_logits0"] = deep_logits[0]
+        except Exception:
+            pass
+
+        logger.block_report(
+            phase="spec",
+            step_idx=metrics.steps,
+            k=draft_k,
+            B=B,
+            greedy=greedy,
+            temperature=temperature,
+            prop_seq=prop_seq,
+            deep_logits=deep_logits,
+            deep_argmax=deep_argmax,
+            accept_len_default=accept_len_default,
+            kv_len_shallow_before=kv_len_shallow_before,
+            kv_len_deep_before=kv_len_deep_before,
+            kv_len_shallow_after=kv_len_shallow,
+            kv_len_deep_after=kv_len_deep,
+            gold=None,
+            sample0_tensors=sample0,
+        )
 
         # invariants: accept_rate vs histogram
         if metrics.proposed > 0:
