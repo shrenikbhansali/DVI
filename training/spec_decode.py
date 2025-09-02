@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 import os
@@ -24,6 +24,7 @@ class SpecMetrics:
     steps: int = 0
     deep_tokens: int = 0
     comp_ratio_runtime_est: float = 1.0
+    prefix_hist: List[int] = field(default_factory=list)
 
     @property
     def accept_rate(self) -> float:
@@ -34,7 +35,7 @@ class SpecMetrics:
         return self.deep_tokens / max(1, self.committed)
 
     def to_dict(self) -> Dict[str, float]:
-        return {
+        out = {
             "spec/proposed": float(self.proposed),
             "spec/accepted": float(self.accepted),
             "spec/committed": float(self.committed),
@@ -42,7 +43,11 @@ class SpecMetrics:
             "spec/deep_tokens": float(self.deep_tokens),
             "spec/deep_to_commit": float(self.deep_to_commit),
             "spec/comp_rt_est": float(self.comp_ratio_runtime_est),
+            "spec/steps": float(self.steps),
         }
+        for i, v in enumerate(self.prefix_hist):
+            out[f"spec/prefix_hist_{i}"] = float(v)
+        return out
 
 
 # Generation only requires gradients disabled; using ``torch.no_grad`` avoids
@@ -114,6 +119,7 @@ def generate_with_dvi_spec(
         )
 
     metrics = SpecMetrics()
+    metrics.prefix_hist = [0 for _ in range(draft_k + 1)]
     total_new = 0
 
     # align debug throttling
@@ -228,6 +234,9 @@ def generate_with_dvi_spec(
         all_matched = matches.all(dim=1)
         first_mismatch = (~matches).float().argmax(dim=1)
         prefix_lens = torch.where(all_matched, torch.full_like(first_mismatch, draft_k), first_mismatch)
+        hist = torch.bincount(prefix_lens, minlength=draft_k + 1)
+        for i in range(draft_k + 1):
+            metrics.prefix_hist[i] += int(hist[i].item())
         accept_len = int(prefix_lens.min().item())
 
         # commit accepted prefix

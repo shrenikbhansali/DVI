@@ -312,12 +312,13 @@ def measure_generate_walltime(
     def _baseline_once(enc_chunk, force_greedy: bool) -> float:
         _cuda_sync()
         t0 = time.perf_counter()
+        temp = max(1e-6, temperature) if force_greedy else temperature
         _ = model.generate(
             input_ids=enc_chunk["input_ids"],
             attention_mask=enc_chunk.get("attention_mask", None),
             max_new_tokens=max_new_tokens,
             do_sample=not force_greedy,
-            temperature=max(1e-6, temperature),
+            temperature=temp,
             num_beams=1,
             use_cache=True,
             pad_token_id=getattr(model.config, "pad_token_id", getattr(tok, "pad_token_id", None)),
@@ -341,7 +342,7 @@ def measure_generate_walltime(
             max_new_tokens=max_new_tokens,
             draft_k=draft_k,
             greedy=greedy,
-            temperature=temperature,
+            temperature=max(1e-6, temperature) if greedy else temperature,
             early_layer=early_layer_override or getattr(model, "early_layer", None),
             device=device,
             quiet=quiet,
@@ -364,6 +365,8 @@ def measure_generate_walltime(
         agg_accepted = 0
         agg_committed = 0
         agg_deep = 0
+        agg_steps = 0
+        agg_prefix = [0 for _ in range(draft_k + 1)] if use_dvi_spec else []
 
         s = 0
 
@@ -378,6 +381,9 @@ def measure_generate_walltime(
                     agg_accepted += int(spec_dict.get("spec/accepted", 0))
                     agg_committed += int(spec_dict.get("spec/committed", 0))
                     agg_deep += int(spec_dict.get("spec/deep_tokens", 0))
+                    agg_steps += int(spec_dict.get("spec/steps", 0))
+                    for i in range(draft_k + 1):
+                        agg_prefix[i] += int(spec_dict.get(f"spec/prefix_hist_{i}", 0))
                 else:
                     total_elapsed += _baseline_once(enc_chunk, force_greedy=greedy)
             except RuntimeError as err:
@@ -391,6 +397,9 @@ def measure_generate_walltime(
                         agg_accepted += int(spec_dict.get("spec/accepted", 0))
                         agg_committed += int(spec_dict.get("spec/committed", 0))
                         agg_deep += int(spec_dict.get("spec/deep_tokens", 0))
+                        agg_steps += int(spec_dict.get("spec/steps", 0))
+                        for i in range(draft_k + 1):
+                            agg_prefix[i] += int(spec_dict.get(f"spec/prefix_hist_{i}", 0))
                     else:
                         total_elapsed += _baseline_once(enc_fallback, force_greedy=True)
                     e = s + 1
@@ -410,13 +419,35 @@ def measure_generate_walltime(
                 "spec/accept_rate": float(acc),
                 "spec/deep_tokens": float(agg_deep),
                 "spec/deep_to_commit": float(agg_deep / max(1, agg_committed)),
+                "spec/steps": float(agg_steps),
             }
+            for i, v in enumerate(agg_prefix):
+                spec_last[f"spec/prefix_hist_{i}"] = float(v)
 
         times.append(total_elapsed)
 
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    times.sort()
-    elapsed_med = float(times[len(times) // 2])
+    total_time = float(sum(times))
+    mean_time = total_time / max(1, len(times))
+    times_sorted = sorted(times)
+    elapsed_med = float(times_sorted[len(times_sorted) // 2])
+    if repeats > 1:
+        print(
+            f"[time] repeats={len(times_sorted)} per-run(s)=["
+            + ",".join(f"{t:.3f}" for t in times_sorted)
+            + f"] median={elapsed_med:.3f} mean={mean_time:.3f} total={total_time:.3f}",
+            flush=True,
+        )
+    else:
+        print(f"[time] repeats=1 per-run={elapsed_med:.3f}", flush=True)
+    if use_dvi_spec and spec_last is not None:
+        spec_last.update({
+            "time/median": elapsed_med,
+            "time/mean": mean_time,
+            "time/total": total_time,
+        })
+        for i, t in enumerate(times_sorted):
+            spec_last[f"time/run_{i}"] = t
     return (elapsed_med, spec_last) if use_dvi_spec else elapsed_med
