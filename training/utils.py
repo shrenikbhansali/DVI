@@ -420,9 +420,34 @@ def measure_generate_walltime(
                 "spec/deep_tokens": float(agg_deep),
                 "spec/deep_to_commit": float(agg_deep / max(1, agg_committed)),
                 "spec/steps": float(agg_steps),
+                "spec/hist_N": float(sum(agg_prefix)),
+                "spec/greedy": float(greedy),
+                "spec/temperature": float(max(1e-6, temperature) if greedy else temperature),
+                "spec/k": float(draft_k),
+                "spec/early_layer": float(early_layer_override or getattr(model, "early_layer", 0) or 0),
+                "spec/mode": 1.0 if use_dvi_spec else 0.0,
             }
             for i, v in enumerate(agg_prefix):
                 spec_last[f"spec/prefix_hist_{i}"] = float(v)
+            # derived metrics from histogram
+            hist = agg_prefix
+            N = max(1, sum(hist))
+            EL = sum(i * c for i, c in enumerate(hist)) / N
+            p0 = hist[0] / N if len(hist) > 0 else 0.0
+            pfull = hist[draft_k] / N if draft_k < len(hist) else 0.0
+            pge2 = sum(hist[2:draft_k + 1]) / N if draft_k >= 2 else 0.0
+            ctar_hat = [1.0 - p0]
+            for j in range(2, draft_k + 1):
+                ctar_hat.append(sum(hist[j:draft_k + 1]) / N)
+            spec_last["spec/E[L]"] = float(EL)
+            spec_last["spec/p0"] = float(p0)
+            spec_last["spec/p_full"] = float(pfull)
+            spec_last["spec/p_ge2"] = float(pge2)
+            for j, val in enumerate(ctar_hat, start=1):
+                spec_last[f"spec/ctar{j}_hat"] = float(val)
+            acc_from_hist = EL / max(1, draft_k)
+            spec_last["spec/accept_rate_from_hist"] = float(acc_from_hist)
+            spec_last["spec/accept_rate_delta"] = float(acc - acc_from_hist)
 
         times.append(total_elapsed)
 

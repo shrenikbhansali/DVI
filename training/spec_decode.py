@@ -25,6 +25,10 @@ class SpecMetrics:
     deep_tokens: int = 0
     comp_ratio_runtime_est: float = 1.0
     prefix_hist: List[int] = field(default_factory=list)
+    draft_k: int = 0
+    invariant_error: int = 0
+    nan_events: int = 0
+    oom_retries: int = 0
 
     @property
     def accept_rate(self) -> float:
@@ -33,6 +37,19 @@ class SpecMetrics:
     @property
     def deep_to_commit(self) -> float:
         return self.deep_tokens / max(1, self.committed)
+
+    def _derive_from_hist(self) -> Tuple[float, float, float, float, List[float]]:
+        k = int(self.draft_k)
+        hist = self.prefix_hist
+        N = max(1, sum(hist))
+        EL = sum(i * c for i, c in enumerate(hist)) / N
+        p0 = hist[0] / N if len(hist) > 0 else 0.0
+        pfull = hist[k] / N if k < len(hist) else 0.0
+        pge2 = sum(hist[2:k + 1]) / N if k >= 2 else 0.0
+        ctar_hat = [1.0 - p0]
+        for j in range(2, k + 1):
+            ctar_hat.append(sum(hist[j:k + 1]) / N)
+        return EL, p0, pfull, pge2, ctar_hat
 
     def to_dict(self) -> Dict[str, float]:
         out = {
@@ -44,9 +61,25 @@ class SpecMetrics:
             "spec/deep_to_commit": float(self.deep_to_commit),
             "spec/comp_rt_est": float(self.comp_ratio_runtime_est),
             "spec/steps": float(self.steps),
+            "spec/invariant_error": float(self.invariant_error),
+            "spec/nan_events": float(self.nan_events),
+            "spec/oom_retries": float(self.oom_retries),
         }
+        hist_N = int(sum(self.prefix_hist))
+        out["spec/hist_N"] = float(hist_N)
         for i, v in enumerate(self.prefix_hist):
             out[f"spec/prefix_hist_{i}"] = float(v)
+        if self.draft_k:
+            EL, p0, pfull, pge2, ctar_hat = self._derive_from_hist()
+            out["spec/E[L]"] = float(EL)
+            out["spec/p0"] = float(p0)
+            out["spec/p_full"] = float(pfull)
+            out["spec/p_ge2"] = float(pge2)
+            for j, val in enumerate(ctar_hat, start=1):
+                out[f"spec/ctar{j}_hat"] = float(val)
+            acc_from_hist = EL / max(1, self.draft_k)
+            out["spec/accept_rate_from_hist"] = float(acc_from_hist)
+            out["spec/accept_rate_delta"] = float(out["spec/accept_rate"] - acc_from_hist)
         return out
 
 
@@ -118,7 +151,7 @@ def generate_with_dvi_spec(
             use_cache=True,
         )
 
-    metrics = SpecMetrics()
+    metrics = SpecMetrics(draft_k=draft_k)
     metrics.prefix_hist = [0 for _ in range(draft_k + 1)]
     total_new = 0
 
@@ -165,7 +198,6 @@ def generate_with_dvi_spec(
             )
         metrics.steps += 1
         metrics.deep_tokens += int(B * draft_k)
-        deep_calls = 1
 
         # --- Misalignment debug (prints to stdout if requested) ---
         if os.getenv("DVI_ALIGN_DEBUG", ""):
@@ -227,6 +259,10 @@ def generate_with_dvi_spec(
                     print(f"[align/spec] gold-check error: {e}", flush=True)
         # --- end misalignment debug ---
 
+        if not torch.isfinite(deep_logits).all():
+            metrics.nan_events += 1
+            deep_logits = torch.nan_to_num(deep_logits)
+
         verify_argmax = deep_logits.argmax(dim=-1)  # [B,k]
         matches = verify_argmax.eq(prop_seq)
 
@@ -234,12 +270,14 @@ def generate_with_dvi_spec(
         all_matched = matches.all(dim=1)
         first_mismatch = (~matches).float().argmax(dim=1)
         prefix_lens = torch.where(all_matched, torch.full_like(first_mismatch, draft_k), first_mismatch)
-        hist = torch.bincount(prefix_lens, minlength=draft_k + 1)
+        counts = torch.bincount(prefix_lens.to(dtype=torch.long, device="cpu"), minlength=draft_k + 1)
         for i in range(draft_k + 1):
-            metrics.prefix_hist[i] += int(hist[i].item())
+            metrics.prefix_hist[i] += int(counts[i])
         accept_len = int(prefix_lens.min().item())
 
-        # commit accepted prefix
+        metrics.accepted += int(B * accept_len)
+
+        # commit accepted prefix or one verifier token on miss
         if accept_len > 0:
             accepted_block = prop_seq[:, :accept_len]
             snap = shallow_snapshots[accept_len - 1]
@@ -261,19 +299,16 @@ def generate_with_dvi_spec(
                 generated[b].extend(acc_list[b])
             last_tokens = accepted_block[:, -1]
             total_new += accept_len
-            metrics.accepted += int(B * accept_len)
             metrics.committed += int(B * accept_len)
-
-        if total_new >= max_new_tokens:
-            break
-
-        # ---- optional single-token fix (commit one deep token when mismatch) ----
-        if accept_len < draft_k:
-            mismatch_tok = verify_argmax[:, accept_len]
+        else:
+            v1 = verify_argmax[:, 0]
+            for b in range(B):
+                generated[b].append(int(v1[b]))
+            last_tokens = v1
             with adapter_guard(model, "draft"):
                 h_fix, shallow_past = run_shallow_until_k(
                     model,
-                    input_ids=mismatch_tok.unsqueeze(1),
+                    input_ids=v1.unsqueeze(1),
                     past_key_values=shallow_past,
                     attention_mask=None,
                     use_cache=True,
@@ -285,19 +320,18 @@ def generate_with_dvi_spec(
                     past_key_values=deep_past,
                     use_cache=True,
                 )
-            metrics.steps += 1
-            metrics.deep_tokens += int(B)
-            deep_calls += 1
-
-            tok_list = mismatch_tok.tolist()
-            for b in range(B):
-                generated[b].append(tok_list[b])
-            last_tokens = mismatch_tok
             total_new += 1
             metrics.committed += int(B)
 
-        # safety: ensure ≤ 2 deep calls per block
-        assert deep_calls <= 2, "Deep called more than twice in a block"
+        # invariants: accept_rate vs histogram
+        if metrics.proposed > 0:
+            hist_EL, _, _, _, _ = metrics._derive_from_hist()
+            acc_from_hist = hist_EL / max(1, metrics.draft_k)
+            if abs(metrics.accept_rate - acc_from_hist) > 1e-6:
+                metrics.invariant_error += 1
+
+        if total_new >= max_new_tokens:
+            break
 
     total_layers = count_transformer_layers(model)
     comp_ratio, _ = theoretical_compression(metrics.accept_rate, k, total_layers)

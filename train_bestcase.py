@@ -305,7 +305,28 @@ def train_bestcase_kl_rl(model, tok, prompts_train: List[str], prompts_eval: Lis
                 quiet=True,
             )
             rt_dict = rt_metrics.to_dict()
-            wandb_log({f"eval/runtime/{k}": v for k, v in rt_dict.items()}, step=g + 1)
+            rt_dict.update({
+                "spec/greedy": float(timing_greedy),
+                "spec/temperature": float(max(1e-6, temperature) if timing_greedy else temperature),
+                "spec/k": float(train_k_spec),
+                "spec/early_layer": float(early_layer),
+            })
+            log_rt = {f"eval/runtime/{k}": v for k, v in rt_dict.items()}
+            # cross-check CTAR hats vs teacher-forced CTARs
+            mode_mismatch = 0.0
+            if timing_greedy:
+                deltas = []
+                for w in range(1, eval_k_max + 1):
+                    rt_hat = rt_dict.get(f"spec/ctar{w}_hat")
+                    if rt_hat is not None:
+                        tf_ctar = ctar_mid.get(w, 0.0)
+                        delta = abs(rt_hat - tf_ctar)
+                        log_rt[f"eval/runtime/ctar{w}_delta"] = delta
+                        deltas.append(delta)
+                if deltas and max(deltas) > 0.05:
+                    mode_mismatch = 1.0
+            log_rt["eval/runtime/spec/mode_mismatch"] = mode_mismatch
+            wandb_log(log_rt, step=g + 1)
             hist_msg = " ".join(
                 [f"{k.split('_')[-1]}={int(v)}" for k, v in rt_dict.items() if k.startswith("spec/prefix_hist_")]
             )

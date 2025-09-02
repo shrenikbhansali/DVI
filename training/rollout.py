@@ -12,6 +12,7 @@ from training.modeling import (
     exit_logits_from_hidden_k,
     adapter_guard,
 )
+from training.kv import advance_kv_with_committed
 from training.sampling import sample_from_logits
 
 __all__ = ["rollout_collect", "rollout_collect_k_spec", "buf_debug"]
@@ -191,7 +192,7 @@ def rollout_collect_k_spec(
             except Exception:
                 pass
 
-        # accept common prefix
+        # accept common prefix or commit one verifier token on miss
         if accept_len > 0:
             accepted_block = prop_seq[:, :accept_len]
             snap = shallow_snaps[accept_len - 1]
@@ -209,22 +210,9 @@ def rollout_collect_k_spec(
                 new_deep.append((ks, vs))
             deep_past = tuple(new_deep)
             last_tokens = accepted_block[:, -1]
-
-        # fix single mismatch
-        if accept_len < k:
-            mismatch_tok = verify_argmax[:, accept_len]
-            with adapter_guard(spec, "draft"):
-                h_fix, shallow_past = run_shallow_until_k(
-                    spec,
-                    input_ids=mismatch_tok.unsqueeze(1),
-                    past_key_values=shallow_past,
-                    attention_mask=None,
-                    use_cache=True,
-                )
-            with adapter_guard(spec, "verify"), torch.no_grad():
-                _, deep_past = run_deep_from_k(
-                    spec, hidden_k=h_fix, past_key_values=deep_past, use_cache=True
-                )
+        else:
+            mismatch_tok = verify_argmax[:, 0]
+            advance_kv_with_committed(spec, mismatch_tok.unsqueeze(1))
             last_tokens = mismatch_tok
 
     return n_collected
