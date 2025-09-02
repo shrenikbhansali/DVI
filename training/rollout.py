@@ -137,7 +137,6 @@ def rollout_collect_k_spec(
 
         verify_argmax = deep_logits.argmax(dim=-1)         # [B,k]
         matches = verify_argmax.eq(prop_seq)
-        rewards = matches.float()
 
         # per-sample accepted prefix length
         all_matched = matches.all(dim=1)
@@ -147,23 +146,35 @@ def rollout_collect_k_spec(
         )
         accept_len = int(prefix_lens.min().item())
 
-        # append drafted positions to buffer
+        # append only accepted prefix (+1 mismatch token) to buffer
         va_list = verify_argmax.detach().cpu().tolist()
-        rw_list = rewards.detach().cpu().tolist()
         for b in range(B):
-            for d in range(k):
-                with torch.inference_mode(False):          # leave inference mode
-                    hidden  = hidden_seq[b, d].detach().clone().cpu()
+            m = int(prefix_lens[b].item())
+            kept = m + (1 if m < k else 0)
+            for d in range(m):
+                with torch.inference_mode(False):
+                    hidden = hidden_seq[b, d].detach().clone().cpu()
                     vlogits = deep_logits[b, d].detach().clone().cpu()
                 buf.append(
                     hidden=hidden,
                     token=int(va_list[b][d]),
-                    reward=float(rw_list[b][d]),
+                    reward=1.0,
                     conf=0.0,
                     vlogits=vlogits,
                 )
-
-        n_collected += B * k
+            if m < k:
+                d = m
+                with torch.inference_mode(False):
+                    hidden = hidden_seq[b, d].detach().clone().cpu()
+                    vlogits = deep_logits[b, d].detach().clone().cpu()
+                buf.append(
+                    hidden=hidden,
+                    token=int(va_list[b][d]),
+                    reward=0.0,
+                    conf=0.0,
+                    vlogits=vlogits,
+                )
+            n_collected += kept
 
         if debug_out is not None:
             try:

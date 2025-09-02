@@ -50,6 +50,8 @@ from training.logging import (
 )
 from training.buffer import ReplayBuffer
 from evaluation.acceptance import eval_acceptance
+from training.spec_decode import generate_with_dvi_spec
+import random
 
 
 def train_bestcase_kl_rl(model, tok, prompts_train: List[str], prompts_eval: List[str],
@@ -69,6 +71,7 @@ def train_bestcase_kl_rl(model, tok, prompts_train: List[str], prompts_eval: Lis
                         ce_mask_by_reward: bool = False,
                         kl_warmup_scale: float = 1.0,
                         eval_k_max: int = None,
+                        timing_greedy: bool = False,
                         ):
     metrics_path = os.path.join(outdir, "logs", "train_metrics.jsonl")
     samples_path = os.path.join(outdir, "logs", "rollout_samples.jsonl")
@@ -288,6 +291,29 @@ def train_bestcase_kl_rl(model, tok, prompts_train: List[str], prompts_eval: Lis
                 log_mid[f"eval/mid/ctar{w}"] = ctar_mid.get(w, 0)
             wandb_log(log_mid, step=g + 1)
 
+            # ----- runtime-style evaluation (free-running) -----
+            rt_prompts = random.sample(prompts_eval, k=min(16, len(prompts_eval)))
+            _, rt_metrics = generate_with_dvi_spec(
+                model,
+                tok,
+                prompts=rt_prompts,
+                max_new_tokens=32,
+                draft_k=train_k_spec,
+                greedy=timing_greedy,
+                temperature=temperature if not timing_greedy else max(1e-6, temperature),
+                early_layer=early_layer,
+                quiet=True,
+            )
+            rt_dict = rt_metrics.to_dict()
+            wandb_log({f"eval/runtime/{k}": v for k, v in rt_dict.items()}, step=g + 1)
+            hist_msg = " ".join(
+                [f"{k.split('_')[-1]}={int(v)}" for k, v in rt_dict.items() if k.startswith("spec/prefix_hist_")]
+            )
+            print(
+                f"[eval/runtime] step {g+1:04d} acc_rate={rt_dict.get('spec/accept_rate',0.0):.3f} {hist_msg}",
+                flush=True,
+            )
+
     del opt
     del buf
     free_cuda("(pre post-train eval)")
@@ -442,6 +468,7 @@ def main():
         ce_mask_by_reward=args.ce_mask_by_reward,
         kl_warmup_scale=args.kl_warmup_scale,
         eval_k_max=args.eval_k_max,
+        timing_greedy=args.timing_greedy,
     )
     deep_kv_purge(model)
     gc.collect()
@@ -542,6 +569,9 @@ def main():
         "comp/runtime_est": comp_rt,
         "comp/theoretical_from_train": comp_train,
     }
+    for k, v in spec_metrics.items():
+        if k.startswith("spec/prefix_hist_") or k == "spec/steps":
+            final_metrics[k] = v
     wandb_log(final_metrics, step=args.steps)
     wandb_summary_update(final_metrics)
 

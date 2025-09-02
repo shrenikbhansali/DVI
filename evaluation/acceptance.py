@@ -34,6 +34,13 @@ def eval_acceptance(spec: EarlyExitLlamaForCausalLM, tok, prompts: List[str],
                    rollout_len: int, steps_per_prompt: int = 1,
                    dump_debug: bool = False, dump_path: Optional[str] = None, topk: int = 5,
                    quiet: bool = False, k_max: int = 4) -> Tuple[float, Dict[int, float]]:
+    """Compute teacher-forced cross-token acceptance rates (CTAR).
+
+    Draft and verifier logits are compared greedily (argmax) under teacher
+    forcing—the verifier's top-1 token is always fed as the next input.
+    Because runtime speculative decoding requires the entire drafted prefix to
+    survive, these CTARs can overestimate block-level acceptance for k>1.
+    """
     global _KV_WARN_COUNT
     spec.eval()
     dev = next(spec.parameters()).device
