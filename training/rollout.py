@@ -11,7 +11,6 @@ from training.modeling import (
     exit_logits_from_hidden_k,
     adapter_guard,
 )
-from training.kv import advance_kv_with_committed
 from training.sampling import sample_from_logits
 from training.align_telemetry import AlignLogger, AlignTelemetryParams
 
@@ -162,18 +161,19 @@ def rollout_collect_k_spec(
         for b in range(B):
             m = int(prefix_lens[b].item())
             if m == k:
-                d = k - 1
-                with torch.inference_mode(False):
-                    hidden = hidden_seq[b, d].detach().clone().cpu()
-                    vlogits = deep_logits[b, d].detach().clone().cpu()
-                buf.append(
-                    hidden=hidden,
-                    token=int(va_list[b][d]),
-                    reward=1.0,
-                    conf=0.0,
-                    vlogits=vlogits,
-                )
-                kept = 1
+                # verifier accepted all k tokens – record each one
+                for d in range(k):
+                    with torch.inference_mode(False):
+                        hidden = hidden_seq[b, d].detach().clone().cpu()
+                        vlogits = deep_logits[b, d].detach().clone().cpu()
+                    buf.append(
+                        hidden=hidden,
+                        token=int(va_list[b][d]),
+                        reward=1.0,
+                        conf=0.0,
+                        vlogits=vlogits,
+                    )
+                kept = k
             else:
                 for d in range(m):
                     with torch.inference_mode(False):
@@ -235,8 +235,36 @@ def rollout_collect_k_spec(
             last_tokens = accepted_block[:, -1]
         else:
             mismatch_tok = deep_argmax[:, 0]
-            advance_kv_with_committed(spec, mismatch_tok.unsqueeze(1))
+            # Advance caches with the committed verifier token keeping local
+            # ``shallow_past``/``deep_past`` in sync.
+            with adapter_guard(spec, "draft"):
+                h_fix, shallow_past = run_shallow_until_k(
+                    spec,
+                    input_ids=mismatch_tok.unsqueeze(1),
+                    past_key_values=shallow_past,
+                    attention_mask=None,
+                    use_cache=True,
+                )
+            with adapter_guard(spec, "verify"), torch.no_grad():
+                _, deep_past = run_deep_from_k(
+                    spec,
+                    hidden_k=h_fix,
+                    past_key_values=deep_past,
+                    use_cache=True,
+                )
             last_tokens = mismatch_tok
+
+        # persist cache state back onto the model for external observers
+        combined_past = tuple(list(shallow_past) + list(deep_past))
+        try:
+            spec.past_key_values = combined_past
+        except Exception:
+            pass
+        try:
+            if hasattr(spec, "model"):
+                spec.model.past_key_values = combined_past
+        except Exception:
+            pass
 
         kv_len_shallow = logger.kv_len_from_past(shallow_past)
         kv_len_deep = logger.kv_len_from_past(deep_past)

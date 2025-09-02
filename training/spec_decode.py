@@ -151,6 +151,21 @@ def generate_with_dvi_spec(
             past_key_values=None,
             use_cache=True,
         )
+    # Persist primed KV caches back onto the model so that external helpers
+    # (e.g. ``estimate_kv_cache``) can observe the prompt state.  The
+    # speculative path keeps its own local copies (``shallow_past`` and
+    # ``deep_past``) but the model itself held ``None`` previously, causing
+    # callers to believe the cache was empty.
+    combined_past = tuple(list(shallow_past) + list(deep_past))
+    try:
+        model.past_key_values = combined_past
+    except Exception:
+        pass
+    try:
+        if hasattr(model, "model"):
+            model.model.past_key_values = combined_past
+    except Exception:
+        pass
 
     logger = AlignLogger(telemetry)
     kv_len_shallow = logger.kv_len_from_past(shallow_past)
@@ -260,6 +275,17 @@ def generate_with_dvi_spec(
             last_tokens = accepted_block[:, -1]
             total_new += accept_len
             metrics.committed += int(B * accept_len)
+            # persist updated KV cache back to model
+            combined_past = tuple(list(shallow_past) + list(deep_past))
+            try:
+                model.past_key_values = combined_past
+            except Exception:
+                pass
+            try:
+                if hasattr(model, "model"):
+                    model.model.past_key_values = combined_past
+            except Exception:
+                pass
         else:
             v1 = deep_argmax[:, 0]
             for b in range(B):
@@ -282,6 +308,16 @@ def generate_with_dvi_spec(
                 )
             total_new += 1
             metrics.committed += int(B)
+            combined_past = tuple(list(shallow_past) + list(deep_past))
+            try:
+                model.past_key_values = combined_past
+            except Exception:
+                pass
+            try:
+                if hasattr(model, "model"):
+                    model.model.past_key_values = combined_past
+            except Exception:
+                pass
 
         kv_len_shallow = logger.kv_len_from_past(shallow_past)
         kv_len_deep = logger.kv_len_from_past(deep_past)
