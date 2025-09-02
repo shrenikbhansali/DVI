@@ -11,7 +11,7 @@ from training.modeling import (
     exit_logits_from_hidden_k,
     adapter_guard,
 )
-from training.kv import advance_kv_with_committed
+from training.kv import advance_kv_with_committed, persist_kv_cache
 from training.sampling import sample_from_logits
 from training.align_telemetry import AlignLogger, AlignTelemetryParams
 
@@ -75,6 +75,8 @@ def rollout_collect_k_spec(
         _, deep_past = run_deep_from_k(
             spec, hidden_k=h_k_prompt, past_key_values=None, use_cache=True
         )
+    persist_kv_cache(spec, shallow_past, deep_past)
+    split_idx = len(shallow_past)
     logger = AlignLogger(telemetry)
     kv_len_shallow = logger.kv_len_from_past(shallow_past)
     kv_len_deep = logger.kv_len_from_past(deep_past)
@@ -162,18 +164,18 @@ def rollout_collect_k_spec(
         for b in range(B):
             m = int(prefix_lens[b].item())
             if m == k:
-                d = k - 1
                 with torch.inference_mode(False):
-                    hidden = hidden_seq[b, d].detach().clone().cpu()
-                    vlogits = deep_logits[b, d].detach().clone().cpu()
-                buf.append(
-                    hidden=hidden,
-                    token=int(va_list[b][d]),
-                    reward=1.0,
-                    conf=0.0,
-                    vlogits=vlogits,
-                )
-                kept = 1
+                    for d in range(k):
+                        hidden = hidden_seq[b, d].detach().clone().cpu()
+                        vlogits = deep_logits[b, d].detach().clone().cpu()
+                        buf.append(
+                            hidden=hidden,
+                            token=int(va_list[b][d]),
+                            reward=1.0,
+                            conf=0.0,
+                            vlogits=vlogits,
+                        )
+                kept = k
             else:
                 for d in range(m):
                     with torch.inference_mode(False):
@@ -233,9 +235,21 @@ def rollout_collect_k_spec(
                 new_deep.append((ks, vs))
             deep_past = tuple(new_deep)
             last_tokens = accepted_block[:, -1]
+            persist_kv_cache(spec, shallow_past, deep_past)
         else:
             mismatch_tok = deep_argmax[:, 0]
             advance_kv_with_committed(spec, mismatch_tok.unsqueeze(1))
+            pkv = getattr(spec, "past_key_values", None)
+            if pkv is None:
+                pkv = getattr(getattr(spec, "model", None), "past_key_values", None)
+            if pkv is not None:
+                shallow_past = tuple(
+                    (k_.contiguous().clone(), v_.contiguous().clone()) for (k_, v_) in pkv[:split_idx]
+                )
+                deep_past = tuple(
+                    (k_.contiguous().clone(), v_.contiguous().clone()) for (k_, v_) in pkv[split_idx:]
+                )
+            persist_kv_cache(spec, shallow_past, deep_past)
             last_tokens = mismatch_tok
 
         kv_len_shallow = logger.kv_len_from_past(shallow_past)

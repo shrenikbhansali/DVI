@@ -12,7 +12,7 @@ from .modeling import (
 from .sampling import sample_from_logits
 from .utils import theoretical_compression, count_transformer_layers
 from .mem import timing_trace  # kept for compatibility
-from .kv import clear_all_kv, prime_kv_full, advance_kv_with_committed
+from .kv import clear_all_kv, prime_kv_full, advance_kv_with_committed, persist_kv_cache
 from .align_telemetry import AlignLogger, AlignTelemetryParams
 
 
@@ -151,6 +151,7 @@ def generate_with_dvi_spec(
             past_key_values=None,
             use_cache=True,
         )
+    persist_kv_cache(model, shallow_past, deep_past)
 
     logger = AlignLogger(telemetry)
     kv_len_shallow = logger.kv_len_from_past(shallow_past)
@@ -260,6 +261,7 @@ def generate_with_dvi_spec(
             last_tokens = accepted_block[:, -1]
             total_new += accept_len
             metrics.committed += int(B * accept_len)
+            persist_kv_cache(model, shallow_past, deep_past)
         else:
             v1 = deep_argmax[:, 0]
             for b in range(B):
@@ -282,6 +284,7 @@ def generate_with_dvi_spec(
                 )
             total_new += 1
             metrics.committed += int(B)
+            persist_kv_cache(model, shallow_past, deep_past)
 
         kv_len_shallow = logger.kv_len_from_past(shallow_past)
         kv_len_deep = logger.kv_len_from_past(deep_past)
@@ -328,4 +331,5 @@ def generate_with_dvi_spec(
     metrics.comp_ratio_runtime_est = comp_ratio
 
     outputs = [torch.tensor(seq, device=device, dtype=torch.long) for seq in generated]
+    persist_kv_cache(model, shallow_past, deep_past)
     return outputs, metrics

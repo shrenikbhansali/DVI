@@ -19,6 +19,7 @@ __all__ = [
     "clear_all_kv",
     "prime_kv_full",
     "advance_kv_with_committed",
+    "persist_kv_cache",
     "drafter_hidden_no_cache",
 ]
 
@@ -108,6 +109,28 @@ def advance_kv_with_committed(spec: EarlyExitLlamaForCausalLM, token_ids: torch.
         h = spec.forward_draft_or_large_model(in_tokens_small=token_ids)
     with adapter_guard(spec, "verify"):
         _ , _ = spec.forward_draft_or_large_model(in_features_large=h)
+
+
+def persist_kv_cache(
+    spec: EarlyExitLlamaForCausalLM,
+    shallow_past: Optional[Tuple],
+    deep_past: Optional[Tuple],
+) -> None:
+    """Write concatenated ``shallow_past`` and ``deep_past`` back to ``spec``.
+
+    This keeps ``spec.past_key_values`` and the underlying ``spec.model`` cache
+    in sync with externally managed KV tuples.
+    """
+    if shallow_past is None and deep_past is None:
+        return
+    combined = tuple(list(shallow_past or []) + list(deep_past or []))
+    for obj in (spec, getattr(spec, "model", None)):
+        if obj is None:
+            continue
+        try:
+            obj.past_key_values = combined
+        except Exception:
+            pass
 
 
 @torch.no_grad()
