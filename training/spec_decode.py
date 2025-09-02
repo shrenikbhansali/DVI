@@ -152,20 +152,21 @@ def generate_with_dvi_spec(
             use_cache=True,
         )
     # Persist primed KV caches back onto the model so that external helpers
-    # (e.g. ``estimate_kv_cache``) can observe the prompt state.  The
-    # speculative path keeps its own local copies (``shallow_past`` and
-    # ``deep_past``) but the model itself held ``None`` previously, causing
-    # callers to believe the cache was empty.
-    combined_past = tuple(list(shallow_past) + list(deep_past))
-    try:
-        model.past_key_values = combined_past
-    except Exception:
-        pass
-    try:
-        if hasattr(model, "model"):
-            model.model.past_key_values = combined_past
-    except Exception:
-        pass
+    # (e.g. ``estimate_kv_cache``) can observe the prompt state.
+    sp = tuple(shallow_past) if shallow_past is not None else tuple()
+    dp = tuple(deep_past) if deep_past is not None else tuple()
+    if sp or dp:
+        combined_past = sp + dp
+        try:
+            model.past_key_values = combined_past
+        except Exception:
+            pass
+        try:
+            if hasattr(model, "model"):
+                model.model.past_key_values = combined_past
+        except Exception:
+            pass
+
 
     logger = AlignLogger(telemetry)
     kv_len_shallow = logger.kv_len_from_past(shallow_past)
@@ -276,16 +277,19 @@ def generate_with_dvi_spec(
             total_new += accept_len
             metrics.committed += int(B * accept_len)
             # persist updated KV cache back to model
-            combined_past = tuple(list(shallow_past) + list(deep_past))
-            try:
-                model.past_key_values = combined_past
-            except Exception:
-                pass
-            try:
-                if hasattr(model, "model"):
-                    model.model.past_key_values = combined_past
-            except Exception:
-                pass
+            sp = tuple(shallow_past) if shallow_past is not None else tuple()
+            dp = tuple(deep_past) if deep_past is not None else tuple()
+            if sp or dp:
+                combined_past = sp + dp
+                try:
+                    model.past_key_values = combined_past
+                except Exception:
+                    pass
+                try:
+                    if hasattr(model, "model"):
+                        model.model.past_key_values = combined_past
+                except Exception:
+                    pass
         else:
             v1 = deep_argmax[:, 0]
             for b in range(B):
@@ -308,16 +312,19 @@ def generate_with_dvi_spec(
                 )
             total_new += 1
             metrics.committed += int(B)
-            combined_past = tuple(list(shallow_past) + list(deep_past))
-            try:
-                model.past_key_values = combined_past
-            except Exception:
-                pass
-            try:
-                if hasattr(model, "model"):
-                    model.model.past_key_values = combined_past
-            except Exception:
-                pass
+            sp = tuple(shallow_past) if shallow_past is not None else tuple()
+            dp = tuple(deep_past) if deep_past is not None else tuple()
+            if sp or dp:
+                combined_past = sp + dp
+                try:
+                    model.past_key_values = combined_past
+                except Exception:
+                    pass
+                try:
+                    if hasattr(model, "model"):
+                        model.model.past_key_values = combined_past
+                except Exception:
+                    pass
 
         kv_len_shallow = logger.kv_len_from_past(shallow_past)
         kv_len_deep = logger.kv_len_from_past(deep_past)
@@ -364,4 +371,14 @@ def generate_with_dvi_spec(
     metrics.comp_ratio_runtime_est = comp_ratio
 
     outputs = [torch.tensor(seq, device=device, dtype=torch.long) for seq in generated]
+    # final persist (guard against None)
+    sp = tuple(shallow_past) if shallow_past is not None else tuple()
+    dp = tuple(deep_past) if deep_past is not None else tuple()
+    if sp or dp:
+        try:
+            model.past_key_values = sp + dp
+            if hasattr(model, "model"):
+                model.model.past_key_values = sp + dp
+        except Exception:
+            pass
     return outputs, metrics

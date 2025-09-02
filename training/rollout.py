@@ -1,3 +1,4 @@
+# training/rollout.py
 """Rollout utilities and buffer debug helpers."""
 from typing import List, Dict, Optional
 
@@ -12,15 +13,22 @@ from training.modeling import (
     adapter_guard,
 )
 from training.sampling import sample_from_logits
+from training.kv import advance_kv_with_committed
 from training.align_telemetry import AlignLogger, AlignTelemetryParams
 
 __all__ = ["rollout_collect", "rollout_collect_k_spec", "buf_debug"]
 
 
 @torch.no_grad()
-def rollout_collect(spec, tok, prompt: str,
-                    buf: ReplayBuffer, steps: int,
-                    debug_out: Optional[List[Dict]] = None, topk: int = 5) -> int:
+def rollout_collect(
+    spec,
+    tok,
+    prompt: str,
+    buf: ReplayBuffer,
+    steps: int,
+    debug_out: Optional[List[Dict]] = None,
+    topk: int = 5,
+) -> int:
     """Legacy single-token rollout forwarded to k-spec path."""
     return rollout_collect_k_spec(
         spec,
@@ -53,8 +61,8 @@ def rollout_collect_k_spec(
 ) -> int:
     """Collect rollouts using k-token speculative drafting.
 
-    This mirrors ``training/spec_decode.generate_with_dvi_spec`` but instead of
-    generating text it pushes per-token records into ``buf`` for training.
+    Mirrors ``training/spec_decode.generate_with_dvi_spec`` but instead of
+    generating text, pushes per-token records into ``buf`` for training.
     """
 
     spec.eval()
@@ -70,10 +78,28 @@ def rollout_collect_k_spec(
         h_k_prompt, shallow_past = run_shallow_until_k(
             spec, input_ids=input_ids, attention_mask=attn_mask, past_key_values=None, use_cache=True
         )
-    with adapter_guard(spec, "verify"), torch.no_grad():
+    with adapter_guard(spec, "verify"):
         _, deep_past = run_deep_from_k(
             spec, hidden_k=h_k_prompt, past_key_values=None, use_cache=True
         )
+
+    # Persist primed caches back onto the model (guarding None)
+    sp = tuple(shallow_past) if shallow_past is not None else tuple()
+    dp = tuple(deep_past) if deep_past is not None else tuple()
+    if sp or dp:
+        combined = sp + dp
+        try:
+            spec.past_key_values = combined
+        except Exception:
+            pass
+        try:
+            if hasattr(spec, "model"):
+                spec.model.past_key_values = combined
+        except Exception:
+            pass
+    # Boundary between shallow/deep slices in PKV
+    split_idx = len(sp)
+
     logger = AlignLogger(telemetry)
     kv_len_shallow = logger.kv_len_from_past(shallow_past)
     kv_len_deep = logger.kv_len_from_past(deep_past)
@@ -96,6 +122,8 @@ def rollout_collect_k_spec(
         tmp_shallow = shallow_past
         prev = last_tokens
         shallow_snaps = []
+
+        # ---- draft k tokens ----
         for _ in range(k):
             with adapter_guard(spec, "draft"):
                 h_k, tmp_shallow = run_shallow_until_k(
@@ -112,13 +140,14 @@ def rollout_collect_k_spec(
             shallow_snaps.append(tmp_shallow)
             prev = nxt
 
-        prop_seq = torch.stack(draft_tokens, dim=1)
-        hidden_seq = torch.stack(draft_hidden, dim=1)
+        prop_seq = torch.stack(draft_tokens, dim=1)     # [B,k]
+        hidden_seq = torch.stack(draft_hidden, dim=1)   # [B,k,H]
 
         kv_len_shallow_before = kv_len_shallow
         kv_len_deep_before = kv_len_deep
 
-        with adapter_guard(spec, "verify"), torch.no_grad():
+        # ---- verify entire block ----
+        with adapter_guard(spec, "verify"):
             deep_logits, deep_past_full = run_deep_from_k(
                 spec, hidden_k=hidden_seq, past_key_values=deep_past, use_cache=True
             )
@@ -131,6 +160,7 @@ def rollout_collect_k_spec(
             deep_argmax = deep_logits.argmax(dim=-1)
             matches0 = deep_argmax.eq(prop_seq)
 
+        # Unshifted prefix lengths (for BUFFERING!)
         all_matched0 = matches0.all(dim=1)
         first_mismatch0 = (~matches0).float().argmax(dim=1)
         prefix_lens0 = torch.where(
@@ -138,9 +168,8 @@ def rollout_collect_k_spec(
         )
         accept_len_default = int(prefix_lens0.min().item())
 
+        # Possibly enable auto-offset for COMMIT length only
         accept_len = accept_len_default
-        prefix_lens = prefix_lens0
-
         if logger.cfg.auto_offset > 0 and deep_argmax.size(1) > 1:
             matches1 = deep_argmax[:, 1:].eq(prop_seq[:, :-1])
             all_matched1 = matches1.all(dim=1)
@@ -151,15 +180,14 @@ def rollout_collect_k_spec(
             accept_len_p1 = int(prefix_lens1.min().item())
             if accept_len_p1 > accept_len:
                 accept_len = accept_len_p1
-                prefix_lens = prefix_lens1
 
         if deep_past_full is None and accept_len > 0:
             accept_len = 0
-            prefix_lens = torch.zeros_like(prefix_lens)
 
+        # ---------- BUFFERING (always use prefix_lens0) ----------
         va_list = deep_argmax.detach().cpu().tolist()
         for b in range(B):
-            m = int(prefix_lens[b].item())
+            m = int(prefix_lens0[b].item())  # <-- unshifted
             if m == k:
                 # verifier accepted all k tokens – record each one
                 for d in range(k):
@@ -175,6 +203,7 @@ def rollout_collect_k_spec(
                     )
                 kept = k
             else:
+                # record the accepted prefix (m) and then the mismatch (1)
                 for d in range(m):
                     with torch.inference_mode(False):
                         hidden = hidden_seq[b, d].detach().clone().cpu()
@@ -200,6 +229,7 @@ def rollout_collect_k_spec(
                 kept = m + 1
             n_collected += kept
 
+        # Optional debug payload
         if debug_out is not None:
             try:
                 v_prob, v_id = torch.topk(torch.softmax(deep_logits[0, 0].float(), dim=-1), k=topk)
@@ -215,9 +245,10 @@ def rollout_collect_k_spec(
             except Exception:
                 pass
 
-        # accept common prefix or commit one verifier token on miss
+        # ---- mutate caches: accept common prefix or commit one verifier token on miss ----
         if accept_len > 0:
             accepted_block = prop_seq[:, :accept_len]
+            # Always update shallow cache from snapshot (cheap and precise)
             snap = shallow_snaps[accept_len - 1]
             new_shallow = []
             for (k_, v_) in snap:
@@ -225,46 +256,61 @@ def rollout_collect_k_spec(
                 vs = v_.contiguous().clone()
                 new_shallow.append((ks, vs))
             shallow_past = tuple(new_shallow)
-            past_len_d = deep_past[0][0].shape[2] if deep_past and deep_past[0] is not None else 0
-            new_deep = []
-            for (k_, v_) in deep_past_full:
-                ks = k_[:, :, : past_len_d + accept_len, :].contiguous().clone()
-                vs = v_[:, :, : past_len_d + accept_len, :].contiguous().clone()
-                new_deep.append((ks, vs))
-            deep_past = tuple(new_deep)
+
+            # Deep cache: prefer verifier-provided PKV slice
+            if deep_past_full is not None:
+                past_len_d = deep_past[0][0].shape[2] if deep_past and deep_past[0] is not None else 0
+                new_deep = []
+                for (k_, v_) in deep_past_full:
+                    ks = k_[:, :, : past_len_d + accept_len, :].contiguous().clone()
+                    vs = v_[:, :, : past_len_d + accept_len, :].contiguous().clone()
+                    new_deep.append((ks, vs))
+                deep_past = tuple(new_deep)
+            else:
+                # Fallback: advance via model to keep caches consistent
+                advance_kv_with_committed(spec, accepted_block)
+                pkv = getattr(spec, "past_key_values", None)
+                if pkv is None:
+                    pkv = getattr(getattr(spec, "model", None), "past_key_values", None)
+                if pkv is not None:
+                    shallow_past = tuple(
+                        (k_.contiguous().clone(), v_.contiguous().clone()) for (k_, v_) in pkv[:split_idx]
+                    )
+                    deep_past = tuple(
+                        (k_.contiguous().clone(), v_.contiguous().clone()) for (k_, v_) in pkv[split_idx:]
+                    )
+
             last_tokens = accepted_block[:, -1]
         else:
+            # Commit exactly one verifier token on miss, keeping caches in sync.
             mismatch_tok = deep_argmax[:, 0]
-            # Advance caches with the committed verifier token keeping local
-            # ``shallow_past``/``deep_past`` in sync.
-            with adapter_guard(spec, "draft"):
-                h_fix, shallow_past = run_shallow_until_k(
-                    spec,
-                    input_ids=mismatch_tok.unsqueeze(1),
-                    past_key_values=shallow_past,
-                    attention_mask=None,
-                    use_cache=True,
+            advance_kv_with_committed(spec, mismatch_tok.unsqueeze(1))
+            pkv = getattr(spec, "past_key_values", None)
+            if pkv is None:
+                pkv = getattr(getattr(spec, "model", None), "past_key_values", None)
+            if pkv is not None:
+                shallow_past = tuple(
+                    (k_.contiguous().clone(), v_.contiguous().clone()) for (k_, v_) in pkv[:split_idx]
                 )
-            with adapter_guard(spec, "verify"), torch.no_grad():
-                _, deep_past = run_deep_from_k(
-                    spec,
-                    hidden_k=h_fix,
-                    past_key_values=deep_past,
-                    use_cache=True,
+                deep_past = tuple(
+                    (k_.contiguous().clone(), v_.contiguous().clone()) for (k_, v_) in pkv[split_idx:]
                 )
             last_tokens = mismatch_tok
 
         # persist cache state back onto the model for external observers
-        combined_past = tuple(list(shallow_past) + list(deep_past))
-        try:
-            spec.past_key_values = combined_past
-        except Exception:
-            pass
-        try:
-            if hasattr(spec, "model"):
-                spec.model.past_key_values = combined_past
-        except Exception:
-            pass
+        sp = tuple(shallow_past) if shallow_past is not None else tuple()
+        dp = tuple(deep_past) if deep_past is not None else tuple()
+        if sp or dp:
+            combined_past = sp + dp
+            try:
+                spec.past_key_values = combined_past
+            except Exception:
+                pass
+            try:
+                if hasattr(spec, "model"):
+                    spec.model.past_key_values = combined_past
+            except Exception:
+                pass
 
         kv_len_shallow = logger.kv_len_from_past(shallow_past)
         kv_len_deep = logger.kv_len_from_past(deep_past)
