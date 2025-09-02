@@ -248,18 +248,14 @@ def _ensure_active_adapter(model, name: str) -> None:
         try:
             set_active_adapter(model, alias)
             model._dvi_active_adapter = alias
-            if getattr(model, "_dvi_adapter_debug_printed", None) != alias:
-                print(f"[adapter] active={alias}", flush=True)
-                model._dvi_adapter_debug_printed = alias
+            model._dvi_adapter_debug_printed = alias
             return
         except Exception as e:
             last_err = e
             continue
     # If we couldn't switch, mark None (base weights)
     model._dvi_active_adapter = None
-    if getattr(model, "_dvi_adapter_debug_printed", None) != "NONE":
-        print(f"[adapter] WARNING: could not activate adapter '{name}' (tried {tried}); using base weights", flush=True)
-        model._dvi_adapter_debug_printed = "NONE"
+    model._dvi_adapter_debug_printed = "NONE"
 
 
 def run_shallow_until_k(

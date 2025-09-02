@@ -209,9 +209,15 @@ def generate_with_dvi_spec(
         deep_argmax = deep_logits.argmax(dim=-1)  # [B,k]
         matches0 = deep_argmax.eq(prop_seq)
 
-        all_matched0 = matches0.all(dim=1)
-        first_mismatch0 = (~matches0).float().argmax(dim=1)
-        prefix_lens0 = torch.where(all_matched0, torch.full_like(first_mismatch0, draft_k), first_mismatch0)
+        prefix_lens0 = torch.zeros(B, dtype=torch.long, device=prop_seq.device)
+        for b in range(B):
+            m = 0
+            for j in range(draft_k):
+                if matches0[b, j]:
+                    m += 1
+                else:
+                    break
+            prefix_lens0[b] = m
         counts = torch.bincount(prefix_lens0.to(dtype=torch.long, device="cpu"), minlength=draft_k + 1)
         for i in range(draft_k + 1):
             metrics.prefix_hist[i] += int(counts[i])
@@ -221,16 +227,20 @@ def generate_with_dvi_spec(
 
         if logger.cfg.auto_offset > 0 and deep_argmax.size(1) > 1:
             matches1 = deep_argmax[:, 1:].eq(prop_seq[:, :-1])
-            all_matched1 = matches1.all(dim=1)
-            first_mismatch1 = (~matches1).float().argmax(dim=1)
-            prefix_lens1 = torch.where(
-                all_matched1, torch.full_like(first_mismatch1, draft_k - 1), first_mismatch1
-            )
+            prefix_lens1 = torch.zeros(B, dtype=torch.long, device=prop_seq.device)
+            for b in range(B):
+                m = 0
+                for j in range(draft_k - 1):
+                    if matches1[b, j]:
+                        m += 1
+                    else:
+                        break
+                prefix_lens1[b] = m
             accept_len_p1 = int(prefix_lens1.min().item())
             if accept_len_p1 > accept_len:
                 accept_len = accept_len_p1
 
-        metrics.accepted += int(B * accept_len)
+        metrics.accepted += int(B * accept_len_default)
 
         # commit accepted prefix or one verifier token on miss
         if accept_len > 0:
@@ -243,10 +253,11 @@ def generate_with_dvi_spec(
 
             past_len_d = deep_past[0][0].shape[2] if deep_past and deep_past[0] is not None else 0
             new_deep = []
-            for (k_, v_) in deep_past_full:
-                ks = k_[:, :, : past_len_d + accept_len, :].contiguous().clone()
-                vs = v_[:, :, : past_len_d + accept_len, :].contiguous().clone()
-                new_deep.append((ks, vs))
+            if deep_past_full is not None:
+                for (k_, v_) in deep_past_full:
+                    ks = k_[:, :, : past_len_d + accept_len, :].contiguous().clone()
+                    vs = v_[:, :, : past_len_d + accept_len, :].contiguous().clone()
+                    new_deep.append((ks, vs))
             deep_past = tuple(new_deep)
 
             acc_list = accepted_block.tolist()
@@ -255,6 +266,29 @@ def generate_with_dvi_spec(
             last_tokens = accepted_block[:, -1]
             total_new += accept_len
             metrics.committed += int(B * accept_len)
+
+            if accept_len < draft_k:
+                v1 = deep_argmax[:, accept_len]
+                for b in range(B):
+                    generated[b].append(int(v1[b]))
+                last_tokens = v1
+                with adapter_guard(model, "draft"):
+                    h_fix, shallow_past = run_shallow_until_k(
+                        model,
+                        input_ids=v1.unsqueeze(1),
+                        past_key_values=shallow_past,
+                        attention_mask=None,
+                        use_cache=True,
+                    )
+                with adapter_guard(model, "verify"):
+                    _, deep_past = run_deep_from_k(
+                        model,
+                        hidden_k=h_fix,
+                        past_key_values=deep_past,
+                        use_cache=True,
+                    )
+                total_new += 1
+                metrics.committed += int(B)
         else:
             v1 = deep_argmax[:, 0]
             for b in range(B):
