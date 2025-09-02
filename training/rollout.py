@@ -11,7 +11,7 @@ from training.modeling import (
     exit_logits_from_hidden_k,
     adapter_guard,
 )
-from training.kv import advance_kv_with_committed
+from training.kv import advance_kv_with_committed, prime_kv_full
 from training.sampling import sample_from_logits
 from training.align_telemetry import AlignLogger, AlignTelemetryParams
 
@@ -67,14 +67,12 @@ def rollout_collect_k_spec(
         attn_mask = attn_mask.to(device)
 
     # --- prime KV caches on the prompt ---
-    with adapter_guard(spec, "draft"):
-        h_k_prompt, shallow_past = run_shallow_until_k(
-            spec, input_ids=input_ids, attention_mask=attn_mask, past_key_values=None, use_cache=True
-        )
-    with adapter_guard(spec, "verify"), torch.no_grad():
-        _, deep_past = run_deep_from_k(
-            spec, hidden_k=h_k_prompt, past_key_values=None, use_cache=True
-        )
+    prime_kv_full(spec, input_ids)
+    pkv_all = getattr(spec, "past_key_values", None)
+    if pkv_all is None:
+        pkv_all = getattr(getattr(spec, "model", None), "past_key_values", [])
+    shallow_past = tuple(pkv_all[:k])
+    deep_past = tuple(pkv_all[k:])
     logger = AlignLogger(telemetry)
     kv_len_shallow = logger.kv_len_from_past(shallow_past)
     kv_len_deep = logger.kv_len_from_past(deep_past)
@@ -233,10 +231,19 @@ def rollout_collect_k_spec(
                 new_deep.append((ks, vs))
             deep_past = tuple(new_deep)
             last_tokens = accepted_block[:, -1]
+            try:
+                spec.past_key_values = tuple(list(shallow_past) + list(deep_past))
+            except Exception:
+                pass
         else:
             mismatch_tok = deep_argmax[:, 0]
             advance_kv_with_committed(spec, mismatch_tok.unsqueeze(1))
             last_tokens = mismatch_tok
+            pkv_all = getattr(spec, "past_key_values", None)
+            if pkv_all is None:
+                pkv_all = getattr(getattr(spec, "model", None), "past_key_values", [])
+            shallow_past = tuple(pkv_all[:k])
+            deep_past = tuple(pkv_all[k:])
 
         kv_len_shallow = logger.kv_len_from_past(shallow_past)
         kv_len_deep = logger.kv_len_from_past(deep_past)

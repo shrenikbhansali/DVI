@@ -135,22 +135,17 @@ def generate_with_dvi_spec(
 
     generated: List[List[int]] = [[] for _ in range(B)]
 
-    # Prime KV caches on the prompt (strict adapter separation)
-    with adapter_guard(model, "draft"):
-        h_k_prompt, shallow_past = run_shallow_until_k(
-            model,
-            input_ids=input_ids,
-            attention_mask=attn_mask,
-            past_key_values=None,
-            use_cache=True,
-        )
-    with adapter_guard(model, "verify"):
-        _, deep_past = run_deep_from_k(
-            model,
-            hidden_k=h_k_prompt,
-            past_key_values=None,
-            use_cache=True,
-        )
+    # Prime KV caches on the prompt so that model.past_key_values reflects
+    # the committed prefix.  ``prime_kv_full`` handles adapter separation
+    # internally and fills the cache for all layers.  We then split this
+    # combined cache into the shallow (draft) and deep (verifier) portions
+    # used for subsequent speculative steps.
+    prime_kv_full(model, input_ids)
+    pkv_all = getattr(model, "past_key_values", None)
+    if pkv_all is None:
+        pkv_all = getattr(getattr(model, "model", None), "past_key_values", [])
+    shallow_past = tuple(pkv_all[:k])
+    deep_past = tuple(pkv_all[k:])
 
     logger = AlignLogger(telemetry)
     kv_len_shallow = logger.kv_len_from_past(shallow_past)
@@ -260,6 +255,11 @@ def generate_with_dvi_spec(
             last_tokens = accepted_block[:, -1]
             total_new += accept_len
             metrics.committed += int(B * accept_len)
+            # mirror committed cache to model for external introspection
+            try:
+                model.past_key_values = tuple(list(shallow_past) + list(deep_past))
+            except Exception:
+                pass
         else:
             v1 = deep_argmax[:, 0]
             for b in range(B):
@@ -282,6 +282,10 @@ def generate_with_dvi_spec(
                 )
             total_new += 1
             metrics.committed += int(B)
+            try:
+                model.past_key_values = tuple(list(shallow_past) + list(deep_past))
+            except Exception:
+                pass
 
         kv_len_shallow = logger.kv_len_from_past(shallow_past)
         kv_len_deep = logger.kv_len_from_past(deep_past)
