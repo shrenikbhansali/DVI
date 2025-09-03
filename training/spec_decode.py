@@ -151,6 +151,22 @@ def generate_with_dvi_spec(
             past_key_values=None,
             use_cache=True,
         )
+    # Persist primed KV caches back onto the model so that external helpers
+    # (e.g. ``estimate_kv_cache``) can observe the prompt state.
+    sp = tuple(shallow_past) if shallow_past is not None else tuple()
+    dp = tuple(deep_past) if deep_past is not None else tuple()
+    if sp or dp:
+        combined_past = sp + dp
+        try:
+            model.past_key_values = combined_past
+        except Exception:
+            pass
+        try:
+            if hasattr(model, "model"):
+                model.model.past_key_values = combined_past
+        except Exception:
+            pass
+
 
     logger = AlignLogger(telemetry)
     kv_len_shallow = logger.kv_len_from_past(shallow_past)
@@ -260,6 +276,20 @@ def generate_with_dvi_spec(
             last_tokens = accepted_block[:, -1]
             total_new += accept_len
             metrics.committed += int(B * accept_len)
+            # persist updated KV cache back to model
+            sp = tuple(shallow_past) if shallow_past is not None else tuple()
+            dp = tuple(deep_past) if deep_past is not None else tuple()
+            if sp or dp:
+                combined_past = sp + dp
+                try:
+                    model.past_key_values = combined_past
+                except Exception:
+                    pass
+                try:
+                    if hasattr(model, "model"):
+                        model.model.past_key_values = combined_past
+                except Exception:
+                    pass
         else:
             v1 = deep_argmax[:, 0]
             for b in range(B):
@@ -282,6 +312,19 @@ def generate_with_dvi_spec(
                 )
             total_new += 1
             metrics.committed += int(B)
+            sp = tuple(shallow_past) if shallow_past is not None else tuple()
+            dp = tuple(deep_past) if deep_past is not None else tuple()
+            if sp or dp:
+                combined_past = sp + dp
+                try:
+                    model.past_key_values = combined_past
+                except Exception:
+                    pass
+                try:
+                    if hasattr(model, "model"):
+                        model.model.past_key_values = combined_past
+                except Exception:
+                    pass
 
         kv_len_shallow = logger.kv_len_from_past(shallow_past)
         kv_len_deep = logger.kv_len_from_past(deep_past)
@@ -328,4 +371,14 @@ def generate_with_dvi_spec(
     metrics.comp_ratio_runtime_est = comp_ratio
 
     outputs = [torch.tensor(seq, device=device, dtype=torch.long) for seq in generated]
+    # final persist (guard against None)
+    sp = tuple(shallow_past) if shallow_past is not None else tuple()
+    dp = tuple(deep_past) if deep_past is not None else tuple()
+    if sp or dp:
+        try:
+            model.past_key_values = sp + dp
+            if hasattr(model, "model"):
+                model.model.past_key_values = sp + dp
+        except Exception:
+            pass
     return outputs, metrics
