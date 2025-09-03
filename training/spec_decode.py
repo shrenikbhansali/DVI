@@ -151,6 +151,7 @@ def generate_with_dvi_spec(
             past_key_values=None,
             use_cache=True,
         )
+
     # Persist primed KV caches back onto the model so that external helpers
     # (e.g. ``estimate_kv_cache``) can observe the prompt state.
     sp = tuple(shallow_past) if shallow_past is not None else tuple()
@@ -167,6 +168,8 @@ def generate_with_dvi_spec(
         except Exception:
             pass
 
+    # Remember boundary to split PKV back into shallow/deep if we have to
+    split_idx = len(sp)
 
     logger = AlignLogger(telemetry)
     kv_len_shallow = logger.kv_len_from_past(shallow_past)
@@ -248,27 +251,42 @@ def generate_with_dvi_spec(
             if accept_len_p1 > accept_len:
                 accept_len = accept_len_p1
 
-        if deep_past_full is None and accept_len > 0:
-            accept_len = 0
-
+        # IMPORTANT: do NOT zero accept_len if deep_past_full is None.
+        # We will commit accepted tokens via the model as a fallback.
         metrics.accepted += int(B * accept_len)
 
         # commit accepted prefix or one verifier token on miss
         if accept_len > 0:
             accepted_block = prop_seq[:, :accept_len]
+            # Shallow cache: restore from snapshot
             snap = shallow_snapshots[accept_len - 1]
             new_shallow = []
             for (k_, v_) in snap:
                 new_shallow.append((k_.contiguous().clone(), v_.contiguous().clone()))
             shallow_past = tuple(new_shallow)
 
-            past_len_d = deep_past[0][0].shape[2] if deep_past and deep_past[0] is not None else 0
-            new_deep = []
-            for (k_, v_) in deep_past_full:
-                ks = k_[:, :, : past_len_d + accept_len, :].contiguous().clone()
-                vs = v_[:, :, : past_len_d + accept_len, :].contiguous().clone()
-                new_deep.append((ks, vs))
-            deep_past = tuple(new_deep)
+            if deep_past_full is not None:
+                # Fast path: slice verifier PKV
+                past_len_d = deep_past[0][0].shape[2] if deep_past and deep_past[0] is not None else 0
+                new_deep = []
+                for (k_, v_) in deep_past_full:
+                    ks = k_[:, :, : past_len_d + accept_len, :].contiguous().clone()
+                    vs = v_[:, :, : past_len_d + accept_len, :].contiguous().clone()
+                    new_deep.append((ks, vs))
+                deep_past = tuple(new_deep)
+            else:
+                # Fallback: commit accepted tokens through the model to advance both caches
+                advance_kv_with_committed(model, accepted_block)
+                pkv = getattr(model, "past_key_values", None)
+                if pkv is None and hasattr(model, "model"):
+                    pkv = getattr(model.model, "past_key_values", None)
+                if pkv is not None:
+                    shallow_past = tuple(
+                        (k_.contiguous().clone(), v_.contiguous().clone()) for (k_, v_) in pkv[:split_idx]
+                    )
+                    deep_past = tuple(
+                        (k_.contiguous().clone(), v_.contiguous().clone()) for (k_, v_) in pkv[split_idx:]
+                    )
 
             acc_list = accepted_block.tolist()
             for b in range(B):
@@ -276,6 +294,7 @@ def generate_with_dvi_spec(
             last_tokens = accepted_block[:, -1]
             total_new += accept_len
             metrics.committed += int(B * accept_len)
+
             # persist updated KV cache back to model
             sp = tuple(shallow_past) if shallow_past is not None else tuple()
             dp = tuple(deep_past) if deep_past is not None else tuple()
@@ -291,6 +310,7 @@ def generate_with_dvi_spec(
                 except Exception:
                     pass
         else:
+            # commit exactly one verifier token on miss
             v1 = deep_argmax[:, 0]
             for b in range(B):
                 generated[b].append(int(v1[b]))
