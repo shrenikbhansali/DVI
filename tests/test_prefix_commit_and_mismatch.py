@@ -35,11 +35,19 @@ def test_prefix_and_mismatch_path_runs_and_logs():
     m = build_toy_controlled()
     if not hasattr(m.model, "_prepare_decoder_attention_mask"):
         import pytest
-
         pytest.skip("missing attention mask helper")
+
     tok = DummyTok()
     buf = ReplayBuffer(capacity=64, device=torch.device("cpu"))
-    n = rollout_collect_k_spec(m, tok, "x", buf, steps=2, k=2, greedy=True)
+
+    # Under token-quota semantics, `steps` is the minimum number of token records
+    # to collect. With k=2 and B=1, steps=4 corresponds to two speculative blocks.
+    n = rollout_collect_k_spec(m, tok, "x", buf, steps=4, k=2, greedy=True)
+
+    # We return the number of token records appended; equals steps when steps is
+    # a multiple of k × batch size.
     assert n == 4
+
     rewards = buf._reward_buf[: len(buf)]
+    # Make sure at least one drafted position was rejected by the verifier.
     assert (rewards == 0).sum().item() >= 1

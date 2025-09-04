@@ -3,7 +3,6 @@ from typing import List, Dict, Optional
 
 import json
 import torch
-from typing import List, Dict, Optional
 
 from training.buffer import ReplayBuffer
 from training.modeling import (
@@ -52,8 +51,30 @@ def rollout_collect_k_spec(
 ) -> int:
     """Collect rollouts using k-token speculative drafting.
 
-    This mirrors ``training/spec_decode.generate_with_dvi_spec`` but instead of
-    generating text it pushes per-token records into ``buf`` for training.
+    Mirrors ``training/spec_decode.generate_with_dvi_spec`` but, instead of
+    generating text, pushes per-token records into ``buf`` for training.
+
+    Semantics:
+        - We draft in blocks; each block proposes `k` tokens per sample.
+        - We always append `k × batch_size` token records to the buffer per block.
+        - We stop when we've appended at least `steps` token records.
+
+    Args:
+        spec: model with shallow/deep paths and exit head.
+        tok: tokenizer (callable returning {"input_ids", ...}).
+        prompt: prompt string for priming caches.
+        buf: ReplayBuffer to receive per-token training records.
+        steps: **Minimum number of token records to collect** (ideally a multiple
+            of `k × batch_size` to avoid overshoot).
+        k: speculative draft length per block per sample.
+        greedy: if True, take argmax from draft logits; else sample.
+        temperature: softmax temperature used when sampling (ignored if greedy).
+        debug_out: optional list to receive per-block debug dicts.
+        topk: how many probs to report in debug_out.
+
+    Returns:
+        int: actual number of token records appended to the buffer.
+             Equals `steps` exactly if `steps` was a multiple of `k × batch_size`.
     """
 
     spec.eval()
@@ -83,14 +104,18 @@ def rollout_collect_k_spec(
     last_tokens = input_ids.gather(1, last_idx.unsqueeze(1)).squeeze(1)
 
     B = input_ids.size(0)
-    n_collected = 0
 
+    n_collected = 0  # number of token records appended so far
+
+    # Stop when we've appended at least `steps` token records
     while n_collected < steps:
         draft_tokens = []
         draft_hidden = []
         tmp_shallow = shallow_past
         prev = last_tokens
         shallow_snaps = []
+
+        # draft k tokens
         for _ in range(k):
             with adapter_guard(spec, "draft"):
                 h_k, tmp_shallow = run_shallow_until_k(
@@ -107,8 +132,8 @@ def rollout_collect_k_spec(
             shallow_snaps.append(tmp_shallow)
             prev = nxt
 
-        prop_seq = torch.stack(draft_tokens, dim=1)
-        hidden_seq = torch.stack(draft_hidden, dim=1)
+        prop_seq = torch.stack(draft_tokens, dim=1)   # [B, k]
+        hidden_seq = torch.stack(draft_hidden, dim=1) # [B, k, H]
 
         with adapter_guard(spec, "verify"), torch.no_grad():
             deep_logits, deep_past_full = run_deep_from_k(
@@ -135,19 +160,17 @@ def rollout_collect_k_spec(
                 )
                 rollout_collect_k_spec._align_prints += 1
 
-        verify_argmax = deep_logits.argmax(dim=-1)         # [B,k]
+        verify_argmax = deep_logits.argmax(dim=-1)  # [B, k]
         matches = verify_argmax.eq(prop_seq)
         rewards = matches.float()
 
         # per-sample accepted prefix length
         all_matched = matches.all(dim=1)
         first_mismatch = (~matches).float().argmax(dim=1)
-        prefix_lens = torch.where(
-            all_matched, torch.full_like(first_mismatch, k), first_mismatch
-        )
+        prefix_lens = torch.where(all_matched, torch.full_like(first_mismatch, k), first_mismatch)
         accept_len = int(prefix_lens.min().item())
 
-        # append drafted positions to buffer
+        # append drafted positions to buffer (all k per sample)
         va_list = verify_argmax.detach().cpu().tolist()
         rw_list = rewards.detach().cpu().tolist()
         for b in range(B):
@@ -162,8 +185,6 @@ def rollout_collect_k_spec(
                     conf=0.0,
                     vlogits=vlogits,
                 )
-
-        n_collected += B * k
 
         if debug_out is not None:
             try:
@@ -215,6 +236,9 @@ def rollout_collect_k_spec(
                     spec, hidden_k=h_fix, past_key_values=deep_past, use_cache=True
                 )
             last_tokens = mismatch_tok
+
+        # completed one block: account for appended records
+        n_collected += B * k
 
     return n_collected
 
