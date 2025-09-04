@@ -51,6 +51,7 @@ from training.logging import (
 from training.buffer import ReplayBuffer
 from evaluation.acceptance import eval_acceptance
 from training.spec_decode import generate_with_dvi_spec
+from training.align_telemetry import AlignTelemetryParams
 import random
 
 
@@ -74,6 +75,7 @@ def train_bestcase_kl_rl(model, tok, prompts_train: List[str], prompts_eval: Lis
                         kl_warmup_scale: float = 1.0,
                         eval_k_max: int = None,
                         timing_greedy: bool = False,
+                        telemetry: AlignTelemetryParams | None = None,
                         ):
     metrics_path = os.path.join(outdir, "logs", "train_metrics.jsonl")
     samples_path = os.path.join(outdir, "logs", "rollout_samples.jsonl")
@@ -136,10 +138,18 @@ def train_bestcase_kl_rl(model, tok, prompts_train: List[str], prompts_eval: Lis
                 temperature=spec_train_temp,
                 debug_out=dbg_roll,
                 topk=debug_topk,
+                telemetry=telemetry,
             )
         else:
             n_collected = rollout_collect(
-                model, tok, p, buf, steps=rollout_len, debug_out=dbg_roll, topk=debug_topk
+                model,
+                tok,
+                p,
+                buf,
+                steps=rollout_len,
+                debug_out=dbg_roll,
+                topk=debug_topk,
+                telemetry=telemetry,
             )
         _cuda_sync()
         t_roll_e = time.perf_counter()
@@ -307,6 +317,7 @@ def train_bestcase_kl_rl(model, tok, prompts_train: List[str], prompts_eval: Lis
                 temperature=temperature if not timing_greedy else max(1e-6, temperature),
                 early_layer=early_layer,
                 quiet=True,
+                telemetry=telemetry,
             )
             rt_dict = rt_metrics.to_dict()
             rt_dict.update({
@@ -417,6 +428,22 @@ def main():
     ap.add_argument("--wandb-project", type=str, default=WANDB_DEFAULT_PROJECT)
     ap.add_argument("--run-name", type=str, default=None)
     ap.add_argument("--quiet-eval", action="store_true")
+    ap.add_argument("--telemetry-debug", type=int, default=0,
+                    help=">0: concise per-block diagnostics to stdout.")
+    ap.add_argument("--telemetry-prints-budget", type=int, default=3,
+                    help="Max telemetry lines printed to stdout.")
+    ap.add_argument("--telemetry-dump-tensors", type=int, default=0,
+                    help=">0: dump small .pt blobs for sample 0.")
+    ap.add_argument("--telemetry-max-blocks", type=int, default=5,
+                    help="Max number of telemetry blocks to dump.")
+    ap.add_argument("--telemetry-save-dir", type=str, default="./dvi_align_dumps",
+                    help="Directory for telemetry JSON/PT dumps.")
+    ap.add_argument("--telemetry-run-id", type=str, default=None,
+                    help="Optional run id used in filenames (default: timestamp).")
+    ap.add_argument("--telemetry-auto-offset", type=int, default=0,
+                    help=">0: compute acceptance by best of {offset 0, +1}.")
+    ap.add_argument("--telemetry-topk", type=int, default=5,
+                    help="Optional: top-k to include in debug contexts, if used.")
     args = ap.parse_args()
 
     # --- Initialize W&B and merge sweep overrides back into args ---
@@ -443,6 +470,17 @@ def main():
     # Make sure eval_k_max is set even if W&B is disabled
     if getattr(args, "eval_k_max", None) is None:
         args.eval_k_max = args.train_k_spec
+
+    telemetry = AlignTelemetryParams(
+        debug=args.telemetry_debug,
+        prints_budget=args.telemetry_prints_budget,
+        dump_tensors=args.telemetry_dump_tensors,
+        max_blocks=args.telemetry_max_blocks,
+        save_dir=args.telemetry_save_dir,
+        run_id=args.telemetry_run_id,
+        auto_offset=args.telemetry_auto_offset,
+        topk=args.telemetry_topk,
+    )
 
     # Now that sweep overrides are applied, set up run directories, env snapshot, and seed
     ensure_dirs(args.outdir)
@@ -499,6 +537,7 @@ def main():
         kl_warmup_scale=args.kl_warmup_scale,
         eval_k_max=args.eval_k_max,
         timing_greedy=args.timing_greedy,
+        telemetry=telemetry,
     )
     deep_kv_purge(model)
     gc.collect()
@@ -532,7 +571,8 @@ def main():
         temperature=max(1e-6, args.temperature),
         early_layer_override=args.early_layer,
         quiet=True,
-        microbatch_base=1
+        microbatch_base=1,
+        telemetry=telemetry,
     )
     dvi_time, spec_metrics = dvi_res
     print(f"[time] DVI(SPEC) generate: {dvi_time:.3f}s", flush=True)
