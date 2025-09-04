@@ -68,8 +68,10 @@ def test_rollout_k_spec_accepts_all():
     tok = DummyTok()
     buf = ReplayBuffer(32, torch.device("cpu"))
     n = rollout_collect_k_spec(model, tok, "hi", buf, steps=4, k=2, greedy=True, temperature=0.0)
-    assert n == 4
-    sample = buf.sample(4, accepted_only=False)
-    assert sample["reward"].sum().item() == pytest.approx(4.0)
+    # All k tokens from each step should be buffered (4 steps * 2 tokens)
+    assert n == 8
+    sample = buf.sample(8, accepted_only=False)
+    # Every token was accepted so the reward sum equals the total count
+    assert sample["reward"].sum().item() == pytest.approx(8.0)
     for p in model.parameters():
         assert p.grad is None

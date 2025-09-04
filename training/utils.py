@@ -18,6 +18,7 @@ from transformers import __version__ as transformers_ver
 import time
 from statistics import median
 from .mem import deep_kv_purge, timing_trace
+from .align_telemetry import AlignTelemetryParams
 
 
 __all__ = [
@@ -214,6 +215,9 @@ def measure_generate_walltime(
     repeats: int = 3,
     use_dvi_spec: bool = False,
     draft_k: int = 4,
+    spec_adaptive: bool = False,
+    eta: float = 0.6,
+    spec_ctar_target1: Optional[float] = None,
     temperature: float = 1.0,
     quiet: bool = True,
     early_layer_override: Optional[int] = None,
@@ -222,6 +226,7 @@ def measure_generate_walltime(
     microbatch_spec: int = 1,
     # keep the safety cap
     input_cap_tokens: int = 256,
+    telemetry: AlignTelemetryParams | None = None,
 ):
     """
     Returns:
@@ -329,7 +334,7 @@ def measure_generate_walltime(
         return time.perf_counter() - t0
 
     @torch.no_grad()
-    def _spec_once(enc_chunk) -> (float, Dict[str, float]):
+    def _spec_once(enc_chunk, eta_val) -> (float, Dict[str, float]):
         deep_kv_purge(model)
         from training.spec_decode import generate_with_dvi_spec
 
@@ -338,14 +343,17 @@ def measure_generate_walltime(
         _, spec_metrics = generate_with_dvi_spec(
             model,
             tok,
-            enc=enc_chunk,  # use pre-encoded batch
+            enc=enc_chunk,
             max_new_tokens=max_new_tokens,
             draft_k=draft_k,
+            spec_adaptive=spec_adaptive,
+            eta=eta_val,
             greedy=greedy,
             temperature=max(1e-6, temperature) if greedy else temperature,
             early_layer=early_layer_override or getattr(model, "early_layer", None),
             device=device,
             quiet=quiet,
+            telemetry=telemetry,
         )
         _cuda_sync()
         deep_kv_purge(model)
@@ -354,6 +362,7 @@ def measure_generate_walltime(
     # ----- timing loop -----
     times: List[float] = []
     spec_last: Optional[Dict[str, float]] = None
+    eta_cur = eta
 
     enc_all = _safe_encode(prompts)
     B = int(enc_all["input_ids"].size(0))
@@ -375,7 +384,7 @@ def measure_generate_walltime(
             enc_chunk = _slice_enc(enc_all, s, e)
             try:
                 if use_dvi_spec:
-                    dt, spec_dict = _spec_once(enc_chunk)
+                    dt, spec_dict = _spec_once(enc_chunk, eta_cur)
                     total_elapsed += dt
                     agg_proposed += int(spec_dict.get("spec/proposed", 0))
                     agg_accepted += int(spec_dict.get("spec/accepted", 0))
@@ -384,6 +393,13 @@ def measure_generate_walltime(
                     agg_steps += int(spec_dict.get("spec/steps", 0))
                     for i in range(draft_k + 1):
                         agg_prefix[i] += int(spec_dict.get(f"spec/prefix_hist_{i}", 0))
+                    if spec_ctar_target1 is not None and spec_adaptive:
+                        c1 = spec_dict.get("spec/ctar1_hat")
+                        if c1 is not None:
+                            if c1 < spec_ctar_target1:
+                                eta_cur = max(0.0, eta_cur - 0.05)
+                            elif c1 > spec_ctar_target1 + 0.02:
+                                eta_cur = min(0.99, eta_cur + 0.05)
                 else:
                     total_elapsed += _baseline_once(enc_chunk, force_greedy=greedy)
             except RuntimeError as err:
@@ -391,7 +407,7 @@ def measure_generate_walltime(
                 enc_fallback = _slice_enc(enc_all, s, s + 1)
                 if ("device-side assert" in msg) or ("cuda" in msg.lower() and "memory" in msg.lower()):
                     if use_dvi_spec:
-                        dt, spec_dict = _spec_once(enc_fallback)
+                        dt, spec_dict = _spec_once(enc_fallback, eta_cur)
                         total_elapsed += dt
                         agg_proposed += int(spec_dict.get("spec/proposed", 0))
                         agg_accepted += int(spec_dict.get("spec/accepted", 0))
@@ -400,6 +416,13 @@ def measure_generate_walltime(
                         agg_steps += int(spec_dict.get("spec/steps", 0))
                         for i in range(draft_k + 1):
                             agg_prefix[i] += int(spec_dict.get(f"spec/prefix_hist_{i}", 0))
+                        if spec_ctar_target1 is not None and spec_adaptive:
+                            c1 = spec_dict.get("spec/ctar1_hat")
+                            if c1 is not None:
+                                if c1 < spec_ctar_target1:
+                                    eta_cur = max(0.0, eta_cur - 0.05)
+                                elif c1 > spec_ctar_target1 + 0.02:
+                                    eta_cur = min(0.99, eta_cur + 0.05)
                     else:
                         total_elapsed += _baseline_once(enc_fallback, force_greedy=True)
                     e = s + 1

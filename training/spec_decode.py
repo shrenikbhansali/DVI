@@ -1,7 +1,6 @@
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
-import os
 import torch
 
 from .modeling import (
@@ -14,6 +13,7 @@ from .sampling import sample_from_logits
 from .utils import theoretical_compression, count_transformer_layers
 from .mem import timing_trace  # kept for compatibility
 from .kv import clear_all_kv, prime_kv_full, advance_kv_with_committed
+from .align_telemetry import AlignLogger, AlignTelemetryParams
 
 
 @dataclass
@@ -95,11 +95,14 @@ def generate_with_dvi_spec(
     enc: Optional[Dict[str, torch.Tensor]] = None,
     max_new_tokens: int = 64,
     draft_k: int = 4,
+    spec_adaptive: bool = False,
+    eta: float = 0.6,
     greedy: bool = False,
     temperature: float = 1.0,
     early_layer: Optional[int] = None,
     device: Optional[torch.device] = None,
     quiet: bool = True,
+    telemetry: Optional[AlignTelemetryParams] = None,
 ) -> Tuple[List[torch.Tensor], SpecMetrics]:
     """Self-speculative decoding using vectorised block verification."""
 
@@ -123,6 +126,49 @@ def generate_with_dvi_spec(
             attn_mask = attn_mask.to(device)
 
     B = int(input_ids.size(0))
+
+    # If caller provides a batch, process each sequence independently to avoid
+    # cross-sample coupling of acceptance lengths.  This mirrors the behaviour
+    # of Kangaroo where speculative decoding runs per-sequence.
+    if B > 1:
+        outs: List[torch.Tensor] = []
+        agg = SpecMetrics(draft_k=draft_k)
+        agg.prefix_hist = [0 for _ in range(draft_k + 1)]
+        for i in range(B):
+            sub_enc = {"input_ids": input_ids[i : i + 1]}
+            if attn_mask is not None:
+                sub_enc["attention_mask"] = attn_mask[i : i + 1]
+            sub_out, sub_m = generate_with_dvi_spec(
+                model,
+                tok,
+                enc=sub_enc,
+                max_new_tokens=max_new_tokens,
+                draft_k=draft_k,
+                spec_adaptive=spec_adaptive,
+                eta=eta,
+                greedy=greedy,
+                temperature=temperature,
+                early_layer=early_layer,
+                device=device,
+                quiet=quiet,
+                telemetry=telemetry,
+            )
+            outs.extend(sub_out)
+            agg.proposed += sub_m.proposed
+            agg.accepted += sub_m.accepted
+            agg.committed += sub_m.committed
+            agg.steps += sub_m.steps
+            agg.deep_tokens += sub_m.deep_tokens
+            agg.invariant_error += sub_m.invariant_error
+            agg.nan_events += sub_m.nan_events
+            agg.oom_retries += sub_m.oom_retries
+            for j in range(draft_k + 1):
+                agg.prefix_hist[j] += sub_m.prefix_hist[j]
+        # derive runtime compression estimate on aggregate stats
+        total_layers = count_transformer_layers(model)
+        comp_ratio, _ = theoretical_compression(agg.accept_rate, k, total_layers)
+        agg.comp_ratio_runtime_est = comp_ratio
+        return outs, agg
 
     # Choose the true last token per sample (avoid PAD)
     if attn_mask is not None:
@@ -151,14 +197,35 @@ def generate_with_dvi_spec(
             use_cache=True,
         )
 
+    # Persist primed KV caches back onto the model so that external helpers
+    # (e.g. ``estimate_kv_cache``) can observe the prompt state.
+    sp = tuple(shallow_past) if shallow_past is not None else tuple()
+    dp = tuple(deep_past) if deep_past is not None else tuple()
+    if sp or dp:
+        combined_past = sp + dp
+        try:
+            model.past_key_values = combined_past
+        except Exception:
+            pass
+        try:
+            if hasattr(model, "model"):
+                model.model.past_key_values = combined_past
+        except Exception:
+            pass
+
+    # Remember boundary to split PKV back into shallow/deep if we have to
+    split_idx = len(sp)
+
+    logger = AlignLogger(telemetry)
+    kv_len_shallow = logger.kv_len_from_past(shallow_past)
+    kv_len_deep = logger.kv_len_from_past(deep_past)
+
     metrics = SpecMetrics(draft_k=draft_k)
     metrics.prefix_hist = [0 for _ in range(draft_k + 1)]
     total_new = 0
 
-    # align debug throttling
-    if not hasattr(generate_with_dvi_spec, "_align_prints"):
-        generate_with_dvi_spec._align_prints = 0
-    max_align_prints = int(os.getenv("DVI_ALIGN_PRINTS", "3"))
+    next_seed_hidden: Optional[torch.Tensor] = None
+    next_seed_past: Optional[Tuple] = None
 
     while total_new < max_new_tokens:
         draft_tokens: List[torch.Tensor] = []
@@ -166,29 +233,53 @@ def generate_with_dvi_spec(
         shallow_snapshots: List[Tuple] = []
         tmp_shallow = shallow_past
         prev = last_tokens
+        drafted = 0
 
-        # ---- draft k tokens ----
-        for _ in range(draft_k):
-            with adapter_guard(model, "draft"):
-                h_k, tmp_shallow = run_shallow_until_k(
-                    model,
-                    input_ids=prev.unsqueeze(1),
-                    past_key_values=tmp_shallow,
-                    attention_mask=None,
-                    use_cache=True,
-                )
-                logits = exit_logits_from_hidden_k(model, h_k)
+        # ---- adaptive drafting loop ----
+        while drafted < draft_k:
+            if drafted == 0 and next_seed_hidden is not None and next_seed_past is not None:
+                h_k = next_seed_hidden
+                tmp_shallow = next_seed_past
+                next_seed_hidden = None
+                next_seed_past = None
+            else:
+                with adapter_guard(model, "draft"):
+                    h_k, tmp_shallow = run_shallow_until_k(
+                        model,
+                        input_ids=prev.unsqueeze(1),
+                        past_key_values=tmp_shallow,
+                        attention_mask=None,
+                        use_cache=True,
+                    )
+            logits = exit_logits_from_hidden_k(model, h_k)
+            pmax = torch.softmax(logits[:, -1, :], dim=-1).amax(dim=-1)
             nxt = sample_from_logits(logits[:, -1, :], greedy=greedy, temperature=temperature)
             draft_tokens.append(nxt)
             draft_hidden.append(h_k[:, -1, :])
             shallow_snapshots.append(tmp_shallow)
             prev = nxt
+            drafted += 1
+            if spec_adaptive and bool((pmax < eta).item()):
+                break
 
-        prop_seq = torch.stack(draft_tokens, dim=1)   # [B,k]
-        hidden_seq = torch.stack(draft_hidden, dim=1) # [B,k,H]
-        metrics.proposed += int(B * draft_k)
+        # one-step prefetch for potential next round
+        with adapter_guard(model, "draft"):
+            pre_h, pre_past = run_shallow_until_k(
+                model,
+                input_ids=prev.unsqueeze(1),
+                past_key_values=tmp_shallow,
+                attention_mask=None,
+                use_cache=True,
+            )
+
+        prop_seq = torch.stack(draft_tokens, dim=1)   # [B,drafted]
+        hidden_seq = torch.stack(draft_hidden, dim=1) # [B,drafted,H]
+        metrics.proposed += int(B * drafted)
 
         # ---- verify entire block ----
+        kv_len_shallow_before = kv_len_shallow
+        kv_len_deep_before = kv_len_deep
+
         with adapter_guard(model, "verify"):
             deep_logits, deep_past_full = run_deep_from_k(
                 model,
@@ -197,102 +288,74 @@ def generate_with_dvi_spec(
                 use_cache=True,
             )
         metrics.steps += 1
-        metrics.deep_tokens += int(B * draft_k)
-
-        # --- Misalignment debug (prints to stdout if requested) ---
-        if os.getenv("DVI_ALIGN_DEBUG", ""):
-            _va = deep_logits.argmax(dim=-1)  # [B, k]
-            m00 = (_va[:, 0] == prop_seq[:, 0]).float().mean().item()
-            m10 = float("nan")
-            m11 = float("nan")
-            if _va.size(1) > 1:
-                m10 = (_va[:, 1] == prop_seq[:, 0]).float().mean().item()
-                m11 = (_va[:, 1] == prop_seq[:, 1]).float().mean().item()
-
-            if generate_with_dvi_spec._align_prints < max_align_prints:
-                print(
-                    f"[align/spec] k={draft_k} match(0↔0)={m00:.3f} "
-                    f"match(1↔0)={m10:.3f} match(1↔1)={m11:.3f}",
-                    flush=True,
-                )
-                generate_with_dvi_spec._align_prints += 1
-
-            # Optional: deeper "gold" check for B==1
-            if os.getenv("DVI_ALIGN_GOLD", "") and B == 1 and generate_with_dvi_spec._align_prints <= max_align_prints:
-                try:
-                    with adapter_guard(model, "verify"):
-                        # Build current prefix for sample 0
-                        prefix_ids = input_ids[0].detach().tolist() + generated[0]
-                        prefix = torch.tensor([prefix_ids], device=device, dtype=input_ids.dtype)
-                        clear_all_kv(model)
-                        if prefix.size(1) >= 1:
-                            prime_kv_full(model, prefix[:, :-1])
-                            last = prefix[:, -1:]
-                        else:
-                            prime_kv_full(model, prefix)
-                            last = prefix[:, -1:]
-
-                        gold = []
-                        steps_to_check = min(2, prop_seq.size(1))
-                        for _ in range(steps_to_check):
-                            g_logits = model.verifier_logits_for_next(last)
-                            g_top1 = int(g_logits.argmax(dim=-1)[0, 0].item())
-                            gold.append(g_top1)
-                            nxt = torch.tensor([[g_top1]], device=last.device, dtype=last.dtype)
-                            advance_kv_with_committed(model, nxt)
-                            last = nxt
-
-                    v_arg = deep_logits.argmax(dim=-1)  # [1,k]
-                    d0 = int(prop_seq[0, 0].item())
-                    d1 = int(prop_seq[0, 1].item()) if prop_seq.size(1) > 1 else -1
-                    v0 = int(v_arg[0, 0].item())
-                    v1 = int(v_arg[0, 1].item()) if v_arg.size(1) > 1 else -1
-                    g0 = gold[0] if len(gold) > 0 else -1
-                    g1 = gold[1] if len(gold) > 1 else -1
-                    print(
-                        f"[align/spec] gold k={draft_k} "
-                        f"deep≈gold: {(v0==g0):d}/{(v1==g1):d} | "
-                        f"draft={d0},{d1} deep={v0},{v1} gold={g0},{g1}",
-                        flush=True,
-                    )
-                except Exception as e:
-                    print(f"[align/spec] gold-check error: {e}", flush=True)
-        # --- end misalignment debug ---
+        metrics.deep_tokens += int(B * drafted)
 
         if not torch.isfinite(deep_logits).all():
             metrics.nan_events += 1
             deep_logits = torch.nan_to_num(deep_logits)
+            deep_argmax = deep_logits.argmax(dim=-1)
+            matches0 = torch.zeros_like(prop_seq, dtype=torch.bool)
+        else:
+            deep_argmax = deep_logits.argmax(dim=-1)  # [B,k]
+            matches0 = deep_argmax.eq(prop_seq)
 
-        verify_argmax = deep_logits.argmax(dim=-1)  # [B,k]
-        matches = verify_argmax.eq(prop_seq)
-
-        # compute accepted prefix length across batch (min)
-        all_matched = matches.all(dim=1)
-        first_mismatch = (~matches).float().argmax(dim=1)
-        prefix_lens = torch.where(all_matched, torch.full_like(first_mismatch, draft_k), first_mismatch)
-        counts = torch.bincount(prefix_lens.to(dtype=torch.long, device="cpu"), minlength=draft_k + 1)
+        all_matched0 = matches0.all(dim=1)
+        first_mismatch0 = (~matches0).float().argmax(dim=1)
+        prefix_lens0 = torch.where(all_matched0, torch.full_like(first_mismatch0, drafted), first_mismatch0)
+        counts = torch.bincount(prefix_lens0.to(dtype=torch.long, device="cpu"), minlength=draft_k + 1)
         for i in range(draft_k + 1):
             metrics.prefix_hist[i] += int(counts[i])
-        accept_len = int(prefix_lens.min().item())
+        accept_len_default = int(prefix_lens0[0].item())
 
+        accept_len = accept_len_default
+
+        if logger.cfg.auto_offset > 0 and deep_argmax.size(1) > 1:
+            matches1 = deep_argmax[:, 1:].eq(prop_seq[:, :-1])
+            all_matched1 = matches1.all(dim=1)
+            first_mismatch1 = (~matches1).float().argmax(dim=1)
+            prefix_lens1 = torch.where(
+                all_matched1, torch.full_like(first_mismatch1, drafted - 1), first_mismatch1
+            )
+            accept_len_p1 = int(prefix_lens1[0].item())
+            if accept_len_p1 > accept_len:
+                accept_len = accept_len_p1
+
+        # IMPORTANT: do NOT zero accept_len if deep_past_full is None.
+        # We will commit accepted tokens via the model as a fallback.
         metrics.accepted += int(B * accept_len)
 
         # commit accepted prefix or one verifier token on miss
         if accept_len > 0:
             accepted_block = prop_seq[:, :accept_len]
+            # Shallow cache: restore from snapshot
             snap = shallow_snapshots[accept_len - 1]
             new_shallow = []
             for (k_, v_) in snap:
                 new_shallow.append((k_.contiguous().clone(), v_.contiguous().clone()))
             shallow_past = tuple(new_shallow)
 
-            past_len_d = deep_past[0][0].shape[2] if deep_past and deep_past[0] is not None else 0
-            new_deep = []
-            for (k_, v_) in deep_past_full:
-                ks = k_[:, :, : past_len_d + accept_len, :].contiguous().clone()
-                vs = v_[:, :, : past_len_d + accept_len, :].contiguous().clone()
-                new_deep.append((ks, vs))
-            deep_past = tuple(new_deep)
+            if deep_past_full is not None:
+                # Fast path: slice verifier PKV
+                past_len_d = deep_past[0][0].shape[2] if deep_past and deep_past[0] is not None else 0
+                new_deep = []
+                for (k_, v_) in deep_past_full:
+                    ks = k_[:, :, : past_len_d + accept_len, :].contiguous().clone()
+                    vs = v_[:, :, : past_len_d + accept_len, :].contiguous().clone()
+                    new_deep.append((ks, vs))
+                deep_past = tuple(new_deep)
+            else:
+                # Fallback: commit accepted tokens through the model to advance both caches
+                advance_kv_with_committed(model, accepted_block)
+                pkv = getattr(model, "past_key_values", None)
+                if pkv is None and hasattr(model, "model"):
+                    pkv = getattr(model.model, "past_key_values", None)
+                if pkv is not None:
+                    shallow_past = tuple(
+                        (k_.contiguous().clone(), v_.contiguous().clone()) for (k_, v_) in pkv[:split_idx]
+                    )
+                    deep_past = tuple(
+                        (k_.contiguous().clone(), v_.contiguous().clone()) for (k_, v_) in pkv[split_idx:]
+                    )
 
             acc_list = accepted_block.tolist()
             for b in range(B):
@@ -300,8 +363,31 @@ def generate_with_dvi_spec(
             last_tokens = accepted_block[:, -1]
             total_new += accept_len
             metrics.committed += int(B * accept_len)
+
+            if accept_len == drafted:
+                next_seed_hidden = pre_h
+                next_seed_past = pre_past
+            else:
+                next_seed_hidden = None
+                next_seed_past = None
+
+            # persist updated KV cache back to model
+            sp = tuple(shallow_past) if shallow_past is not None else tuple()
+            dp = tuple(deep_past) if deep_past is not None else tuple()
+            if sp or dp:
+                combined_past = sp + dp
+                try:
+                    model.past_key_values = combined_past
+                except Exception:
+                    pass
+                try:
+                    if hasattr(model, "model"):
+                        model.model.past_key_values = combined_past
+                except Exception:
+                    pass
         else:
-            v1 = verify_argmax[:, 0]
+            # commit exactly one verifier token on miss
+            v1 = deep_argmax[:, 0]
             for b in range(B):
                 generated[b].append(int(v1[b]))
             last_tokens = v1
@@ -322,6 +408,51 @@ def generate_with_dvi_spec(
                 )
             total_new += 1
             metrics.committed += int(B)
+            next_seed_hidden = None
+            next_seed_past = None
+            sp = tuple(shallow_past) if shallow_past is not None else tuple()
+            dp = tuple(deep_past) if deep_past is not None else tuple()
+            if sp or dp:
+                combined_past = sp + dp
+                try:
+                    model.past_key_values = combined_past
+                except Exception:
+                    pass
+                try:
+                    if hasattr(model, "model"):
+                        model.model.past_key_values = combined_past
+                except Exception:
+                    pass
+
+        kv_len_shallow = logger.kv_len_from_past(shallow_past)
+        kv_len_deep = logger.kv_len_from_past(deep_past)
+
+        sample0 = {}
+        try:
+            sample0["prop_seq0"] = prop_seq[0]
+            sample0["deep_argmax0"] = deep_argmax[0]
+            sample0["deep_logits0"] = deep_logits[0]
+        except Exception:
+            pass
+
+        logger.block_report(
+            phase="spec",
+            step_idx=metrics.steps,
+            k=drafted,
+            B=B,
+            greedy=greedy,
+            temperature=temperature,
+            prop_seq=prop_seq,
+            deep_logits=deep_logits,
+            deep_argmax=deep_argmax,
+            accept_len_default=accept_len_default,
+            kv_len_shallow_before=kv_len_shallow_before,
+            kv_len_deep_before=kv_len_deep_before,
+            kv_len_shallow_after=kv_len_shallow,
+            kv_len_deep_after=kv_len_deep,
+            gold=None,
+            sample0_tensors=sample0,
+        )
 
         # invariants: accept_rate vs histogram
         if metrics.proposed > 0:
@@ -338,4 +469,14 @@ def generate_with_dvi_spec(
     metrics.comp_ratio_runtime_est = comp_ratio
 
     outputs = [torch.tensor(seq, device=device, dtype=torch.long) for seq in generated]
+    # final persist (guard against None)
+    sp = tuple(shallow_past) if shallow_past is not None else tuple()
+    dp = tuple(deep_past) if deep_past is not None else tuple()
+    if sp or dp:
+        try:
+            model.past_key_values = sp + dp
+            if hasattr(model, "model"):
+                model.model.past_key_values = sp + dp
+        except Exception:
+            pass
     return outputs, metrics
