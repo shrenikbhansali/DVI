@@ -4,6 +4,12 @@
 alignment in both training and runtime experiments. Telemetry is **off by
 default** and is controlled entirely through CLI flags in `train_bestcase.py`.
 
+Policy-gradient training can be enabled with `--use-policy-grad` and is further
+configured via `--rl-weight`, `--pg-baseline-ema`, `--kl-beta0`,
+`--kl-beta-min` and `--kl-anneal-steps`. When enabled, telemetry JSONs also
+record averaged advantages/kl terms and the drafting `eta`/`prefix_hist` per
+block.
+
 When enabled it can:
 
 * emit up to `--telemetry-prints-budget` concise lines to stdout

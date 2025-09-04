@@ -4,6 +4,7 @@ from typing import Tuple, List, Dict, Optional
 
 import torch
 import torch.nn.functional as F
+from training.modeling import run_shallow_until_k, exit_logits_from_hidden_k, adapter_guard
 
 __all__ = ["one_mixed_step", "policy_kl_ent_multi_step", "policy_gradient_terms", "one_policy_step"]
 
@@ -161,17 +162,21 @@ def policy_gradient_terms(
 
     dev = next(model.parameters()).device
     with torch.inference_mode(False):
-        hidden = batch["hidden"].to(dev).clone()
+        state = batch["state"].to(dev).clone()
         vlogits = batch["vlogits"].to(dev).clone()
     tokens = batch["token"].to(dev).view(-1)
     accepted = batch["accepted"].to(dev).view(-1).float()
 
-    h = hidden.float()
-    if hasattr(model, "exit_pre_norm") and model.exit_pre_norm is not None:
-        h = model.exit_pre_norm(h)
-    slogits = model.exit_proj(h)
-    if hasattr(model, "exit_logit_scale"):
-        slogits = model.exit_logit_scale.to(slogits.dtype) * slogits
+    with adapter_guard(model, "draft"):
+        h_k, _ = run_shallow_until_k(
+            model,
+            input_ids=state.view(-1, 1),
+            attention_mask=None,
+            past_key_values=None,
+            use_cache=False,
+        )
+    slogits_full = exit_logits_from_hidden_k(model, h_k)
+    slogits = slogits_full[:, -1, :]
     slogp = F.log_softmax(slogits, dim=-1)
     logp = slogp.gather(1, tokens.unsqueeze(1)).squeeze(1)
 
