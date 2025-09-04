@@ -18,6 +18,7 @@ from transformers import __version__ as transformers_ver
 import time
 from statistics import median
 from .mem import deep_kv_purge, timing_trace
+from .align_telemetry import AlignTelemetryParams
 
 
 __all__ = [
@@ -214,6 +215,9 @@ def measure_generate_walltime(
     repeats: int = 3,
     use_dvi_spec: bool = False,
     draft_k: int = 4,
+    spec_adaptive: bool = False,
+    eta: float = 0.6,
+    spec_ctar_target1: Optional[float] = None,
     temperature: float = 1.0,
     quiet: bool = True,
     early_layer_override: Optional[int] = None,
@@ -222,6 +226,7 @@ def measure_generate_walltime(
     microbatch_spec: int = 1,
     # keep the safety cap
     input_cap_tokens: int = 256,
+    telemetry: AlignTelemetryParams | None = None,
 ):
     """
     Returns:
@@ -312,12 +317,13 @@ def measure_generate_walltime(
     def _baseline_once(enc_chunk, force_greedy: bool) -> float:
         _cuda_sync()
         t0 = time.perf_counter()
+        temp = max(1e-6, temperature) if force_greedy else temperature
         _ = model.generate(
             input_ids=enc_chunk["input_ids"],
             attention_mask=enc_chunk.get("attention_mask", None),
             max_new_tokens=max_new_tokens,
             do_sample=not force_greedy,
-            temperature=max(1e-6, temperature),
+            temperature=temp,
             num_beams=1,
             use_cache=True,
             pad_token_id=getattr(model.config, "pad_token_id", getattr(tok, "pad_token_id", None)),
@@ -328,7 +334,7 @@ def measure_generate_walltime(
         return time.perf_counter() - t0
 
     @torch.no_grad()
-    def _spec_once(enc_chunk) -> (float, Dict[str, float]):
+    def _spec_once(enc_chunk, eta_val) -> (float, Dict[str, float]):
         deep_kv_purge(model)
         from training.spec_decode import generate_with_dvi_spec
 
@@ -337,14 +343,17 @@ def measure_generate_walltime(
         _, spec_metrics = generate_with_dvi_spec(
             model,
             tok,
-            enc=enc_chunk,  # use pre-encoded batch
+            enc=enc_chunk,
             max_new_tokens=max_new_tokens,
             draft_k=draft_k,
+            spec_adaptive=spec_adaptive,
+            eta=eta_val,
             greedy=greedy,
-            temperature=temperature,
+            temperature=max(1e-6, temperature) if greedy else temperature,
             early_layer=early_layer_override or getattr(model, "early_layer", None),
             device=device,
             quiet=quiet,
+            telemetry=telemetry,
         )
         _cuda_sync()
         deep_kv_purge(model)
@@ -353,6 +362,7 @@ def measure_generate_walltime(
     # ----- timing loop -----
     times: List[float] = []
     spec_last: Optional[Dict[str, float]] = None
+    eta_cur = eta
 
     enc_all = _safe_encode(prompts)
     B = int(enc_all["input_ids"].size(0))
@@ -364,6 +374,8 @@ def measure_generate_walltime(
         agg_accepted = 0
         agg_committed = 0
         agg_deep = 0
+        agg_steps = 0
+        agg_prefix = [0 for _ in range(draft_k + 1)] if use_dvi_spec else []
 
         s = 0
 
@@ -372,12 +384,22 @@ def measure_generate_walltime(
             enc_chunk = _slice_enc(enc_all, s, e)
             try:
                 if use_dvi_spec:
-                    dt, spec_dict = _spec_once(enc_chunk)
+                    dt, spec_dict = _spec_once(enc_chunk, eta_cur)
                     total_elapsed += dt
                     agg_proposed += int(spec_dict.get("spec/proposed", 0))
                     agg_accepted += int(spec_dict.get("spec/accepted", 0))
                     agg_committed += int(spec_dict.get("spec/committed", 0))
                     agg_deep += int(spec_dict.get("spec/deep_tokens", 0))
+                    agg_steps += int(spec_dict.get("spec/steps", 0))
+                    for i in range(draft_k + 1):
+                        agg_prefix[i] += int(spec_dict.get(f"spec/prefix_hist_{i}", 0))
+                    if spec_ctar_target1 is not None and spec_adaptive:
+                        c1 = spec_dict.get("spec/ctar1_hat")
+                        if c1 is not None:
+                            if c1 < spec_ctar_target1:
+                                eta_cur = max(0.0, eta_cur - 0.05)
+                            elif c1 > spec_ctar_target1 + 0.02:
+                                eta_cur = min(0.99, eta_cur + 0.05)
                 else:
                     total_elapsed += _baseline_once(enc_chunk, force_greedy=greedy)
             except RuntimeError as err:
@@ -385,12 +407,22 @@ def measure_generate_walltime(
                 enc_fallback = _slice_enc(enc_all, s, s + 1)
                 if ("device-side assert" in msg) or ("cuda" in msg.lower() and "memory" in msg.lower()):
                     if use_dvi_spec:
-                        dt, spec_dict = _spec_once(enc_fallback)
+                        dt, spec_dict = _spec_once(enc_fallback, eta_cur)
                         total_elapsed += dt
                         agg_proposed += int(spec_dict.get("spec/proposed", 0))
                         agg_accepted += int(spec_dict.get("spec/accepted", 0))
                         agg_committed += int(spec_dict.get("spec/committed", 0))
                         agg_deep += int(spec_dict.get("spec/deep_tokens", 0))
+                        agg_steps += int(spec_dict.get("spec/steps", 0))
+                        for i in range(draft_k + 1):
+                            agg_prefix[i] += int(spec_dict.get(f"spec/prefix_hist_{i}", 0))
+                        if spec_ctar_target1 is not None and spec_adaptive:
+                            c1 = spec_dict.get("spec/ctar1_hat")
+                            if c1 is not None:
+                                if c1 < spec_ctar_target1:
+                                    eta_cur = max(0.0, eta_cur - 0.05)
+                                elif c1 > spec_ctar_target1 + 0.02:
+                                    eta_cur = min(0.99, eta_cur + 0.05)
                     else:
                         total_elapsed += _baseline_once(enc_fallback, force_greedy=True)
                     e = s + 1
@@ -410,13 +442,60 @@ def measure_generate_walltime(
                 "spec/accept_rate": float(acc),
                 "spec/deep_tokens": float(agg_deep),
                 "spec/deep_to_commit": float(agg_deep / max(1, agg_committed)),
+                "spec/steps": float(agg_steps),
+                "spec/hist_N": float(sum(agg_prefix)),
+                "spec/greedy": float(greedy),
+                "spec/temperature": float(max(1e-6, temperature) if greedy else temperature),
+                "spec/k": float(draft_k),
+                "spec/early_layer": float(early_layer_override or getattr(model, "early_layer", 0) or 0),
+                "spec/mode": 1.0 if use_dvi_spec else 0.0,
             }
+            for i, v in enumerate(agg_prefix):
+                spec_last[f"spec/prefix_hist_{i}"] = float(v)
+            # derived metrics from histogram
+            hist = agg_prefix
+            N = max(1, sum(hist))
+            EL = sum(i * c for i, c in enumerate(hist)) / N
+            p0 = hist[0] / N if len(hist) > 0 else 0.0
+            pfull = hist[draft_k] / N if draft_k < len(hist) else 0.0
+            pge2 = sum(hist[2:draft_k + 1]) / N if draft_k >= 2 else 0.0
+            ctar_hat = [1.0 - p0]
+            for j in range(2, draft_k + 1):
+                ctar_hat.append(sum(hist[j:draft_k + 1]) / N)
+            spec_last["spec/E[L]"] = float(EL)
+            spec_last["spec/p0"] = float(p0)
+            spec_last["spec/p_full"] = float(pfull)
+            spec_last["spec/p_ge2"] = float(pge2)
+            for j, val in enumerate(ctar_hat, start=1):
+                spec_last[f"spec/ctar{j}_hat"] = float(val)
+            acc_from_hist = EL / max(1, draft_k)
+            spec_last["spec/accept_rate_from_hist"] = float(acc_from_hist)
+            spec_last["spec/accept_rate_delta"] = float(acc - acc_from_hist)
 
         times.append(total_elapsed)
 
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    times.sort()
-    elapsed_med = float(times[len(times) // 2])
+    total_time = float(sum(times))
+    mean_time = total_time / max(1, len(times))
+    times_sorted = sorted(times)
+    elapsed_med = float(times_sorted[len(times_sorted) // 2])
+    if repeats > 1:
+        print(
+            f"[time] repeats={len(times_sorted)} per-run(s)=["
+            + ",".join(f"{t:.3f}" for t in times_sorted)
+            + f"] median={elapsed_med:.3f} mean={mean_time:.3f} total={total_time:.3f}",
+            flush=True,
+        )
+    else:
+        print(f"[time] repeats=1 per-run={elapsed_med:.3f}", flush=True)
+    if use_dvi_spec and spec_last is not None:
+        spec_last.update({
+            "time/median": elapsed_med,
+            "time/mean": mean_time,
+            "time/total": total_time,
+        })
+        for i, t in enumerate(times_sorted):
+            spec_last[f"time/run_{i}"] = t
     return (elapsed_med, spec_last) if use_dvi_spec else elapsed_med
