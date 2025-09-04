@@ -18,6 +18,7 @@ from transformers import __version__ as transformers_ver
 import time
 from statistics import median
 from .mem import deep_kv_purge, timing_trace
+from .align_telemetry import AlignTelemetryParams
 
 
 __all__ = [
@@ -225,6 +226,7 @@ def measure_generate_walltime(
     microbatch_spec: int = 1,
     # keep the safety cap
     input_cap_tokens: int = 256,
+    telemetry: AlignTelemetryParams | None = None,
 ):
     """
     Returns:
@@ -351,6 +353,7 @@ def measure_generate_walltime(
             early_layer=early_layer_override or getattr(model, "early_layer", None),
             device=device,
             quiet=quiet,
+            telemetry=telemetry,
         )
         _cuda_sync()
         deep_kv_purge(model)
