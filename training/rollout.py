@@ -9,29 +9,18 @@ from training.modeling import (
     run_shallow_until_k,
     run_deep_from_k,
     exit_logits_from_hidden_k,
+    adapter_guard,
 )
 from training.sampling import sample_from_logits
 
 __all__ = ["rollout_collect", "rollout_collect_k_spec", "buf_debug"]
 
 
-@torch.inference_mode()
-def rollout_collect(
-    spec,
-    tok,
-    prompt: str,
-    buf: ReplayBuffer,
-    steps: int,
-    debug_out: Optional[List[Dict]] = None,
-    topk: int = 5,
-) -> int:
-    """Legacy single-token rollout forwarded to k-spec path.
-
-    Note:
-        Under token-quota semantics, `steps` is the *minimum number of token
-        records to collect*. With k=1 and batch size B=1 this equals the number
-        of single-token steps to run.
-    """
+@torch.no_grad()
+def rollout_collect(spec, tok, prompt: str,
+                    buf: ReplayBuffer, steps: int,
+                    debug_out: Optional[List[Dict]] = None, topk: int = 5) -> int:
+    """Legacy single-token rollout forwarded to k-spec path."""
     return rollout_collect_k_spec(
         spec,
         tok,
@@ -46,7 +35,7 @@ def rollout_collect(
     )
 
 
-@torch.inference_mode()
+@torch.no_grad()
 def rollout_collect_k_spec(
     spec,
     tok,
@@ -97,10 +86,11 @@ def rollout_collect_k_spec(
         attn_mask = attn_mask.to(device)
 
     # --- prime KV caches on the prompt ---
-    h_k_prompt, shallow_past = run_shallow_until_k(
-        spec, input_ids=input_ids, attention_mask=attn_mask, past_key_values=None, use_cache=True
-    )
-    with torch.no_grad():
+    with adapter_guard(spec, "draft"):
+        h_k_prompt, shallow_past = run_shallow_until_k(
+            spec, input_ids=input_ids, attention_mask=attn_mask, past_key_values=None, use_cache=True
+        )
+    with adapter_guard(spec, "verify"), torch.no_grad():
         _, deep_past = run_deep_from_k(
             spec, hidden_k=h_k_prompt, past_key_values=None, use_cache=True
         )
@@ -127,14 +117,15 @@ def rollout_collect_k_spec(
 
         # draft k tokens
         for _ in range(k):
-            h_k, tmp_shallow = run_shallow_until_k(
-                spec,
-                input_ids=prev.unsqueeze(1),
-                past_key_values=tmp_shallow,
-                attention_mask=None,
-                use_cache=True,
-            )
-            logits = exit_logits_from_hidden_k(spec, h_k)
+            with adapter_guard(spec, "draft"):
+                h_k, tmp_shallow = run_shallow_until_k(
+                    spec,
+                    input_ids=prev.unsqueeze(1),
+                    past_key_values=tmp_shallow,
+                    attention_mask=None,
+                    use_cache=True,
+                )
+                logits = exit_logits_from_hidden_k(spec, h_k)
             nxt = sample_from_logits(logits[:, -1, :], greedy=greedy, temperature=temperature)
             draft_tokens.append(nxt)
             draft_hidden.append(h_k[:, -1, :])
@@ -144,10 +135,30 @@ def rollout_collect_k_spec(
         prop_seq = torch.stack(draft_tokens, dim=1)   # [B, k]
         hidden_seq = torch.stack(draft_hidden, dim=1) # [B, k, H]
 
-        with torch.no_grad():
+        with adapter_guard(spec, "verify"), torch.no_grad():
             deep_logits, deep_past_full = run_deep_from_k(
                 spec, hidden_k=hidden_seq, past_key_values=deep_past, use_cache=True
             )
+        import os
+
+        if os.getenv("DVI_ALIGN_DEBUG", ""):
+            _va = deep_logits.argmax(dim=-1)  # [B, k]
+            m00 = (_va[:, 0] == prop_seq[:, 0]).float().mean().item()
+            m10 = float("nan")
+            m11 = float("nan")
+            if _va.size(1) > 1:
+                m10 = (_va[:, 1] == prop_seq[:, 0]).float().mean().item()
+                m11 = (_va[:, 1] == prop_seq[:, 1]).float().mean().item()
+
+            if not hasattr(rollout_collect_k_spec, "_align_prints"):
+                rollout_collect_k_spec._align_prints = 0
+            if rollout_collect_k_spec._align_prints < 3:
+                print(
+                    f"[align/rollout] k={k} match(0↔0)={m00:.3f} "
+                    f"match(1↔0)={m10:.3f} match(1↔1)={m11:.3f}",
+                    flush=True,
+                )
+                rollout_collect_k_spec._align_prints += 1
 
         verify_argmax = deep_logits.argmax(dim=-1)  # [B, k]
         matches = verify_argmax.eq(prop_seq)
@@ -164,12 +175,15 @@ def rollout_collect_k_spec(
         rw_list = rewards.detach().cpu().tolist()
         for b in range(B):
             for d in range(k):
+                with torch.inference_mode(False):          # leave inference mode
+                    hidden  = hidden_seq[b, d].detach().clone().cpu()
+                    vlogits = deep_logits[b, d].detach().clone().cpu()
                 buf.append(
-                    hidden=hidden_seq[b, d].detach().cpu(),
+                    hidden=hidden,
                     token=int(va_list[b][d]),
                     reward=float(rw_list[b][d]),
                     conf=0.0,
-                    vlogits=deep_logits[b, d].detach().cpu(),
+                    vlogits=vlogits,
                 )
 
         if debug_out is not None:
@@ -209,14 +223,15 @@ def rollout_collect_k_spec(
         # fix single mismatch
         if accept_len < k:
             mismatch_tok = verify_argmax[:, accept_len]
-            h_fix, shallow_past = run_shallow_until_k(
-                spec,
-                input_ids=mismatch_tok.unsqueeze(1),
-                past_key_values=shallow_past,
-                attention_mask=None,
-                use_cache=True,
-            )
-            with torch.no_grad():
+            with adapter_guard(spec, "draft"):
+                h_fix, shallow_past = run_shallow_until_k(
+                    spec,
+                    input_ids=mismatch_tok.unsqueeze(1),
+                    past_key_values=shallow_past,
+                    attention_mask=None,
+                    use_cache=True,
+                )
+            with adapter_guard(spec, "verify"), torch.no_grad():
                 _, deep_past = run_deep_from_k(
                     spec, hidden_k=h_fix, past_key_values=deep_past, use_cache=True
                 )

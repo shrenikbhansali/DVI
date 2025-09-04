@@ -7,7 +7,7 @@ from .modeling import (
     run_shallow_until_k,
     run_deep_from_k,
     exit_logits_from_hidden_k,
-    cast_exit_to_base_dtype,
+    adapter_guard,
 )
 from .sampling import sample_from_logits
 from .utils import theoretical_compression, count_transformer_layers
@@ -19,6 +19,7 @@ from .mem import timing_trace
 class SpecMetrics:
     proposed: int = 0
     accepted: int = 0
+    committed: int = 0
     steps: int = 0
     deep_tokens: int = 0
     comp_ratio_runtime_est: float = 1.0
@@ -29,19 +30,23 @@ class SpecMetrics:
 
     @property
     def deep_to_commit(self) -> float:
-        return self.deep_tokens / max(1, self.accepted)
+        return self.deep_tokens / max(1, self.committed)
 
     def to_dict(self) -> Dict[str, float]:
         return {
             "spec/proposed": float(self.proposed),
             "spec/accepted": float(self.accepted),
+            "spec/committed": float(self.committed),
             "spec/accept_rate": float(self.accept_rate),
             "spec/deep_tokens": float(self.deep_tokens),
             "spec/deep_to_commit": float(self.deep_to_commit),
             "spec/comp_rt_est": float(self.comp_ratio_runtime_est),
         }
 
-@torch.inference_mode()
+# Generation only requires gradients disabled; using ``torch.no_grad`` avoids
+# producing inference tensors that could accidentally leak into later
+# optimisation steps.
+@torch.no_grad()
 def generate_with_dvi_spec(
     model,
     tok,
@@ -59,7 +64,6 @@ def generate_with_dvi_spec(
     """Self-speculative decoding using vectorised block verification."""
 
     model.eval()
-    cast_exit_to_base_dtype(model)
     device = device or next(model.parameters()).device
     k = early_layer if early_layer is not None else getattr(model, "early_layer", None)
     assert isinstance(k, int) and k > 0
@@ -91,19 +95,21 @@ def generate_with_dvi_spec(
     generated: List[List[int]] = [[] for _ in range(B)]
 
     # Prime KV caches on the prompt
-    h_k_prompt, shallow_past = run_shallow_until_k(
-        model,
-        input_ids=input_ids,
-        attention_mask=attn_mask,
-        past_key_values=None,
-        use_cache=True,
-    )
-    _, deep_past = run_deep_from_k(
-        model,
-        hidden_k=h_k_prompt,
-        past_key_values=None,
-        use_cache=True,
-    )
+    with adapter_guard(model, "draft"):
+        h_k_prompt, shallow_past = run_shallow_until_k(
+            model,
+            input_ids=input_ids,
+            attention_mask=attn_mask,
+            past_key_values=None,
+            use_cache=True,
+        )
+    with adapter_guard(model, "verify"):
+        _, deep_past = run_deep_from_k(
+            model,
+            hidden_k=h_k_prompt,
+            past_key_values=None,
+            use_cache=True,
+        )
 
     metrics = SpecMetrics()
     total_new = 0
@@ -117,14 +123,15 @@ def generate_with_dvi_spec(
 
         # ---- draft k tokens ----
         for _ in range(draft_k):
-            h_k, tmp_shallow = run_shallow_until_k(
-                model,
-                input_ids=prev.unsqueeze(1),
-                past_key_values=tmp_shallow,
-                attention_mask=None,
-                use_cache=True,
-            )
-            logits = exit_logits_from_hidden_k(model, h_k)
+            with adapter_guard(model, "draft"):
+                h_k, tmp_shallow = run_shallow_until_k(
+                    model,
+                    input_ids=prev.unsqueeze(1),
+                    past_key_values=tmp_shallow,
+                    attention_mask=None,
+                    use_cache=True,
+                )
+                logits = exit_logits_from_hidden_k(model, h_k)
             nxt = sample_from_logits(logits[:, -1, :], greedy=greedy, temperature=temperature)
             draft_tokens.append(nxt)
             draft_hidden.append(h_k[:, -1, :])
@@ -136,15 +143,44 @@ def generate_with_dvi_spec(
         metrics.proposed += int(B * draft_k)
 
         # ---- verify entire block ----
-        deep_logits, deep_past_full = run_deep_from_k(
-            model,
-            hidden_k=hidden_seq,
-            past_key_values=deep_past,
-            use_cache=True,
-        )
+        with adapter_guard(model, "verify"):
+            deep_logits, deep_past_full = run_deep_from_k(
+                model,
+                hidden_k=hidden_seq,
+                past_key_values=deep_past,
+                use_cache=True,
+            )
         metrics.steps += 1
         metrics.deep_tokens += int(B * draft_k)
         deep_calls = 1
+        import os
+
+        # --- Misalignment debug (prints to stdout) ---
+        if os.getenv("DVI_ALIGN_DEBUG", ""):
+            # Argmax predictions from the deep verifier for the k drafted positions
+            _va = deep_logits.argmax(dim=-1)  # [B, k]
+
+            # Sanity matches:
+            #   m00: deep[:,0] vs draft[:,0]  <-- should roughly match CTAR1 if aligned
+            #   m10: deep[:,1] vs draft[:,0]  <-- if this ≈CTAR1 instead, you're +1 shifted
+            m00 = (_va[:, 0] == prop_seq[:, 0]).float().mean().item()
+            m10 = float("nan")
+            m11 = float("nan")
+            if _va.size(1) > 1:
+                m10 = (_va[:, 1] == prop_seq[:, 0]).float().mean().item()
+                m11 = (_va[:, 1] == prop_seq[:, 1]).float().mean().item()
+
+            # Print only a few times to avoid spam
+            if not hasattr(generate_with_dvi_spec, "_align_prints"):
+                generate_with_dvi_spec._align_prints = 0
+            if generate_with_dvi_spec._align_prints < 3:
+                print(
+                    f"[align/spec] k={draft_k} match(0↔0)={m00:.3f} "
+                    f"match(1↔0)={m10:.3f} match(1↔1)={m11:.3f}",
+                    flush=True,
+                )
+                generate_with_dvi_spec._align_prints += 1
+        # --- end misalignment debug ---
 
         verify_argmax = deep_logits.argmax(dim=-1)  # [B,k]
         matches = verify_argmax.eq(prop_seq)
@@ -177,6 +213,7 @@ def generate_with_dvi_spec(
             last_tokens = accepted_block[:, -1]
             total_new += accept_len
             metrics.accepted += int(B * accept_len)
+            metrics.committed += int(B * accept_len)
 
         if total_new >= max_new_tokens:
             break
@@ -184,19 +221,21 @@ def generate_with_dvi_spec(
         # ---- optional single-token fix ----
         if accept_len < draft_k:
             mismatch_tok = verify_argmax[:, accept_len]
-            h_fix, shallow_past = run_shallow_until_k(
-                model,
-                input_ids=mismatch_tok.unsqueeze(1),
-                past_key_values=shallow_past,
-                attention_mask=None,
-                use_cache=True,
-            )
-            _, deep_past = run_deep_from_k(
-                model,
-                hidden_k=h_fix,
-                past_key_values=deep_past,
-                use_cache=True,
-            )
+            with adapter_guard(model, "draft"):
+                h_fix, shallow_past = run_shallow_until_k(
+                    model,
+                    input_ids=mismatch_tok.unsqueeze(1),
+                    past_key_values=shallow_past,
+                    attention_mask=None,
+                    use_cache=True,
+                )
+            with adapter_guard(model, "verify"):
+                _, deep_past = run_deep_from_k(
+                    model,
+                    hidden_k=h_fix,
+                    past_key_values=deep_past,
+                    use_cache=True,
+                )
             metrics.steps += 1
             metrics.deep_tokens += int(B)
             deep_calls += 1
@@ -206,7 +245,7 @@ def generate_with_dvi_spec(
                 generated[b].append(tok_list[b])
             last_tokens = mismatch_tok
             total_new += 1
-            metrics.accepted += int(B)
+            metrics.committed += int(B)
 
         # safety: ensure ≤ 2 deep calls per block
         assert deep_calls <= 2, "Deep called more than twice in a block"
