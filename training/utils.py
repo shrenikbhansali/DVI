@@ -84,14 +84,18 @@ def build_prompts_from_alpaca(limit: int) -> List[str]:
     return prompts
 
 
-def ctar(bits: List[int], w: int) -> float:
-    if len(bits) < w:
-        return 0.0
-    tot = len(bits) - w + 1
+def ctar(seqs: List[List[int]], w: int) -> float:
+    """Compute w-CTAR across multiple bit sequences without cross-boundary leakage."""
     ok = 0
-    for i in range(tot):
-        if all(bits[i + j] == 1 for j in range(w)):
-            ok += 1
+    tot = 0
+    for bits in seqs:
+        if len(bits) < w:
+            continue
+        win = len(bits) - w + 1
+        tot += win
+        for i in range(win):
+            if all(bits[i + j] == 1 for j in range(w)):
+                ok += 1
     return ok / max(1, tot)
 
 
@@ -225,11 +229,15 @@ def measure_generate_walltime(
       - (elapsed_seconds, spec_metrics_dict) if use_dvi_spec=True
 
     Notes:
-      * SPEC microbatch is forced to 1 to avoid 'min across batch' accept_len collapse.
+      * SPEC defaults to microbatch=1 to avoid 'min across batch' accept_len collapse but can be overridden.
       * Baseline can use a larger microbatch for throughput.
     """
     device = next(model.parameters()).device
     model.eval()
+    mb = max(1, int(microbatch_spec if use_dvi_spec else microbatch_base))
+    dtype = next(model.parameters()).dtype
+    mode = "spec" if use_dvi_spec else "base"
+    print(f"[time] mode={mode}; device={device}; dtype={dtype}; microbatch={mb}", flush=True)
 
     # Sane generation config
     try:
@@ -298,7 +306,9 @@ def measure_generate_walltime(
     def _slice_enc(enc, s, e):
         return {k: v[s:e] for k, v in enc.items()}
 
-    @torch.inference_mode()
+    # ``torch.no_grad`` is sufficient for generation benchmarking here and
+    # avoids returning tensors marked as inference.
+    @torch.no_grad()
     def _baseline_once(enc_chunk, force_greedy: bool) -> float:
         _cuda_sync()
         t0 = time.perf_counter()
@@ -317,7 +327,7 @@ def measure_generate_walltime(
         _cuda_sync()
         return time.perf_counter() - t0
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def _spec_once(enc_chunk) -> (float, Dict[str, float]):
         deep_kv_purge(model)
         from training.spec_decode import generate_with_dvi_spec
@@ -352,9 +362,10 @@ def measure_generate_walltime(
         total_elapsed = 0.0
         agg_proposed = 0
         agg_accepted = 0
+        agg_committed = 0
+        agg_deep = 0
 
         s = 0
-        mb = 1
 
         while s < B:
             e = min(s + mb, B)
@@ -365,6 +376,8 @@ def measure_generate_walltime(
                     total_elapsed += dt
                     agg_proposed += int(spec_dict.get("spec/proposed", 0))
                     agg_accepted += int(spec_dict.get("spec/accepted", 0))
+                    agg_committed += int(spec_dict.get("spec/committed", 0))
+                    agg_deep += int(spec_dict.get("spec/deep_tokens", 0))
                 else:
                     total_elapsed += _baseline_once(enc_chunk, force_greedy=greedy)
             except RuntimeError as err:
@@ -376,6 +389,8 @@ def measure_generate_walltime(
                         total_elapsed += dt
                         agg_proposed += int(spec_dict.get("spec/proposed", 0))
                         agg_accepted += int(spec_dict.get("spec/accepted", 0))
+                        agg_committed += int(spec_dict.get("spec/committed", 0))
+                        agg_deep += int(spec_dict.get("spec/deep_tokens", 0))
                     else:
                         total_elapsed += _baseline_once(enc_fallback, force_greedy=True)
                     e = s + 1
@@ -391,7 +406,10 @@ def measure_generate_walltime(
             spec_last = {
                 "spec/proposed": float(agg_proposed),
                 "spec/accepted": float(agg_accepted),
+                "spec/committed": float(agg_committed),
                 "spec/accept_rate": float(acc),
+                "spec/deep_tokens": float(agg_deep),
+                "spec/deep_to_commit": float(agg_deep / max(1, agg_committed)),
             }
 
         times.append(total_elapsed)

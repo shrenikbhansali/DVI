@@ -68,7 +68,9 @@ def run_eval(
         ray.get(ans_handles)
 
 
-@torch.inference_mode()
+# Disable gradients without enabling inference mode so any tensors produced
+# here remain compatible with autograd in subsequent training.
+@torch.no_grad()
 def get_model_answers(
         model,
         tokenizer,
