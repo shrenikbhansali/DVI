@@ -1,5 +1,5 @@
 """Rollout utilities and buffer debug helpers."""
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional
 
 import json
 import torch
@@ -19,16 +19,9 @@ __all__ = ["rollout_collect", "rollout_collect_k_spec", "buf_debug"]
 
 
 @torch.no_grad()
-def rollout_collect(
-    spec,
-    tok,
-    prompt: str,
-    buf: ReplayBuffer,
-    steps: int,
-    debug_out: Optional[List[Dict]] = None,
-    topk: int = 5,
-    telemetry: Optional[AlignTelemetryParams] = None,
-) -> int:
+def rollout_collect(spec, tok, prompt: str,
+                    buf: ReplayBuffer, steps: int,
+                    debug_out: Optional[List[Dict]] = None, topk: int = 5) -> int:
     """Legacy single-token rollout forwarded to k-spec path."""
     return rollout_collect_k_spec(
         spec,
@@ -41,7 +34,6 @@ def rollout_collect(
         temperature=1.0,
         debug_out=debug_out,
         topk=topk,
-        telemetry=telemetry,
     )
 
 
@@ -54,8 +46,6 @@ def rollout_collect_k_spec(
     steps: int,
     *,
     k: int = 1,
-    spec_adaptive: bool = False,
-    eta: float = 0.6,
     greedy: bool = False,
     temperature: float = 1.0,
     debug_out: Optional[List[Dict]] = None,
@@ -118,54 +108,31 @@ def rollout_collect_k_spec(
     B = input_ids.size(0)
     n_collected = 0
     steps_done = 0
-    next_seed_hidden: Optional[torch.Tensor] = None
-    next_seed_past: Optional[Tuple] = None
 
     while steps_done < steps:
-        draft_tokens: List[torch.Tensor] = []
-        draft_hidden: List[torch.Tensor] = []
+        draft_tokens = []
+        draft_hidden = []
         tmp_shallow = shallow_past
         prev = last_tokens
-        shallow_snaps: List[Tuple] = []
-        drafted = 0
-
-        while drafted < k:
-            if drafted == 0 and next_seed_hidden is not None and next_seed_past is not None:
-                h_k = next_seed_hidden
-                tmp_shallow = next_seed_past
-                next_seed_hidden = None
-                next_seed_past = None
-            else:
-                with adapter_guard(spec, "draft"):
-                    h_k, tmp_shallow = run_shallow_until_k(
-                        spec,
-                        input_ids=prev.unsqueeze(1),
-                        past_key_values=tmp_shallow,
-                        attention_mask=None,
-                        use_cache=True,
-                    )
-            logits = exit_logits_from_hidden_k(spec, h_k)
-            pmax = torch.softmax(logits[:, -1, :], dim=-1).amax(dim=-1)
+        shallow_snaps = []
+        for _ in range(k):
+            with adapter_guard(spec, "draft"):
+                h_k, tmp_shallow = run_shallow_until_k(
+                    spec,
+                    input_ids=prev.unsqueeze(1),
+                    past_key_values=tmp_shallow,
+                    attention_mask=None,
+                    use_cache=True,
+                )
+                logits = exit_logits_from_hidden_k(spec, h_k)
             nxt = sample_from_logits(logits[:, -1, :], greedy=greedy, temperature=temperature)
             draft_tokens.append(nxt)
             draft_hidden.append(h_k[:, -1, :])
             shallow_snaps.append(tmp_shallow)
             prev = nxt
-            drafted += 1
-            if spec_adaptive and bool((pmax < eta).item()):
-                break
 
-        with adapter_guard(spec, "draft"):
-            pre_h, pre_past = run_shallow_until_k(
-                spec,
-                input_ids=prev.unsqueeze(1),
-                past_key_values=tmp_shallow,
-                attention_mask=None,
-                use_cache=True,
-            )
-
-        prop_seq = torch.stack(draft_tokens, dim=1)
-        hidden_seq = torch.stack(draft_hidden, dim=1)
+        prop_seq = torch.stack(draft_tokens, dim=1)   # [B,k]
+        hidden_seq = torch.stack(draft_hidden, dim=1) # [B,k,H]
 
         kv_len_shallow_before = kv_len_shallow
         kv_len_deep_before = kv_len_deep
@@ -183,32 +150,40 @@ def rollout_collect_k_spec(
             deep_argmax = deep_logits.argmax(dim=-1)
             matches0 = deep_argmax.eq(prop_seq)
 
+        # --- longest common prefix at t=0 ---
         all_matched0 = matches0.all(dim=1)
         first_mismatch0 = (~matches0).float().argmax(dim=1)
         prefix_lens0 = torch.where(
-            all_matched0, torch.full_like(first_mismatch0, drafted), first_mismatch0
+            all_matched0, torch.full_like(first_mismatch0, k), first_mismatch0
         )
-        accept_len = int(prefix_lens0[0].item())
+        accept_len = int(prefix_lens0.min().item())
         prefix_lens = prefix_lens0
 
+        # --- ALSO consider +1 offset alignment; take the larger ---
         if deep_argmax.size(1) > 1:
-            matches1 = deep_argmax[:, 1:].eq(prop_seq[:, :-1])
+            matches1 = deep_argmax[:, 1:].eq(prop_seq[:, :-1])  # [B,k-1]
             all_matched1 = matches1.all(dim=1)
             first_mismatch1 = (~matches1).float().argmax(dim=1)
             prefix_lens1 = torch.where(
-                all_matched1, torch.full_like(first_mismatch1, drafted - 1), first_mismatch1
+                all_matched1, torch.full_like(first_mismatch1, k - 1), first_mismatch1
             )
-            accept_len_p1 = int(prefix_lens1[0].item())
+            accept_len_p1 = int(prefix_lens1.min().item())
             if accept_len_p1 > accept_len:
                 accept_len = accept_len_p1
                 prefix_lens = prefix_lens1
+
+        # If verifier KV wasn't returned, don't accept a positive prefix
+        if deep_past_full is None and accept_len > 0:
+            accept_len = 0
+            prefix_lens = torch.zeros_like(prefix_lens)
 
         # ---- buffer training examples: accepted prefix tokens + one mismatch (if any) ----
         va_list = deep_argmax.detach().cpu().tolist()
         for b in range(B):
             m = int(prefix_lens[b].item())
-            if m == drafted:
-                for d in range(drafted):
+            if m == k:
+                # verifier accepted all k tokens – record each one
+                for d in range(k):
                     with torch.inference_mode(False):
                         hidden = hidden_seq[b, d].detach().clone().cpu()
                         vlogits = deep_logits[b, d].detach().clone().cpu()
@@ -219,8 +194,9 @@ def rollout_collect_k_spec(
                         conf=0.0,
                         vlogits=vlogits,
                     )
-                kept = drafted
+                kept = k
             else:
+                # record the accepted prefix (m) and then the mismatch (1)
                 for d in range(m):
                     with torch.inference_mode(False):
                         hidden = hidden_seq[b, d].detach().clone().cpu()
@@ -261,8 +237,10 @@ def rollout_collect_k_spec(
             except Exception:
                 pass
 
+        # ---- mutate caches: accept common prefix or commit one verifier token on miss ----
         if accept_len > 0:
             accepted_block = prop_seq[:, :accept_len]
+            # update shallow cache from snapshot
             snap = shallow_snaps[accept_len - 1]
             new_shallow = []
             for (k_, v_) in snap:
@@ -271,6 +249,7 @@ def rollout_collect_k_spec(
                 new_shallow.append((ks, vs))
             shallow_past = tuple(new_shallow)
 
+            # deep cache: use verifier PKV slice
             if deep_past_full is not None:
                 past_len_d = deep_past[0][0].shape[2] if deep_past and deep_past[0] is not None else 0
                 new_deep = []
@@ -280,6 +259,7 @@ def rollout_collect_k_spec(
                     new_deep.append((ks, vs))
                 deep_past = tuple(new_deep)
             else:
+                # fall back: advance via model path if verifier PKV missing
                 advance_kv_with_committed(spec, accepted_block)
                 pkv = getattr(spec, "past_key_values", None) or getattr(getattr(spec, "model", None), "past_key_values", None)
                 if pkv is not None:
@@ -287,13 +267,8 @@ def rollout_collect_k_spec(
                     deep_past    = tuple((k_.contiguous().clone(), v_.contiguous().clone()) for (k_, v_) in pkv[split_idx:])
 
             last_tokens = accepted_block[:, -1]
-            if accept_len == drafted:
-                next_seed_hidden = pre_h
-                next_seed_past = pre_past
-            else:
-                next_seed_hidden = None
-                next_seed_past = None
         else:
+            # Commit exactly one verifier token on miss, keeping caches in sync.
             mismatch_tok = deep_argmax[:, 0]
             advance_kv_with_committed(spec, mismatch_tok.unsqueeze(1))
             pkv = getattr(spec, "past_key_values", None) or getattr(getattr(spec, "model", None), "past_key_values", None)
@@ -301,8 +276,6 @@ def rollout_collect_k_spec(
                 shallow_past = tuple((k_.contiguous().clone(), v_.contiguous().clone()) for (k_, v_) in pkv[:split_idx])
                 deep_past    = tuple((k_.contiguous().clone(), v_.contiguous().clone()) for (k_, v_) in pkv[split_idx:])
             last_tokens = mismatch_tok
-            next_seed_hidden = None
-            next_seed_past = None
 
         # persist cache state back onto the model for external observers (**as list**)
         sp = tuple(shallow_past) if shallow_past is not None else tuple()
@@ -333,14 +306,14 @@ def rollout_collect_k_spec(
         logger.block_report(
             phase="rollout",
             step_idx=steps_done,
-            k=drafted,
+            k=k,
             B=B,
             greedy=greedy,
             temperature=temperature,
             prop_seq=prop_seq,
             deep_logits=deep_logits,
             deep_argmax=deep_argmax,
-            accept_len_default=int(prefix_lens0[0].item()),
+            accept_len_default=int(prefix_lens0.min().item()),
             kv_len_shallow_before=kv_len_shallow_before,
             kv_len_deep_before=kv_len_deep_before,
             kv_len_shallow_after=kv_len_shallow,
