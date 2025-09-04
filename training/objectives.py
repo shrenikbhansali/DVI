@@ -32,33 +32,56 @@ def _logit_stats(s_logits: torch.Tensor, t_logits: torch.Tensor) -> Tuple[float,
 
 def one_mixed_step(model, opt, batch,
                    temperature=1.0, clip=1.0,
-                   ce_weight=0.20,
+                   ce_weight=0.10,
                    lam_pg=0.0, lam_kl=1.0, ent_weight=0.0,
-                   init_fro: float = None, max_fro: float = 0.0, max_fro_ratio: float = 0.0):
+                   init_fro: float = None, max_fro: float = 0.0, max_fro_ratio: float = 0.0,
+                   ce_mask_by_reward: bool = False):
     dev = next(model.parameters()).device
-    hidden = batch["hidden"].to(dev)
-    vlogits = batch["vlogits"].to(dev)
+    #
+    # Batches sampled from the replay buffer may contain tensors that were
+    # created while ``torch.inference_mode`` was active (e.g. during the
+    # rollout collection or evaluation stages).  Such tensors carry the
+    # "inference" flag which prevents autograd from saving them for backward
+    # and triggers errors when we attempt to optimise the exit head.  Cloning
+    # the tensors inside an ``inference_mode(False)`` block converts them back
+    # into normal tensors that autograd can use.
+    with torch.inference_mode(False):
+        hidden = batch["hidden"].to(dev).clone()
+        vlogits = batch["vlogits"].to(dev).clone()
     tokens = batch["token"].to(dev).view(-1)
+    rewards = batch.get("reward", torch.ones_like(tokens, dtype=torch.float32, device=dev)).to(dev).view(-1)
 
     h = hidden.float()
     if hasattr(model, "exit_pre_norm") and model.exit_pre_norm is not None:
         h = model.exit_pre_norm(h)
     slogits = model.exit_proj(h)
     if hasattr(model, "exit_logit_scale"):
-        slogits = model.exit_logit_scale * slogits
+        slogits = model.exit_logit_scale.to(slogits.dtype) * slogits
 
     slogp = F.log_softmax(slogits, dim=-1)
     sp = slogp.exp()
 
     pi_v = sp.gather(1, tokens.view(-1, 1)).squeeze(1)
-    loss_pg = -torch.log(pi_v.clamp_min(1e-8)).mean()
+    pos = rewards.gt(0)
+    count_pos = pos.float().sum().clamp_min(1.0)
+    loss_pg = -(rewards * torch.log(pi_v.clamp_min(1e-8))).sum() / count_pos
 
     tlogits = vlogits.float() / float(temperature)
     tlogp = F.log_softmax(tlogits, dim=-1)
     tp = tlogp.exp()
     kl = F.kl_div(input=slogp, target=tp, reduction="batchmean", log_target=False)
 
-    ce = F.nll_loss(slogp, tokens, reduction="mean") if ce_weight > 0.0 else torch.tensor(0.0, device=dev)
+    if ce_weight > 0.0:
+        if ce_mask_by_reward:
+            mask = rewards > 0
+            if mask.any():
+                ce = F.nll_loss(slogp[mask], tokens[mask], reduction="mean")
+            else:
+                ce = torch.tensor(0.0, device=dev)
+        else:
+            ce = F.nll_loss(slogp, tokens, reduction="mean")
+    else:
+        ce = torch.tensor(0.0, device=dev)
     ent = -(sp * slogp).sum(-1).mean()
 
     loss = lam_pg * loss_pg + lam_kl * kl + ce_weight * ce - ent_weight * ent
@@ -89,39 +112,36 @@ def one_mixed_step(model, opt, batch,
 
 
 def policy_kl_ent_multi_step(
-    step_records: List[Dict[str, torch.Tensor]],
+    records: List[Dict[str, torch.Tensor]],
     *,
     kl_weight: float = 1.0,
     ent_weight: float = 0.0,
-    baseline: float = 0.0,
+    baseline: float = 0.0,  # kept for back-compat; not used
 ) -> Dict[str, torch.Tensor]:
-    """Compute multi-step policy gradient with KL and entropy regularisation.
+    """Aggregate -log π_S(t^V), KL(p_V‖p_S) and entropy over ``records`` (``baseline`` unused)."""
 
-    Each element of ``step_records`` should contain ``logp_exit`` (log prob of
-    the taken action), ``logits_exit`` and ``logits_verifier`` for KL,
-    and ``reward`` (scalar reward for that position).
-    """
+    if len(records) == 0:
+        raise ValueError("records must be non-empty")
 
-    if len(step_records) == 0:
-        raise ValueError("step_records must be non-empty")
-
-    pg_terms = []
+    ce_terms = []
     kl_terms = []
     ent_terms = []
-    for rec in step_records:
-        logp = rec["logp_exit"]
-        reward = rec["reward"]
-        adv = reward - baseline
-        pg_terms.append(-adv.detach() * logp)
+    for rec in records:
+        slogits = rec["logits_exit"]
+        tlogits = rec["logits_verifier"].detach()
+        token = rec["token"].view(-1)
 
-        if "logits_exit" in rec and "logits_verifier" in rec:
-            s_logp = F.log_softmax(rec["logits_exit"], dim=-1)
-            t_logp = F.log_softmax(rec["logits_verifier"].detach(), dim=-1)
-            kl_terms.append(F.kl_div(s_logp, t_logp.exp(), reduction="batchmean", log_target=False))
-            ent_terms.append(-(s_logp.exp() * s_logp).sum(-1).mean())
+        s_logp = F.log_softmax(slogits, dim=-1)
+        sp = s_logp.exp()
+        ce_terms.append(F.nll_loss(s_logp, token, reduction="mean"))
 
-    pg = torch.stack(pg_terms).mean()
-    kl = torch.stack(kl_terms).mean() if kl_terms else torch.tensor(0.0, device=pg.device)
-    ent = torch.stack(ent_terms).mean() if ent_terms else torch.tensor(0.0, device=pg.device)
-    loss = pg + kl_weight * kl - ent_weight * ent
-    return {"loss": loss, "pg": pg, "kl": kl, "ent": ent}
+        kl_terms.append(
+            F.kl_div(s_logp, F.softmax(tlogits, dim=-1), reduction="batchmean", log_target=False)
+        )
+        ent_terms.append(-(sp * s_logp).sum(-1).mean())
+
+    ce = torch.stack(ce_terms).mean()
+    kl = torch.stack(kl_terms).mean()
+    ent = torch.stack(ent_terms).mean()
+    loss = ce + kl_weight * kl - ent_weight * ent
+    return {"loss": loss, "pg": ce, "kl": kl, "ent": ent}

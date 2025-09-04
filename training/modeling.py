@@ -1,12 +1,15 @@
 """Model assembly helpers for DVI training."""
 import copy
+import os
+import contextlib
 from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
 
 from kangaroo.earlyexit import EarlyExitLlamaForCausalLM
-from kangaroo.sgp_lora import inject_dual_lora, enable_lora_grads
+from kangaroo.sgp_lora import attach_dual_lora, enable_lora_grads, set_active_adapter
+from .mem import timing_trace
 
 __all__ = [
     "prepare_dvi_trainable",
@@ -14,6 +17,8 @@ __all__ = [
     "run_shallow_until_k",
     "run_deep_from_k",
     "exit_logits_from_hidden_k",
+    "cast_exit_to_base_dtype",
+    "adapter_guard",
 ]
 
 # ---------------------------------------------------------------------------
@@ -43,9 +48,20 @@ def _llama_model(model):
     )
     for path in candidates:
         m = _get_by_path(model, path)
-        if m is not None and hasattr(m, "layers") and hasattr(m, "_prepare_decoder_attention_mask"):
+        if m is not None and hasattr(m, "layers"):
             return m
     raise AttributeError("Could not locate inner decoder model with `.layers`.")
+
+
+def _early_model(model):
+    """Locate the EarlyExitLlamaForCausalLM instance if wrapped by PEFT."""
+    if hasattr(model, "forward_draft_or_large_model"):
+        return model
+    for path in ("base_model.model", "model", "model.model"):
+        m = _get_by_path(model, path)
+        if m is not None and hasattr(m, "forward_draft_or_large_model"):
+            return m
+    return None
 
 
 def _resolve_early_layer(model) -> int:
@@ -84,11 +100,18 @@ class _SafeLinear(nn.Linear):
 # Public API
 # ---------------------------------------------------------------------------
 
-def prepare_dvi_trainable(model_id: str, early_layer: int, dtype: torch.dtype = torch.float16) -> EarlyExitLlamaForCausalLM:
+def prepare_dvi_trainable(
+    model_id: str,
+    early_layer: int,
+    *,
+    rank_s: int = 8,
+    rank_v: int = 0,
+    dtype: torch.dtype = torch.float16,
+) -> EarlyExitLlamaForCausalLM:
     model = EarlyExitLlamaForCausalLM.from_pretrained(
         model_id, torch_dtype=dtype, device_map="auto", EARLY_STOP_LAYER=early_layer
     )
-    model = inject_dual_lora(model, exit_layer=early_layer, rank=8)
+    model = attach_dual_lora(model, split_layer=early_layer, rank_s=rank_s, rank_v=rank_v)
 
     # ---- expose split index on top-level and common submodules/configs ----
     try:
@@ -111,11 +134,11 @@ def prepare_dvi_trainable(model_id: str, early_layer: int, dtype: torch.dtype = 
                 pass
     # ----------------------------------------------------------------------
 
-    # Freeze base; enable only LoRA-S + exit head stack
+    # Freeze base; enable only draft LoRA + exit head stack
     for p in model.parameters():
         p.requires_grad = False
-    enable_lora_grads(model, "lora_S", True)
-    enable_lora_grads(model, "lora_D", False)
+    enable_lora_grads(model, "lora_draft", True)
+    enable_lora_grads(model, "lora_verify", False)
 
     # ----- HEADS: keep the draft head in float32 and auto-cast inputs -----
     with torch.no_grad():
@@ -161,7 +184,7 @@ def build_optimizer(model, lr_exit=2e-4, lr_lora=5e-5, wd_exit=1e-2, wd_lora=0.0
     groups = [
         {"params": head_params, "lr": lr_exit, "weight_decay": wd_exit},
     ]
-    lora_s = [p for n, p in model.named_parameters() if p.requires_grad and "lora_S" in n]
+    lora_s = [p for n, p in model.named_parameters() if p.requires_grad and "lora_draft" in n]
     if lora_s:
         groups.append({"params": lora_s, "lr": lr_lora, "weight_decay": wd_lora})
     return torch.optim.AdamW(groups, betas=(0.9, 0.999), eps=1e-8)
@@ -170,6 +193,55 @@ def build_optimizer(model, lr_exit=2e-4, lr_lora=5e-5, wd_exit=1e-2, wd_lora=0.0
 def _decoder_layers(model):
     """Return transformer decoder layers list for HF/PEFT LLaMA-style models."""
     return _llama_model(model).layers
+
+
+def cast_exit_to_base_dtype(model) -> None:
+    """Cast draft head stack to the base model's lm_head dtype for fast inference."""
+    base_dtype = getattr(model.lm_head.weight, "dtype", torch.float16)
+    if hasattr(model, "exit_proj"):
+        model.exit_proj.to(dtype=base_dtype)
+    if hasattr(model, "exit_pre_norm") and model.exit_pre_norm is not None:
+        model.exit_pre_norm.to(dtype=base_dtype)
+    if hasattr(model, "exit_logit_scale"):
+        model.exit_logit_scale.data = model.exit_logit_scale.data.to(base_dtype)
+    try:
+        model._exit_cast_dtype = base_dtype
+    except Exception:
+        pass
+
+
+@contextlib.contextmanager
+def adapter_guard(model, name: str):
+    """Temporarily switch LoRA adapter, restoring previous on exit."""
+    prev = getattr(model, "_dvi_active_adapter", None)
+    try:
+        _ensure_active_adapter(model, name)
+        yield
+    finally:
+        cur = getattr(model, "_dvi_active_adapter", None)
+        if prev != cur:
+            if prev is not None:
+                set_active_adapter(model, prev)
+            else:
+                try:
+                    set_active_adapter(model, None)
+                except Exception:
+                    pass
+            try:
+                model._dvi_active_adapter = prev
+            except Exception:
+                pass
+
+
+def _ensure_active_adapter(model, name: str) -> None:
+    """Switch LoRA adapter only when necessary to avoid redundant work."""
+    cur = getattr(model, "_dvi_active_adapter", None)
+    if cur != name:
+        set_active_adapter(model, name)
+        try:
+            model._dvi_active_adapter = name
+        except Exception:
+            pass
 
 
 def run_shallow_until_k(
@@ -181,9 +253,29 @@ def run_shallow_until_k(
     use_cache: bool = True,
 ):
     """Run embedding + layers [:k] to obtain hidden at split and updated KVs."""
+    _ensure_active_adapter(model, "draft")
+    early = _early_model(model)
+
+    # Try fast-path only if enabled and no external KV is provided
+    if early is not None and past_key_values is None and not os.getenv("DVI_DISABLE_EARLY_FASTPATH"):
+        try:
+            out = early.forward_draft_or_large_model(
+                in_tokens_small=input_ids, position_ids=None, use_cache=use_cache
+            )
+        except TypeError:
+            # older signatures without use_cache
+            out = early.forward_draft_or_large_model(
+                in_tokens_small=input_ids, position_ids=None
+            )
+        kvs = getattr(early, "past_key_values", None)
+        if use_cache and kvs is not None:
+            k = _resolve_early_layer(early)
+            return out, tuple(kvs[:k])
+        # else: fall through to manual path
+
+    # fallback manual path
     k = _resolve_early_layer(model)
     lm = _llama_model(model)
-
     B, T = input_ids.shape
     device = input_ids.device
 
@@ -193,12 +285,24 @@ def run_shallow_until_k(
     if past_key_values and past_key_values[0] is not None:
         past_len = past_key_values[0][0].shape[2]
 
-    if attention_mask is None:
-        attention_mask = torch.ones((B, past_len + T), dtype=torch.bool, device=device)
-    attn_mask = lm._prepare_decoder_attention_mask(
-        attention_mask, (B, T), hidden_states, past_len
-    )
-    position_ids = torch.arange(past_len, past_len + T, device=device).unsqueeze(0).expand(B, T)
+    if past_len > 0:
+        attn_mask = None
+        position_ids = (
+            torch.arange(past_len, past_len + T, device=device)
+            .unsqueeze(0)
+            .expand(B, T)
+        )
+        timing_trace("run_shallow_until_k: cached fast-path mask skip")
+    else:
+        if attention_mask is None:
+            attention_mask = torch.ones((B, T), dtype=torch.bool, device=device)
+        attn_mask = lm._prepare_decoder_attention_mask(
+            attention_mask,
+            (B, T),
+            hidden_states,
+            0,
+        )
+        position_ids = torch.arange(0, T, device=device).unsqueeze(0).expand(B, T)
 
     if past_key_values is None:
         past_key_values = tuple([None] * k)
@@ -229,9 +333,29 @@ def run_deep_from_k(
     use_cache: bool = True,
 ):
     """Run only layers [k:] given hidden states at split layer."""
+    _ensure_active_adapter(model, "verify")
+    early = _early_model(model)
+
+    # Try fast-path only if enabled and no external KV is provided
+    if early is not None and past_key_values is None and not os.getenv("DVI_DISABLE_EARLY_FASTPATH"):
+        try:
+            deep_hidden, norm = early.forward_draft_or_large_model(
+                in_features_large=hidden_k, use_cache=use_cache
+            )
+        except TypeError:
+            deep_hidden, norm = early.forward_draft_or_large_model(
+                in_features_large=hidden_k
+            )
+        kvs = getattr(early, "past_key_values", None)
+        if use_cache and kvs is not None:
+            k = _resolve_early_layer(early)
+            logits = model.lm_head(norm)
+            return logits, tuple(kvs[k:])
+        # else: fall through to manual path
+
+    # fallback manual path
     k = _resolve_early_layer(model)
     lm = _llama_model(model)
-
     B, T, _ = hidden_k.shape
     device = hidden_k.device
 
@@ -239,11 +363,23 @@ def run_deep_from_k(
     if past_key_values and past_key_values[0] is not None:
         past_len = past_key_values[0][0].shape[2]
 
-    attention_mask = torch.ones((B, past_len + T), dtype=torch.bool, device=device)
-    attn_mask = lm._prepare_decoder_attention_mask(
-        attention_mask, (B, T), hidden_k, past_len
-    )
-    position_ids = torch.arange(past_len, past_len + T, device=device).unsqueeze(0).expand(B, T)
+    if past_len > 0 and past_key_values is not None:
+        attn_mask = None
+        position_ids = (
+            torch.arange(past_len, past_len + T, device=device)
+            .unsqueeze(0)
+            .expand(B, T)
+        )
+        timing_trace("run_deep_from_k: cached fast-path mask skip")
+    else:
+        attention_mask = torch.ones((B, T), dtype=torch.bool, device=device)
+        attn_mask = lm._prepare_decoder_attention_mask(
+            attention_mask,
+            (B, T),
+            hidden_k,
+            0,
+        )
+        position_ids = torch.arange(0, T, device=device).unsqueeze(0).expand(B, T)
 
     deep_layers = lm.layers[k:]
     if past_key_values is None:
@@ -271,26 +407,11 @@ def run_deep_from_k(
 
 
 def exit_logits_from_hidden_k(model, hidden_k: torch.Tensor) -> torch.Tensor:
-    """Project hidden states at split layer to draft logits (dtype-safe)."""
+    """Project hidden states at split layer to draft logits."""
     h = hidden_k
-
-    # Run pre-norm in its own dtype (float32 here)
-    if hasattr(model, "exit_pre_norm") and model.exit_pre_norm is not None and hasattr(model.exit_pre_norm, "weight"):
-        pre_dtype = model.exit_pre_norm.weight.dtype
-        if h.dtype != pre_dtype:
-            h = h.to(pre_dtype)
+    if hasattr(model, "exit_pre_norm") and model.exit_pre_norm is not None:
         h = model.exit_pre_norm(h)
-
-    # _SafeLinear will upcast if needed, but we align explicitly
-    proj_dtype = model.exit_proj.weight.dtype
-    if h.dtype != proj_dtype:
-        h = h.to(proj_dtype)
-
     logits = model.exit_proj(h)
-
     if hasattr(model, "exit_logit_scale"):
-        scale = model.exit_logit_scale
-        if scale.dtype != logits.dtype:
-            scale = scale.to(logits.dtype)
-        logits = scale * logits
+        logits = model.exit_logit_scale.to(logits.dtype) * logits
     return logits
