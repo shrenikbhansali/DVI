@@ -68,6 +68,8 @@ def train_bestcase_kl_rl(model, tok, prompts_train: List[str], prompts_eval: Lis
                         train_k_spec: int = 1,
                         spec_train_greedy: bool = False,
                         spec_train_temp: float = 1.0,
+                        spec_adaptive: bool = False,
+                        eta: float = 0.6,
                         ce_mask_by_reward: bool = False,
                         kl_warmup_scale: float = 1.0,
                         eval_k_max: int = None,
@@ -128,6 +130,8 @@ def train_bestcase_kl_rl(model, tok, prompts_train: List[str], prompts_eval: Lis
                 buf,
                 steps=rollout_len,
                 k=train_k_spec,
+                spec_adaptive=spec_adaptive,
+                eta=eta,
                 greedy=spec_train_greedy,
                 temperature=spec_train_temp,
                 debug_out=dbg_roll,
@@ -400,7 +404,10 @@ def main():
                     help="repeat timing and take median")
     ap.add_argument("--timing-greedy", action="store_true",
                     help="use greedy decoding for walltime timing (default: sampling)")
-    ap.add_argument("--spec-draft-k", type=int, default=4, help="block size for self-spec drafting")
+    ap.add_argument("--spec-k-max", type=int, default=4, help="max speculative lookahead for timing/eval")
+    ap.add_argument("--spec-adaptive", action="store_true", help="enable adaptive speculative lookahead")
+    ap.add_argument("--eta", type=float, default=0.6, help="confidence threshold for adaptive drafting")
+    ap.add_argument("--spec-ctar-target1", type=float, default=None, help="target CTAR1 for runtime controller")
     ap.add_argument("--train-k-spec", type=int, default=1, help="k tokens per speculative draft during training")
     ap.add_argument("--spec-train-greedy", action="store_true", help="use greedy drafting during spec training")
     ap.add_argument("--spec-train-temp", type=float, default=1.0, help="temperature for spec training drafting")
@@ -486,6 +493,8 @@ def main():
         train_k_spec=args.train_k_spec,
         spec_train_greedy=args.spec_train_greedy,
         spec_train_temp=args.spec_train_temp,
+        spec_adaptive=args.spec_adaptive,
+        eta=args.eta,
         ce_mask_by_reward=args.ce_mask_by_reward,
         kl_warmup_scale=args.kl_warmup_scale,
         eval_k_max=args.eval_k_max,
@@ -516,7 +525,10 @@ def main():
         greedy=args.timing_greedy,
         repeats=args.time_repeats,
         use_dvi_spec=True,
-        draft_k=args.spec_draft_k,
+        draft_k=args.spec_k_max,
+        spec_adaptive=args.spec_adaptive,
+        eta=args.eta,
+        spec_ctar_target1=args.spec_ctar_target1,
         temperature=max(1e-6, args.temperature),
         early_layer_override=args.early_layer,
         quiet=True,
@@ -526,9 +538,16 @@ def main():
     print(f"[time] DVI(SPEC) generate: {dvi_time:.3f}s", flush=True)
     if spec_metrics is None:
         spec_metrics = {}
-    acc_rt = float(spec_metrics.get("spec/accept_rate", 0.0))
+    acc_rt = float(spec_metrics.get("spec/accept_rate_from_hist", 0.0))
     comp_rt, _ = theoretical_compression(acc_rt, args.early_layer, total_layers)
-    print(f"[spec] runtime_accept_rate={acc_rt:.3f} | runtime_comp_est≈{comp_rt:.3f}", flush=True)
+    hist_counts = [
+        spec_metrics.get(f"spec/prefix_hist_{i}", 0.0)
+        for i in range(args.spec_k_max + 1)
+    ]
+    print(
+        f"[spec] runtime_accept_rate={acc_rt:.3f} | runtime_comp_est≈{comp_rt:.3f} | prefix_hist={hist_counts}",
+        flush=True,
+    )
 
     deep_kv_purge(model)
     try:

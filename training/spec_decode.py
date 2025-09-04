@@ -95,6 +95,8 @@ def generate_with_dvi_spec(
     enc: Optional[Dict[str, torch.Tensor]] = None,
     max_new_tokens: int = 64,
     draft_k: int = 4,
+    spec_adaptive: bool = False,
+    eta: float = 0.6,
     greedy: bool = False,
     temperature: float = 1.0,
     early_layer: Optional[int] = None,
@@ -124,6 +126,49 @@ def generate_with_dvi_spec(
             attn_mask = attn_mask.to(device)
 
     B = int(input_ids.size(0))
+
+    # If caller provides a batch, process each sequence independently to avoid
+    # cross-sample coupling of acceptance lengths.  This mirrors the behaviour
+    # of Kangaroo where speculative decoding runs per-sequence.
+    if B > 1:
+        outs: List[torch.Tensor] = []
+        agg = SpecMetrics(draft_k=draft_k)
+        agg.prefix_hist = [0 for _ in range(draft_k + 1)]
+        for i in range(B):
+            sub_enc = {"input_ids": input_ids[i : i + 1]}
+            if attn_mask is not None:
+                sub_enc["attention_mask"] = attn_mask[i : i + 1]
+            sub_out, sub_m = generate_with_dvi_spec(
+                model,
+                tok,
+                enc=sub_enc,
+                max_new_tokens=max_new_tokens,
+                draft_k=draft_k,
+                spec_adaptive=spec_adaptive,
+                eta=eta,
+                greedy=greedy,
+                temperature=temperature,
+                early_layer=early_layer,
+                device=device,
+                quiet=quiet,
+                telemetry=telemetry,
+            )
+            outs.extend(sub_out)
+            agg.proposed += sub_m.proposed
+            agg.accepted += sub_m.accepted
+            agg.committed += sub_m.committed
+            agg.steps += sub_m.steps
+            agg.deep_tokens += sub_m.deep_tokens
+            agg.invariant_error += sub_m.invariant_error
+            agg.nan_events += sub_m.nan_events
+            agg.oom_retries += sub_m.oom_retries
+            for j in range(draft_k + 1):
+                agg.prefix_hist[j] += sub_m.prefix_hist[j]
+        # derive runtime compression estimate on aggregate stats
+        total_layers = count_transformer_layers(model)
+        comp_ratio, _ = theoretical_compression(agg.accept_rate, k, total_layers)
+        agg.comp_ratio_runtime_est = comp_ratio
+        return outs, agg
 
     # Choose the true last token per sample (avoid PAD)
     if attn_mask is not None:
@@ -179,33 +224,57 @@ def generate_with_dvi_spec(
     metrics.prefix_hist = [0 for _ in range(draft_k + 1)]
     total_new = 0
 
+    next_seed_hidden: Optional[torch.Tensor] = None
+    next_seed_past: Optional[Tuple] = None
+
     while total_new < max_new_tokens:
         draft_tokens: List[torch.Tensor] = []
         draft_hidden: List[torch.Tensor] = []
         shallow_snapshots: List[Tuple] = []
         tmp_shallow = shallow_past
         prev = last_tokens
+        drafted = 0
 
-        # ---- draft k tokens ----
-        for _ in range(draft_k):
-            with adapter_guard(model, "draft"):
-                h_k, tmp_shallow = run_shallow_until_k(
-                    model,
-                    input_ids=prev.unsqueeze(1),
-                    past_key_values=tmp_shallow,
-                    attention_mask=None,
-                    use_cache=True,
-                )
-                logits = exit_logits_from_hidden_k(model, h_k)
+        # ---- adaptive drafting loop ----
+        while drafted < draft_k:
+            if drafted == 0 and next_seed_hidden is not None and next_seed_past is not None:
+                h_k = next_seed_hidden
+                tmp_shallow = next_seed_past
+                next_seed_hidden = None
+                next_seed_past = None
+            else:
+                with adapter_guard(model, "draft"):
+                    h_k, tmp_shallow = run_shallow_until_k(
+                        model,
+                        input_ids=prev.unsqueeze(1),
+                        past_key_values=tmp_shallow,
+                        attention_mask=None,
+                        use_cache=True,
+                    )
+            logits = exit_logits_from_hidden_k(model, h_k)
+            pmax = torch.softmax(logits[:, -1, :], dim=-1).amax(dim=-1)
             nxt = sample_from_logits(logits[:, -1, :], greedy=greedy, temperature=temperature)
             draft_tokens.append(nxt)
             draft_hidden.append(h_k[:, -1, :])
             shallow_snapshots.append(tmp_shallow)
             prev = nxt
+            drafted += 1
+            if spec_adaptive and bool((pmax < eta).item()):
+                break
 
-        prop_seq = torch.stack(draft_tokens, dim=1)   # [B,k]
-        hidden_seq = torch.stack(draft_hidden, dim=1) # [B,k,H]
-        metrics.proposed += int(B * draft_k)
+        # one-step prefetch for potential next round
+        with adapter_guard(model, "draft"):
+            pre_h, pre_past = run_shallow_until_k(
+                model,
+                input_ids=prev.unsqueeze(1),
+                past_key_values=tmp_shallow,
+                attention_mask=None,
+                use_cache=True,
+            )
+
+        prop_seq = torch.stack(draft_tokens, dim=1)   # [B,drafted]
+        hidden_seq = torch.stack(draft_hidden, dim=1) # [B,drafted,H]
+        metrics.proposed += int(B * drafted)
 
         # ---- verify entire block ----
         kv_len_shallow_before = kv_len_shallow
@@ -219,7 +288,7 @@ def generate_with_dvi_spec(
                 use_cache=True,
             )
         metrics.steps += 1
-        metrics.deep_tokens += int(B * draft_k)
+        metrics.deep_tokens += int(B * drafted)
 
         if not torch.isfinite(deep_logits).all():
             metrics.nan_events += 1
@@ -232,11 +301,11 @@ def generate_with_dvi_spec(
 
         all_matched0 = matches0.all(dim=1)
         first_mismatch0 = (~matches0).float().argmax(dim=1)
-        prefix_lens0 = torch.where(all_matched0, torch.full_like(first_mismatch0, draft_k), first_mismatch0)
+        prefix_lens0 = torch.where(all_matched0, torch.full_like(first_mismatch0, drafted), first_mismatch0)
         counts = torch.bincount(prefix_lens0.to(dtype=torch.long, device="cpu"), minlength=draft_k + 1)
         for i in range(draft_k + 1):
             metrics.prefix_hist[i] += int(counts[i])
-        accept_len_default = int(prefix_lens0.min().item())
+        accept_len_default = int(prefix_lens0[0].item())
 
         accept_len = accept_len_default
 
@@ -245,9 +314,9 @@ def generate_with_dvi_spec(
             all_matched1 = matches1.all(dim=1)
             first_mismatch1 = (~matches1).float().argmax(dim=1)
             prefix_lens1 = torch.where(
-                all_matched1, torch.full_like(first_mismatch1, draft_k - 1), first_mismatch1
+                all_matched1, torch.full_like(first_mismatch1, drafted - 1), first_mismatch1
             )
-            accept_len_p1 = int(prefix_lens1.min().item())
+            accept_len_p1 = int(prefix_lens1[0].item())
             if accept_len_p1 > accept_len:
                 accept_len = accept_len_p1
 
@@ -295,6 +364,13 @@ def generate_with_dvi_spec(
             total_new += accept_len
             metrics.committed += int(B * accept_len)
 
+            if accept_len == drafted:
+                next_seed_hidden = pre_h
+                next_seed_past = pre_past
+            else:
+                next_seed_hidden = None
+                next_seed_past = None
+
             # persist updated KV cache back to model
             sp = tuple(shallow_past) if shallow_past is not None else tuple()
             dp = tuple(deep_past) if deep_past is not None else tuple()
@@ -332,6 +408,8 @@ def generate_with_dvi_spec(
                 )
             total_new += 1
             metrics.committed += int(B)
+            next_seed_hidden = None
+            next_seed_past = None
             sp = tuple(shallow_past) if shallow_past is not None else tuple()
             dp = tuple(deep_past) if deep_past is not None else tuple()
             if sp or dp:
@@ -360,7 +438,7 @@ def generate_with_dvi_spec(
         logger.block_report(
             phase="spec",
             step_idx=metrics.steps,
-            k=draft_k,
+            k=drafted,
             B=B,
             greedy=greedy,
             temperature=temperature,
