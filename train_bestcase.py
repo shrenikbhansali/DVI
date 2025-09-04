@@ -150,6 +150,10 @@ def train_bestcase_kl_rl(model, tok, prompts_train: List[str], prompts_eval: Lis
                 debug_out=dbg_roll,
                 topk=debug_topk,
                 telemetry=telemetry,
+                spec_adaptive=spec_adaptive,
+                eta=eta,
+                greedy=spec_train_greedy,
+                temperature=spec_train_temp,
             )
         _cuda_sync()
         t_roll_e = time.perf_counter()

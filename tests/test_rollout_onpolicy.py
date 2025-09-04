@@ -5,6 +5,7 @@ sys.path.append(str(pathlib.Path(__file__).resolve().parents[1]))
 
 from training.buffer import ReplayBuffer
 from training import rollout as rollout_mod
+from training.align_telemetry import AlignTelemetryParams
 
 
 class DummySpec(torch.nn.Module):
@@ -110,3 +111,37 @@ def test_rollout_adaptive_stop(monkeypatch):
     buf = ReplayBuffer(16, torch.device("cpu"))
     rollout_mod.rollout_collect_k_spec(spec, tok, "hi", buf, steps=1, k=3, greedy=True, spec_adaptive=True, eta=0.9)
     assert len(buf) == 1
+
+
+def test_rollout_collect_forwards_params(monkeypatch):
+    captured = {}
+
+    def fake_rollout_collect_k_spec(*args, **kwargs):
+        captured.update(kwargs)
+        return 0
+
+    monkeypatch.setattr(rollout_mod, "rollout_collect_k_spec", fake_rollout_collect_k_spec)
+
+    spec = DummySpec()
+    tok = make_tok()
+    buf = ReplayBuffer(4, torch.device("cpu"))
+    tele = AlignTelemetryParams(debug=1)
+
+    rollout_mod.rollout_collect(
+        spec,
+        tok,
+        "hi",
+        buf,
+        steps=1,
+        telemetry=tele,
+        spec_adaptive=True,
+        eta=0.7,
+        greedy=False,
+        temperature=0.5,
+    )
+
+    assert captured.get("telemetry") is tele
+    assert captured.get("spec_adaptive") is True
+    assert captured.get("eta") == 0.7
+    assert captured.get("greedy") is False
+    assert captured.get("temperature") == 0.5

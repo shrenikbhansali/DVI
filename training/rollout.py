@@ -19,9 +19,21 @@ __all__ = ["rollout_collect", "rollout_collect_k_spec", "buf_debug"]
 
 
 @torch.no_grad()
-def rollout_collect(spec, tok, prompt: str,
-                    buf: ReplayBuffer, steps: int,
-                    debug_out: Optional[List[Dict]] = None, topk: int = 5) -> int:
+def rollout_collect(
+    spec,
+    tok,
+    prompt: str,
+    buf: ReplayBuffer,
+    steps: int,
+    debug_out: Optional[List[Dict]] = None,
+    topk: int = 5,
+    *,
+    telemetry: Optional[AlignTelemetryParams] = None,
+    spec_adaptive: bool = False,
+    eta: float = 0.0,
+    greedy: bool = True,
+    temperature: float = 1.0,
+) -> int:
     """Legacy single-token rollout forwarded to k-spec path."""
     return rollout_collect_k_spec(
         spec,
@@ -30,10 +42,13 @@ def rollout_collect(spec, tok, prompt: str,
         buf,
         steps,
         k=1,
-        greedy=True,
-        temperature=1.0,
+        greedy=greedy,
+        temperature=temperature,
         debug_out=debug_out,
         topk=topk,
+        telemetry=telemetry,
+        spec_adaptive=spec_adaptive,
+        eta=eta,
     )
 
 
