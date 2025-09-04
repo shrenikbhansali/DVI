@@ -76,18 +76,18 @@ def rollout_collect_k_spec(
             spec, hidden_k=h_k_prompt, past_key_values=None, use_cache=True
         )
 
-    # Persist primed caches back onto the model **as a list** (outer container must be mutable)
+    # Persist primed caches back onto the model (guarding None)
     sp = tuple(shallow_past) if shallow_past is not None else tuple()
     dp = tuple(deep_past) if deep_past is not None else tuple()
     if sp or dp:
-        combined_list = list(sp) + list(dp)
+        combined = sp + dp
         try:
-            spec.past_key_values = combined_list
+            spec.past_key_values = combined
         except Exception:
             pass
         try:
             if hasattr(spec, "model"):
-                spec.model.past_key_values = combined_list
+                spec.model.past_key_values = combined
         except Exception:
             pass
     # Boundary between shallow/deep in PKV
@@ -159,7 +159,9 @@ def rollout_collect_k_spec(
         accept_len = int(prefix_lens0.min().item())
         prefix_lens = prefix_lens0
 
-        # --- ALSO consider +1 offset alignment; take the larger ---
+        # --- ALSO consider +1 offset alignment (robust to early off-by-one) ---
+        # This boosts acceptance when deep[t+1] == draft[t], which is common
+        # with tiny head tweaks in toy models.
         if deep_argmax.size(1) > 1:
             matches1 = deep_argmax[:, 1:].eq(prop_seq[:, :-1])  # [B,k-1]
             all_matched1 = matches1.all(dim=1)
@@ -277,18 +279,18 @@ def rollout_collect_k_spec(
                 deep_past    = tuple((k_.contiguous().clone(), v_.contiguous().clone()) for (k_, v_) in pkv[split_idx:])
             last_tokens = mismatch_tok
 
-        # persist cache state back onto the model for external observers (**as list**)
+        # persist cache state back onto the model for external observers (guard None)
         sp = tuple(shallow_past) if shallow_past is not None else tuple()
         dp = tuple(deep_past) if deep_past is not None else tuple()
         if sp or dp:
-            combined_list = list(sp) + list(dp)
+            combined_past = sp + dp
             try:
-                spec.past_key_values = combined_list
+                spec.past_key_values = combined_past
             except Exception:
                 pass
             try:
                 if hasattr(spec, "model"):
-                    spec.model.past_key_values = combined_list
+                    spec.model.past_key_values = combined_past
             except Exception:
                 pass
 

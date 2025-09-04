@@ -39,9 +39,20 @@ from training.kv import estimate_kv_cache
 from training.rollout import rollout_collect, rollout_collect_k_spec, buf_debug
 from training.objectives import one_mixed_step
 from training.schedule import mix_schedule, phase_of_step
-from training.logging import init_wandb, wandb_watch_model, wandb_log, WANDB_DEFAULT_ENTITY, WANDB_DEFAULT_PROJECT
+from training.logging import (
+    init_wandb,
+    wandb_watch_model,
+    wandb_log,
+    wandb_summary_update,
+    finish_wandb,
+    WANDB_DEFAULT_ENTITY,
+    WANDB_DEFAULT_PROJECT,
+)
 from training.buffer import ReplayBuffer
 from evaluation.acceptance import eval_acceptance
+from training.spec_decode import generate_with_dvi_spec
+from training.align_telemetry import AlignTelemetryParams
+import random
 
 
 def train_bestcase_kl_rl(model, tok, prompts_train: List[str], prompts_eval: List[str],
@@ -58,9 +69,13 @@ def train_bestcase_kl_rl(model, tok, prompts_train: List[str], prompts_eval: Lis
                         train_k_spec: int = 1,
                         spec_train_greedy: bool = False,
                         spec_train_temp: float = 1.0,
+                        spec_adaptive: bool = False,
+                        eta: float = 0.6,
                         ce_mask_by_reward: bool = False,
                         kl_warmup_scale: float = 1.0,
                         eval_k_max: int = None,
+                        timing_greedy: bool = False,
+                        telemetry: AlignTelemetryParams | None = None,
                         ):
     metrics_path = os.path.join(outdir, "logs", "train_metrics.jsonl")
     samples_path = os.path.join(outdir, "logs", "rollout_samples.jsonl")
@@ -117,14 +132,24 @@ def train_bestcase_kl_rl(model, tok, prompts_train: List[str], prompts_eval: Lis
                 buf,
                 steps=rollout_len,
                 k=train_k_spec,
+                spec_adaptive=spec_adaptive,
+                eta=eta,
                 greedy=spec_train_greedy,
                 temperature=spec_train_temp,
                 debug_out=dbg_roll,
                 topk=debug_topk,
+                telemetry=telemetry,
             )
         else:
             n_collected = rollout_collect(
-                model, tok, p, buf, steps=rollout_len, debug_out=dbg_roll, topk=debug_topk
+                model,
+                tok,
+                p,
+                buf,
+                steps=rollout_len,
+                debug_out=dbg_roll,
+                topk=debug_topk,
+                telemetry=telemetry,
             )
         _cuda_sync()
         t_roll_e = time.perf_counter()
@@ -257,8 +282,7 @@ def train_bestcase_kl_rl(model, tok, prompts_train: List[str], prompts_eval: Lis
             "cuda/mem_alloc_MB": mem_alloc, "cuda/mem_reserved_MB": mem_reserved, "cuda/mem_max_alloc_MB": mem_max,
             "tokens/total": tokens_total,
             # added: frequent compression logging
-            "comp/ratio_est": comp_ratio,
-            "comp/speedup_est": speedup_est,
+            "comp/theoretical_from_train": comp_ratio,
         }, step=g)
 
         if dbg_roll:
@@ -281,6 +305,51 @@ def train_bestcase_kl_rl(model, tok, prompts_train: List[str], prompts_eval: Lis
                 log_mid[f"eval/mid/ctar{w}"] = ctar_mid.get(w, 0)
             wandb_log(log_mid, step=g + 1)
 
+            # ----- runtime-style evaluation (free-running) -----
+            rt_prompts = random.sample(prompts_eval, k=min(16, len(prompts_eval)))
+            _, rt_metrics = generate_with_dvi_spec(
+                model,
+                tok,
+                prompts=rt_prompts,
+                max_new_tokens=32,
+                draft_k=train_k_spec,
+                greedy=timing_greedy,
+                temperature=temperature if not timing_greedy else max(1e-6, temperature),
+                early_layer=early_layer,
+                quiet=True,
+                telemetry=telemetry,
+            )
+            rt_dict = rt_metrics.to_dict()
+            rt_dict.update({
+                "spec/greedy": float(timing_greedy),
+                "spec/temperature": float(max(1e-6, temperature) if timing_greedy else temperature),
+                "spec/k": float(train_k_spec),
+                "spec/early_layer": float(early_layer),
+            })
+            log_rt = {f"eval/runtime/{k}": v for k, v in rt_dict.items()}
+            # cross-check CTAR hats vs teacher-forced CTARs
+            mode_mismatch = 0.0
+            if timing_greedy:
+                deltas = []
+                for w in range(1, eval_k_max + 1):
+                    rt_hat = rt_dict.get(f"spec/ctar{w}_hat")
+                    if rt_hat is not None:
+                        tf_ctar = ctar_mid.get(w, 0.0)
+                        delta = abs(rt_hat - tf_ctar)
+                        log_rt[f"eval/runtime/ctar{w}_delta"] = delta
+                        deltas.append(delta)
+                if deltas and max(deltas) > 0.05:
+                    mode_mismatch = 1.0
+            log_rt["eval/runtime/spec/mode_mismatch"] = mode_mismatch
+            wandb_log(log_rt, step=g + 1)
+            hist_msg = " ".join(
+                [f"{k.split('_')[-1]}={int(v)}" for k, v in rt_dict.items() if k.startswith("spec/prefix_hist_")]
+            )
+            print(
+                f"[eval/runtime] step {g+1:04d} acc_rate={rt_dict.get('spec/accept_rate',0.0):.3f} {hist_msg}",
+                flush=True,
+            )
+
     del opt
     del buf
     free_cuda("(pre post-train eval)")
@@ -297,11 +366,14 @@ def train_bestcase_kl_rl(model, tok, prompts_train: List[str], prompts_eval: Lis
     for w in range(1, eval_k_max + 1):
         log_post[f"eval/post/ctar{w}"] = ctar1.get(w, 0)
     wandb_log(log_post, step=steps)
+    wandb_summary_update(log_post)
 
     deep_kv_purge(model)
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+
+    return acc1
 
 
 def main():
@@ -343,7 +415,10 @@ def main():
                     help="repeat timing and take median")
     ap.add_argument("--timing-greedy", action="store_true",
                     help="use greedy decoding for walltime timing (default: sampling)")
-    ap.add_argument("--spec-draft-k", type=int, default=4, help="block size for self-spec drafting")
+    ap.add_argument("--spec-k-max", type=int, default=4, help="max speculative lookahead for timing/eval")
+    ap.add_argument("--spec-adaptive", action="store_true", help="enable adaptive speculative lookahead")
+    ap.add_argument("--eta", type=float, default=0.6, help="confidence threshold for adaptive drafting")
+    ap.add_argument("--spec-ctar-target1", type=float, default=None, help="target CTAR1 for runtime controller")
     ap.add_argument("--train-k-spec", type=int, default=1, help="k tokens per speculative draft during training")
     ap.add_argument("--spec-train-greedy", action="store_true", help="use greedy drafting during spec training")
     ap.add_argument("--spec-train-temp", type=float, default=1.0, help="temperature for spec training drafting")
@@ -353,9 +428,61 @@ def main():
     ap.add_argument("--wandb-project", type=str, default=WANDB_DEFAULT_PROJECT)
     ap.add_argument("--run-name", type=str, default=None)
     ap.add_argument("--quiet-eval", action="store_true")
+    ap.add_argument("--telemetry-debug", type=int, default=0,
+                    help=">0: concise per-block diagnostics to stdout.")
+    ap.add_argument("--telemetry-prints-budget", type=int, default=3,
+                    help="Max telemetry lines printed to stdout.")
+    ap.add_argument("--telemetry-dump-tensors", type=int, default=0,
+                    help=">0: dump small .pt blobs for sample 0.")
+    ap.add_argument("--telemetry-max-blocks", type=int, default=5,
+                    help="Max number of telemetry blocks to dump.")
+    ap.add_argument("--telemetry-save-dir", type=str, default="./dvi_align_dumps",
+                    help="Directory for telemetry JSON/PT dumps.")
+    ap.add_argument("--telemetry-run-id", type=str, default=None,
+                    help="Optional run id used in filenames (default: timestamp).")
+    ap.add_argument("--telemetry-auto-offset", type=int, default=0,
+                    help=">0: compute acceptance by best of {offset 0, +1}.")
+    ap.add_argument("--telemetry-topk", type=int, default=5,
+                    help="Optional: top-k to include in debug contexts, if used.")
     args = ap.parse_args()
-    args.eval_k_max = args.eval_k_max or args.train_k_spec
 
+    # --- Initialize W&B and merge sweep overrides back into args ---
+    run = init_wandb(args)
+    try:
+        import wandb  # local import to avoid hard dependency if --no-wandb
+        if (not getattr(args, "no_wandb", False)) and wandb.run is not None:
+            # Merge config -> args so the rest of the script uses sweep values
+            for k, v in dict(wandb.config).items():
+                if hasattr(args, k):
+                    setattr(args, k, v)
+            # (Re)compute any dependent args AFTER merge
+            args.eval_k_max = args.eval_k_max or args.train_k_spec
+            # Log resolved args once for convenience
+            arg_log = {}
+            for k, v in vars(args).items():
+                if isinstance(v, (int, float, str, bool)) or v is None:
+                    arg_log[f"args/{k}"] = v
+            wandb_log(arg_log, step=0)
+    except Exception:
+        # If wandb not available or disabled, fall back silently
+        args.eval_k_max = args.eval_k_max or args.train_k_spec
+
+    # Make sure eval_k_max is set even if W&B is disabled
+    if getattr(args, "eval_k_max", None) is None:
+        args.eval_k_max = args.train_k_spec
+
+    telemetry = AlignTelemetryParams(
+        debug=args.telemetry_debug,
+        prints_budget=args.telemetry_prints_budget,
+        dump_tensors=args.telemetry_dump_tensors,
+        max_blocks=args.telemetry_max_blocks,
+        save_dir=args.telemetry_save_dir,
+        run_id=args.telemetry_run_id,
+        auto_offset=args.telemetry_auto_offset,
+        topk=args.telemetry_topk,
+    )
+
+    # Now that sweep overrides are applied, set up run directories, env snapshot, and seed
     ensure_dirs(args.outdir)
     env_dump(args.outdir)
     set_seed(args.seed)
@@ -384,13 +511,12 @@ def main():
         diff_nrm = (model.lm_head.weight.detach().float() - model.exit_proj.weight.detach().float()).norm().item()
     print("[sanity] head parity:", {"||lm||": lm_nrm, "||exit||": exit_nrm, "||lm-exit||": diff_nrm}, flush=True)
 
-    run = init_wandb(args)
     wandb_log({"sanity/head_parity_lm": lm_nrm,
                "sanity/head_parity_exit": exit_nrm,
                "sanity/head_parity_diff": diff_nrm}, step=0)
     wandb_watch_model(model, log_freq=25)
 
-    train_bestcase_kl_rl(
+    acc1 = train_bestcase_kl_rl(
         model, tok, prompts_train, prompts_eval,
         steps=args.steps, rollout_len=args.rollout, batch_size=args.batch_size,
         lr_exit=args.lr_exit, lr_lora=args.lr_lora, temperature=args.temperature,
@@ -405,9 +531,13 @@ def main():
         train_k_spec=args.train_k_spec,
         spec_train_greedy=args.spec_train_greedy,
         spec_train_temp=args.spec_train_temp,
+        spec_adaptive=args.spec_adaptive,
+        eta=args.eta,
         ce_mask_by_reward=args.ce_mask_by_reward,
         kl_warmup_scale=args.kl_warmup_scale,
         eval_k_max=args.eval_k_max,
+        timing_greedy=args.timing_greedy,
+        telemetry=telemetry,
     )
     deep_kv_purge(model)
     gc.collect()
@@ -434,19 +564,30 @@ def main():
         greedy=args.timing_greedy,
         repeats=args.time_repeats,
         use_dvi_spec=True,
-        draft_k=args.spec_draft_k,
+        draft_k=args.spec_k_max,
+        spec_adaptive=args.spec_adaptive,
+        eta=args.eta,
+        spec_ctar_target1=args.spec_ctar_target1,
         temperature=max(1e-6, args.temperature),
         early_layer_override=args.early_layer,
         quiet=True,
-        microbatch_base=1
+        microbatch_base=1,
+        telemetry=telemetry,
     )
     dvi_time, spec_metrics = dvi_res
     print(f"[time] DVI(SPEC) generate: {dvi_time:.3f}s", flush=True)
     if spec_metrics is None:
         spec_metrics = {}
-    acc_rt = float(spec_metrics.get("spec/accept_rate", 0.0))
+    acc_rt = float(spec_metrics.get("spec/accept_rate_from_hist", 0.0))
     comp_rt, _ = theoretical_compression(acc_rt, args.early_layer, total_layers)
-    print(f"[spec] runtime_accept_rate={acc_rt:.3f} | runtime_comp_est≈{comp_rt:.3f}", flush=True)
+    hist_counts = [
+        spec_metrics.get(f"spec/prefix_hist_{i}", 0.0)
+        for i in range(args.spec_k_max + 1)
+    ]
+    print(
+        f"[spec] runtime_accept_rate={acc_rt:.3f} | runtime_comp_est≈{comp_rt:.3f} | prefix_hist={hist_counts}",
+        flush=True,
+    )
 
     deep_kv_purge(model)
     try:
@@ -458,12 +599,6 @@ def main():
                 pass
     except Exception:
         pass
-    if run is not None:
-        try:
-            run.finish()
-            timing_trace("wandb run finished before baseline load")
-        except Exception:
-            pass
     del model
     gc.collect()
     if torch.cuda.is_available():
@@ -500,7 +635,8 @@ def main():
     speedup_wall = (base_time / dvi_time) if dvi_time > 0 else float("inf")
     print(f"[time] Walltime speedup (baseline/DVI SPEC): {speedup_wall:.3f}×", flush=True)
 
-    wandb_log({
+    comp_train, _ = theoretical_compression(acc1, args.early_layer, total_layers)
+    final_metrics = {
         "speed/walltime_dvi_spec_s": dvi_time,
         "speed/walltime_base_s": base_time,
         "speed/speedup_walltime_spec": speedup_wall,
@@ -511,10 +647,13 @@ def main():
         "spec/deep_tokens": spec_metrics.get("spec/deep_tokens", 0.0),
         "spec/deep_to_commit": spec_metrics.get("spec/deep_to_commit", 0.0),
         "comp/runtime_est": comp_rt,
-        "comp/theoretical_from_train": theoretical_compression(
-            spec_metrics.get("spec/accept_rate", 0.0), args.early_layer, total_layers
-        )[0],
-    }, step=args.steps)
+        "comp/theoretical_from_train": comp_train,
+    }
+    for k, v in spec_metrics.items():
+        if k.startswith("spec/prefix_hist_") or k == "spec/steps":
+            final_metrics[k] = v
+    wandb_log(final_metrics, step=args.steps)
+    wandb_summary_update(final_metrics)
 
     deep_kv_purge(baseline)
     del baseline
@@ -522,6 +661,7 @@ def main():
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     free_cuda("(timing done)")
+    finish_wandb()
 
 
 if __name__ == "__main__":
