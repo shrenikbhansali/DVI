@@ -107,6 +107,10 @@ class AlignLogger:
         kv_len_deep_after: int,
         gold: Optional[Dict[str, Any]] = None,
         sample0_tensors: Optional[Dict[str, torch.Tensor]] = None,
+        eta: Optional[float] = None,
+        prefix_hist: Optional[Any] = None,
+        policy_mean_adv: Optional[float] = None,
+        policy_mean_kl: Optional[float] = None,
     ) -> None:
         if deep_logits is not None and deep_argmax is None:
             deep_argmax = deep_logits.argmax(dim=-1)
@@ -145,6 +149,14 @@ class AlignLogger:
                 "diag": diag,
                 "gold": gold,
             }
+            if eta is not None:
+                meta.setdefault("diag_extra", {})["eta"] = float(eta)
+            if prefix_hist is not None:
+                meta.setdefault("diag_extra", {})["prefix_hist"] = prefix_hist
+            if policy_mean_adv is not None:
+                meta.setdefault("diag_extra", {})["policy_mean_advantage"] = float(policy_mean_adv)
+            if policy_mean_kl is not None:
+                meta.setdefault("diag_extra", {})["policy_mean_kl"] = float(policy_mean_kl)
             self._save_json(f"{self.cfg.run_id}_{phase}_step{step_idx:04d}.json", meta)
             if self.cfg.dump_tensors and sample0_tensors:
                 safe = {k: (v.detach().cpu() if isinstance(v, torch.Tensor) else v)

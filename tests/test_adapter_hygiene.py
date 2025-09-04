@@ -80,7 +80,18 @@ def test_rollout_restores_adapter():
     tok = DummyTok()
     buf = ReplayBuffer(32, torch.device("cpu"))
     before = getattr(model, "_dvi_active_adapter", None)
-    rollout_collect_k_spec(model, tok, "hi", buf, steps=2, k=2, greedy=True, temperature=0.0)
+    rollout_collect_k_spec(
+        model,
+        tok,
+        "hi",
+        buf,
+        steps=2,
+        k=2,
+        greedy=True,
+        temperature=0.0,
+        spec_adaptive=False,
+        eta=0.0,
+    )
     assert getattr(model, "_dvi_active_adapter", None) == before
 
 

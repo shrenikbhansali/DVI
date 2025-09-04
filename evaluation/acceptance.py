@@ -14,8 +14,9 @@ from training.kv import (
 )
 from training.utils import ctar, free_cuda
 from training.modeling import exit_logits_from_hidden_k, adapter_guard
+from training.spec_decode import generate_with_dvi_spec
 
-__all__ = ["eval_acceptance"]
+__all__ = ["eval_acceptance", "eval_runtime_acceptance"]
 
 _KV_WARN_COUNT = 0
 _KV_WARN_LIMIT = 8
@@ -103,3 +104,32 @@ def eval_acceptance(spec: EarlyExitLlamaForCausalLM, tok, prompts: List[str],
             for rec in dbg_out:
                 f.write(json.dumps(rec) + "\n")
     return acc, c
+
+
+@torch.no_grad()
+def eval_runtime_acceptance(
+    spec: EarlyExitLlamaForCausalLM,
+    tok,
+    prompts: List[str],
+    *,
+    draft_k: int = 4,
+    eta: float = 0.0,
+    spec_adaptive: bool = False,
+    greedy: bool = True,
+    temperature: float = 1.0,
+    max_new_tokens: int = 1,
+) -> Dict[str, float]:
+    """Run free-form speculative decoding and return runtime metrics."""
+
+    _, metrics = generate_with_dvi_spec(
+        spec,
+        tok,
+        prompts=prompts,
+        draft_k=draft_k,
+        spec_adaptive=spec_adaptive,
+        eta=eta,
+        greedy=greedy,
+        temperature=temperature,
+        max_new_tokens=max_new_tokens,
+    )
+    return metrics.to_dict()

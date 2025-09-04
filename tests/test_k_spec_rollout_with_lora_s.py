@@ -40,7 +40,18 @@ def test_k_spec_all_accepts_and_no_grad_on_vlogits():
         pytest.skip("missing attention mask helper")
     tok = DummyTok()
     buf = ReplayBuffer(capacity=64, device=torch.device("cpu"))
-    n = rollout_collect_k_spec(m, tok, "x", buf, steps=3, k=2, greedy=True, temperature=0.0)
+    n = rollout_collect_k_spec(
+        m,
+        tok,
+        "x",
+        buf,
+        steps=3,
+        k=2,
+        greedy=True,
+        temperature=0.0,
+        spec_adaptive=False,
+        eta=0.0,
+    )
     assert n == 6
     assert len(buf) == 6
     assert buf.accepted_count() == 6

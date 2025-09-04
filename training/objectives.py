@@ -1,11 +1,11 @@
 """Losses and head regularisation for DVI training."""
 import math
-from typing import Tuple, List, Dict
+from typing import Tuple, List, Dict, Optional
 
 import torch
 import torch.nn.functional as F
 
-__all__ = ["one_mixed_step", "policy_kl_ent_multi_step"]
+__all__ = ["one_mixed_step", "policy_kl_ent_multi_step", "policy_gradient_terms", "one_policy_step"]
 
 
 def _maybe_clamp_exit_head(model, init_fro: float, max_fro: float, max_fro_ratio: float) -> None:
@@ -145,3 +145,94 @@ def policy_kl_ent_multi_step(
     ent = torch.stack(ent_terms).mean()
     loss = ce + kl_weight * kl - ent_weight * ent
     return {"loss": loss, "pg": ce, "kl": kl, "ent": ent}
+
+
+def policy_gradient_terms(
+    model,
+    batch: Dict[str, torch.Tensor],
+    *,
+    baseline_state: Optional[Dict[str, float]] = None,
+    baseline_ema: float = 0.9,
+) -> Tuple[torch.Tensor, torch.Tensor, float]:
+    """Return policy gradient and KL terms for a batch.
+
+    ``baseline_state`` is a mutable dict carrying an EMA baseline across calls.
+    """
+
+    dev = next(model.parameters()).device
+    with torch.inference_mode(False):
+        hidden = batch["hidden"].to(dev).clone()
+        vlogits = batch["vlogits"].to(dev).clone()
+    tokens = batch["token"].to(dev).view(-1)
+    accepted = batch["accepted"].to(dev).view(-1).float()
+
+    h = hidden.float()
+    if hasattr(model, "exit_pre_norm") and model.exit_pre_norm is not None:
+        h = model.exit_pre_norm(h)
+    slogits = model.exit_proj(h)
+    if hasattr(model, "exit_logit_scale"):
+        slogits = model.exit_logit_scale.to(slogits.dtype) * slogits
+    slogp = F.log_softmax(slogits, dim=-1)
+    logp = slogp.gather(1, tokens.unsqueeze(1)).squeeze(1)
+
+    # Baseline EMA
+    baseline = 0.0
+    if baseline_state is not None:
+        baseline = float(baseline_state.get("b", 0.0))
+    mean_r = float(accepted.mean().item())
+    baseline = baseline * baseline_ema + mean_r * (1.0 - baseline_ema)
+    if baseline_state is not None:
+        baseline_state["b"] = baseline
+
+    adv = accepted - baseline
+    pg_loss = -(adv.detach() * logp).mean()
+
+    kl = F.kl_div(
+        slogp,
+        F.softmax(vlogits.float(), dim=-1),
+        reduction="batchmean",
+        log_target=False,
+    )
+    return pg_loss, kl, baseline
+
+
+def one_policy_step(
+    model,
+    opt,
+    batch: Dict[str, torch.Tensor],
+    *,
+    rl_weight: float = 1.0,
+    beta: float = 0.1,
+    clip: float = 1.0,
+    baseline_state: Optional[Dict[str, float]] = None,
+    baseline_ema: float = 0.9,
+) -> Dict[str, float]:
+    pg, kl, baseline = policy_gradient_terms(
+        model, batch, baseline_state=baseline_state, baseline_ema=baseline_ema
+    )
+    loss = rl_weight * pg + beta * kl
+
+    is_finite = torch.isfinite(loss)
+    if not bool(is_finite):
+        opt.zero_grad(set_to_none=True)
+        return {
+            "ok": False,
+            "loss": float("nan"),
+            "pg": float("nan"),
+            "kl": float("nan"),
+            "baseline": float(baseline),
+        }
+
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(
+        (p for p in model.parameters() if p.requires_grad), clip
+    )
+    opt.step()
+    opt.zero_grad(set_to_none=True)
+    return {
+        "ok": True,
+        "loss": float(loss.item()),
+        "pg": float(pg.item()),
+        "kl": float(kl.item()),
+        "baseline": float(baseline),
+    }

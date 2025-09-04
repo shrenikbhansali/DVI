@@ -96,6 +96,30 @@ class ReplayBuffer:
         return out
 
     @torch.no_grad()
+    def sample_on_policy(self, batch_size: int) -> Dict[str, torch.Tensor]:
+        """Uniform sample without filtering, exposing draft actions and accepts.
+
+        Returns a dict with ``token`` (drafter's action), ``accepted`` flag,
+        optional ``hidden`` for recompute, and ``vlogits`` for verifier KL."""
+        if self._size == 0 or self._hidden_buf is None:
+            raise ValueError("Buffer is empty")
+
+        if batch_size > self._size:
+            raise ValueError("Not enough samples in buffer")
+
+        choice = torch.randperm(self._size, device=self.device)[:batch_size]
+        out = {
+            "hidden": self._hidden_buf[choice].clone(),
+            "token": self._token_buf[choice].clone(),
+            "accepted": self._reward_buf[choice].clone(),
+        }
+        if self._vlogits_buf is not None:
+            out["vlogits"] = self._vlogits_buf[choice].clone()
+        else:
+            out["vlogits"] = torch.empty((batch_size, 0), device=self.device)
+        return out
+
+    @torch.no_grad()
     def accepted_count(self) -> int:
         if self._size == 0:
             return 0

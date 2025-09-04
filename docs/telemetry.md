@@ -49,4 +49,9 @@ Telemetry files are stored in the directory passed via `--telemetry-save-dir`
 and are named `{run_id}_{phase}_step####.json`.  Each JSON file contains a
 `diag` block with fields such as `match_0`, `match_p1`, `best_offset` and
 `accept_len_default`, together with KV-cache lengths before/after the block.
-A couple of sample JSONs are usually enough to diagnose alignment issues.
+When policy-gradient training is enabled the dumps also contain a
+`diag_extra` section with `eta`, a per-block `prefix_hist`, and averaged
+`policy_mean_advantage`/`policy_mean_kl` statistics.
+These additional fields help correlate runtime behaviour with policy
+updates.  A couple of sample JSONs are usually enough to diagnose
+alignment issues.
