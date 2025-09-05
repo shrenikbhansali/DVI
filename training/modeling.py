@@ -106,7 +106,7 @@ def prepare_dvi_trainable(
     *,
     rank_s: int = 8,
     rank_v: int = 0,
-    dtype: torch.dtype = torch.float16,
+    dtype: torch.dtype = torch.float32,
 ) -> EarlyExitLlamaForCausalLM:
     model = EarlyExitLlamaForCausalLM.from_pretrained(
         model_id, torch_dtype=dtype, device_map="auto", EARLY_STOP_LAYER=early_layer
