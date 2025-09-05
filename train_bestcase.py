@@ -141,6 +141,7 @@ def train_bestcase_kl_rl(model, tok, prompts_train: List[str], prompts_eval: Lis
     # Build optimizer after any dtype casting that may occur during evaluation.
     opt = build_optimizer(model, lr_exit=lr_exit, lr_lora=lr_lora, wd_exit=1e-2, wd_lora=0.0)
     pg_baseline_state: Dict[str, float] = {}
+    pg_active = False
 
     ptr = 0
     tokens_total = 0
@@ -243,7 +244,10 @@ def train_bestcase_kl_rl(model, tok, prompts_train: List[str], prompts_eval: Lis
         t_trn_e = time.perf_counter()
         step_time = (t_trn_e - t_trn_s)
         policy_stats = None
-        if use_policy_grad:
+        if use_policy_grad and lam_pg > 0:
+            if not pg_active:
+                pg_baseline_state.clear()
+                pg_active = True
             try:
                 pg_batch = buf.sample_on_policy(batch_size)
             except ValueError:
