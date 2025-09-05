@@ -175,6 +175,16 @@ def prepare_dvi_trainable(
 
 
 def build_optimizer(model, lr_exit=2e-4, lr_lora=5e-5, wd_exit=1e-2, wd_lora=0.0):
+    # Ensure exit-head components remain in float32 before constructing the optimizer.
+    if getattr(model, "exit_proj", None) is not None:
+        if getattr(model.exit_proj, "weight", None) is not None and model.exit_proj.weight.dtype != torch.float32:
+            model.exit_proj = model.exit_proj.to(dtype=torch.float32)
+    if hasattr(model, "exit_pre_norm") and model.exit_pre_norm is not None:
+        if next(model.exit_pre_norm.parameters()).dtype != torch.float32:
+            model.exit_pre_norm = model.exit_pre_norm.to(dtype=torch.float32)
+    if hasattr(model, "exit_logit_scale") and model.exit_logit_scale.dtype != torch.float32:
+        model.exit_logit_scale.data = model.exit_logit_scale.data.to(torch.float32)
+
     head_params = [model.exit_proj.weight]
     if hasattr(model, "exit_pre_norm") and model.exit_pre_norm is not None:
         head_params += list(model.exit_pre_norm.parameters())
