@@ -2,6 +2,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 import torch
+import time
 
 from .modeling import (
     run_shallow_until_k,
@@ -29,6 +30,9 @@ class SpecMetrics:
     invariant_error: int = 0
     nan_events: int = 0
     oom_retries: int = 0
+    deep_forward_calls_per_100_decode_tokens: float = 0.0
+    avg_drafted_T: float = 0.0
+    decode_tokens_per_second: float = 0.0
 
     @property
     def accept_rate(self) -> float:
@@ -80,6 +84,9 @@ class SpecMetrics:
             acc_from_hist = EL / max(1, self.draft_k)
             out["spec/accept_rate_from_hist"] = float(acc_from_hist)
             out["spec/accept_rate_delta"] = float(out["spec/accept_rate"] - acc_from_hist)
+        out["spec/deep_calls_per_100"] = float(self.deep_forward_calls_per_100_decode_tokens)
+        out["spec/avg_drafted_T"] = float(self.avg_drafted_T)
+        out["spec/decode_toks_per_s"] = float(self.decode_tokens_per_second)
         return out
 
 
@@ -213,8 +220,11 @@ def generate_with_dvi_spec(
         except Exception:
             pass
 
-    # Remember boundary to split PKV back into shallow/deep if we have to
-    split_idx = len(sp)
+    # Remember boundary to split PKV back into shallow/deep if we have to.
+    # ``k`` is constant for the model and matches the number of shallow
+    # layers; relying on the tuple length can misalign when caches are
+    # disabled.
+    split_idx = k
 
     logger = AlignLogger(telemetry)
     kv_len_shallow = logger.kv_len_from_past(shallow_past)
@@ -223,14 +233,14 @@ def generate_with_dvi_spec(
     metrics = SpecMetrics(draft_k=draft_k)
     metrics.prefix_hist = [0 for _ in range(draft_k + 1)]
     total_new = 0
+    deep_forward_calls = 0
+    t_start = time.time()
 
     next_seed_hidden: Optional[torch.Tensor] = None
     next_seed_past: Optional[Tuple] = None
 
     while total_new < max_new_tokens:
         draft_tokens: List[torch.Tensor] = []
-        draft_hidden: List[torch.Tensor] = []
-        shallow_snapshots: List[Tuple] = []
         tmp_shallow = shallow_past
         prev = last_tokens
         drafted = 0
@@ -255,8 +265,6 @@ def generate_with_dvi_spec(
             pmax = torch.softmax(logits[:, -1, :], dim=-1).amax(dim=-1)
             nxt = sample_from_logits(logits[:, -1, :], greedy=greedy, temperature=temperature)
             draft_tokens.append(nxt)
-            draft_hidden.append(h_k[:, -1, :])
-            shallow_snapshots.append(tmp_shallow)
             prev = nxt
             drafted += 1
             if spec_adaptive and bool((pmax < eta).item()):
@@ -273,22 +281,33 @@ def generate_with_dvi_spec(
             )
 
         prop_seq = torch.stack(draft_tokens, dim=1)   # [B,drafted]
-        hidden_seq = torch.stack(draft_hidden, dim=1) # [B,drafted,H]
         metrics.proposed += int(B * drafted)
 
-        # ---- verify entire block ----
+        # Re-run shallow stack over the entire block to obtain split-layer
+        # activations and updated KV in one batched call.
         kv_len_shallow_before = kv_len_shallow
+        with adapter_guard(model, "draft"):
+            hidden_seq, shallow_past_full = run_shallow_until_k(
+                model,
+                input_ids=prop_seq,
+                past_key_values=shallow_past,
+                attention_mask=None,
+                use_cache=True,
+            )
         kv_len_deep_before = kv_len_deep
 
+        # ---- verify entire block ----
         with adapter_guard(model, "verify"):
             deep_logits, deep_past_full = run_deep_from_k(
                 model,
                 hidden_k=hidden_seq,
                 past_key_values=deep_past,
+                attention_mask=None,
                 use_cache=True,
             )
         metrics.steps += 1
         metrics.deep_tokens += int(B * drafted)
+        deep_forward_calls += 1
 
         if not torch.isfinite(deep_logits).all():
             metrics.nan_events += 1
@@ -327,17 +346,17 @@ def generate_with_dvi_spec(
         # commit accepted prefix or one verifier token on miss
         if accept_len > 0:
             accepted_block = prop_seq[:, :accept_len]
-            # Shallow cache: restore from snapshot
-            snap = shallow_snapshots[accept_len - 1]
+            past_len_s = kv_len_shallow_before
             new_shallow = []
-            for (k_, v_) in snap:
-                new_shallow.append((k_.contiguous().clone(), v_.contiguous().clone()))
+            for (k_, v_) in shallow_past_full:
+                ks = k_[:, :, : past_len_s + accept_len, :].contiguous().clone()
+                vs = v_[:, :, : past_len_s + accept_len, :].contiguous().clone()
+                new_shallow.append((ks, vs))
             shallow_past = tuple(new_shallow)
 
+            past_len_d = kv_len_deep_before
+            new_deep = []
             if deep_past_full is not None:
-                # Fast path: slice verifier PKV
-                past_len_d = deep_past[0][0].shape[2] if deep_past and deep_past[0] is not None else 0
-                new_deep = []
                 for (k_, v_) in deep_past_full:
                     ks = k_[:, :, : past_len_d + accept_len, :].contiguous().clone()
                     vs = v_[:, :, : past_len_d + accept_len, :].contiguous().clone()
@@ -364,9 +383,17 @@ def generate_with_dvi_spec(
             total_new += accept_len
             metrics.committed += int(B * accept_len)
 
+            # KV lengths grow by the number of committed tokens
+            kv_len_shallow += accept_len
+            kv_len_deep += accept_len
+
             if accept_len == drafted:
-                next_seed_hidden = pre_h
-                next_seed_past = pre_past
+                next_seed_hidden = pre_h.clone()
+                next_seed_past = (
+                    tuple((k_.contiguous().clone(), v_.contiguous().clone()) for (k_, v_) in pre_past)
+                    if pre_past is not None
+                    else None
+                )
             else:
                 next_seed_hidden = None
                 next_seed_past = None
@@ -408,6 +435,9 @@ def generate_with_dvi_spec(
                 )
             total_new += 1
             metrics.committed += int(B)
+            # KV lengths grow by one verifier token on miss
+            kv_len_shallow += 1
+            kv_len_deep += 1
             next_seed_hidden = None
             next_seed_past = None
             sp = tuple(shallow_past) if shallow_past is not None else tuple()
@@ -467,6 +497,11 @@ def generate_with_dvi_spec(
     total_layers = count_transformer_layers(model)
     comp_ratio, _ = theoretical_compression(metrics.accept_rate, k, total_layers)
     metrics.comp_ratio_runtime_est = comp_ratio
+
+    elapsed = time.time() - t_start
+    metrics.avg_drafted_T = metrics.proposed / max(1, metrics.steps * B)
+    metrics.deep_forward_calls_per_100_decode_tokens = 100.0 * deep_forward_calls / max(1, metrics.committed)
+    metrics.decode_tokens_per_second = metrics.committed / max(1e-6, elapsed)
 
     outputs = [torch.tensor(seq, device=device, dtype=torch.long) for seq in generated]
     # final persist (guard against None)
