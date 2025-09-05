@@ -309,6 +309,14 @@ def run_shallow_until_k(
     """
     _ensure_active_adapter(model, "draft")
     early = _early_model(model)
+    # If no external KV cache is supplied, discard any stale cache that may
+    # have been left on the model from a previous context (e.g. eval).
+    if past_key_values is None and early is not None:
+        if getattr(early, "past_key_values", None) is not None:
+            early.past_key_values = None
+        inner = getattr(early, "model", None)
+        if inner is not None and getattr(inner, "past_key_values", None) is not None:
+            inner.past_key_values = None
 
     # Try fast-path only if enabled and no external KV is provided
     if early is not None and past_key_values is None and not os.getenv("DVI_DISABLE_EARLY_FASTPATH"):

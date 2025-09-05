@@ -35,7 +35,7 @@ from training.utils import (
 )
 from training.mem import deep_kv_purge, timing_trace
 from training.modeling import prepare_dvi_trainable, build_optimizer
-from training.kv import estimate_kv_cache
+from training.kv import estimate_kv_cache, clear_all_kv
 from training.rollout import rollout_collect, rollout_collect_k_spec, buf_debug
 from training.objectives import one_mixed_step, one_policy_step
 from training.schedule import mix_schedule, phase_of_step
@@ -128,6 +128,7 @@ def train_bestcase_kl_rl(model, tok, prompts_train: List[str], prompts_eval: Lis
         max_new_tokens=32,
         telemetry=telemetry,
     )
+    clear_all_kv(model)
     log_rt_pre = {f"eval/runtime/pre/{k}": v for k, v in rt_metrics_pre.items()}
     wandb_log(log_rt_pre, step=0)
     hist_msg = " ".join(
@@ -402,6 +403,7 @@ def train_bestcase_kl_rl(model, tok, prompts_train: List[str], prompts_eval: Lis
                 max_new_tokens=32,
                 telemetry=telemetry,
             )
+            clear_all_kv(model)
             rt_dict.update({
                 "spec/greedy": float(timing_greedy),
                 "spec/temperature": float(max(1e-6, temperature) if timing_greedy else temperature),
@@ -461,6 +463,7 @@ def train_bestcase_kl_rl(model, tok, prompts_train: List[str], prompts_eval: Lis
         max_new_tokens=32,
         telemetry=telemetry,
     )
+    clear_all_kv(model)
     log_rt_post = {f"eval/runtime/post/{k}": v for k, v in rt_metrics_post.items()}
     wandb_log(log_rt_post, step=steps)
     hist_msg = " ".join(
