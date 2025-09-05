@@ -19,6 +19,7 @@ class ReplayBuffer:
 
         # Storage buffers
         self._hidden_buf: Optional[torch.Tensor] = None
+        self._state_buf = torch.empty(self.capacity, dtype=torch.long, device=self.device)
         self._token_buf = torch.empty(self.capacity, dtype=torch.long, device=self.device)
         self._reward_buf = torch.empty(self.capacity, dtype=torch.float32, device=self.device)
         self._conf_buf = torch.empty(self.capacity, dtype=torch.float32, device=self.device)
@@ -36,6 +37,7 @@ class ReplayBuffer:
         reward: float,
         conf: float,
         vlogits: Optional[torch.Tensor] = None,
+        state: Optional[int] = None,
     ) -> bool:
         """Append a transition and return ``True`` if an old slot was overwritten."""
         if self._hidden_buf is None:
@@ -49,6 +51,7 @@ class ReplayBuffer:
             logging.debug("Overwriting index %d with token %d", idx, int(token))
 
         self._hidden_buf[idx].copy_(hidden.detach().to(self.device))
+        self._state_buf[idx] = int(state) if state is not None else 0
         self._token_buf[idx] = int(token)
         self._reward_buf[idx] = float(reward)
         self._conf_buf[idx] = float(conf)
@@ -67,7 +70,7 @@ class ReplayBuffer:
     @torch.no_grad()
     def sample(self, batch_size: int, accepted_only: bool = True) -> Dict[str, torch.Tensor]:
         """Sample a batch of transitions uniformly."""
-        if self._size == 0 or self._hidden_buf is None:
+        if self._size == 0:
             raise ValueError("Buffer is empty")
 
         mask = self._reward_buf[: self._size] == 1.0
@@ -88,6 +91,30 @@ class ReplayBuffer:
             "token": self._token_buf[choice].clone(),
             "reward": self._reward_buf[choice].clone(),
             "conf": self._conf_buf[choice].clone(),
+        }
+        if self._vlogits_buf is not None:
+            out["vlogits"] = self._vlogits_buf[choice].clone()
+        else:
+            out["vlogits"] = torch.empty((batch_size, 0), device=self.device)
+        return out
+
+    @torch.no_grad()
+    def sample_on_policy(self, batch_size: int) -> Dict[str, torch.Tensor]:
+        """Uniform sample without filtering, exposing draft actions and accepts.
+
+        Returns a dict with ``token`` (drafter's action), ``accepted`` flag,
+        optional ``hidden`` for recompute, and ``vlogits`` for verifier KL."""
+        if self._size == 0 or self._hidden_buf is None:
+            raise ValueError("Buffer is empty")
+
+        if batch_size > self._size:
+            raise ValueError("Not enough samples in buffer")
+
+        choice = torch.randperm(self._size, device=self.device)[:batch_size]
+        out = {
+            "state": self._state_buf[choice].clone(),
+            "token": self._token_buf[choice].clone(),
+            "accepted": self._reward_buf[choice].clone(),
         }
         if self._vlogits_buf is not None:
             out["vlogits"] = self._vlogits_buf[choice].clone()

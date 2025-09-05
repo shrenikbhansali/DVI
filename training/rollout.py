@@ -19,9 +19,21 @@ __all__ = ["rollout_collect", "rollout_collect_k_spec", "buf_debug"]
 
 
 @torch.no_grad()
-def rollout_collect(spec, tok, prompt: str,
-                    buf: ReplayBuffer, steps: int,
-                    debug_out: Optional[List[Dict]] = None, topk: int = 5) -> int:
+def rollout_collect(
+    spec,
+    tok,
+    prompt: str,
+    buf: ReplayBuffer,
+    steps: int,
+    debug_out: Optional[List[Dict]] = None,
+    topk: int = 5,
+    *,
+    telemetry: Optional[AlignTelemetryParams] = None,
+    spec_adaptive: bool = False,
+    eta: float = 0.0,
+    greedy: bool = True,
+    temperature: float = 1.0,
+) -> int:
     """Legacy single-token rollout forwarded to k-spec path."""
     return rollout_collect_k_spec(
         spec,
@@ -30,10 +42,13 @@ def rollout_collect(spec, tok, prompt: str,
         buf,
         steps,
         k=1,
-        greedy=True,
-        temperature=1.0,
+        greedy=greedy,
+        temperature=temperature,
         debug_out=debug_out,
         topk=topk,
+        telemetry=telemetry,
+        spec_adaptive=spec_adaptive,
+        eta=eta,
     )
 
 
@@ -51,6 +66,8 @@ def rollout_collect_k_spec(
     debug_out: Optional[List[Dict]] = None,
     topk: int = 5,
     telemetry: Optional[AlignTelemetryParams] = None,
+    spec_adaptive: bool = False,
+    eta: float = 0.0,
 ) -> int:
     """Collect rollouts using k-token speculative drafting.
 
@@ -125,14 +142,21 @@ def rollout_collect_k_spec(
                     use_cache=True,
                 )
                 logits = exit_logits_from_hidden_k(spec, h_k)
+            probs = torch.softmax(logits[:, -1, :], dim=-1)
+            if spec_adaptive and float(probs.max().item()) < float(eta):
+                break
             nxt = sample_from_logits(logits[:, -1, :], greedy=greedy, temperature=temperature)
             draft_tokens.append(nxt)
             draft_hidden.append(h_k[:, -1, :])
             shallow_snaps.append(tmp_shallow)
             prev = nxt
 
-        prop_seq = torch.stack(draft_tokens, dim=1)   # [B,k]
-        hidden_seq = torch.stack(draft_hidden, dim=1) # [B,k,H]
+        if len(draft_tokens) == 0:
+            break
+
+        prop_seq = torch.stack(draft_tokens, dim=1)
+        hidden_seq = torch.stack(draft_hidden, dim=1)
+        k_cur = int(prop_seq.size(1))
 
         kv_len_shallow_before = kv_len_shallow
         kv_len_deep_before = kv_len_deep
@@ -154,7 +178,7 @@ def rollout_collect_k_spec(
         all_matched0 = matches0.all(dim=1)
         first_mismatch0 = (~matches0).float().argmax(dim=1)
         prefix_lens0 = torch.where(
-            all_matched0, torch.full_like(first_mismatch0, k), first_mismatch0
+            all_matched0, torch.full_like(first_mismatch0, k_cur), first_mismatch0
         )
         accept_len = int(prefix_lens0.min().item())
         prefix_lens = prefix_lens0
@@ -165,7 +189,7 @@ def rollout_collect_k_spec(
             all_matched1 = matches1.all(dim=1)
             first_mismatch1 = (~matches1).float().argmax(dim=1)
             prefix_lens1 = torch.where(
-                all_matched1, torch.full_like(first_mismatch1, k - 1), first_mismatch1
+                all_matched1, torch.full_like(first_mismatch1, k_cur - 1), first_mismatch1
             )
             accept_len_p1 = int(prefix_lens1.min().item())
             if accept_len_p1 > accept_len:
@@ -178,46 +202,50 @@ def rollout_collect_k_spec(
             prefix_lens = torch.zeros_like(prefix_lens)
 
         # ---- buffer training examples: accepted prefix tokens + one mismatch (if any) ----
-        va_list = deep_argmax.detach().cpu().tolist()
+        ps_list = prop_seq.detach().cpu().tolist()
         for b in range(B):
             m = int(prefix_lens[b].item())
-            if m == k:
-                # verifier accepted all k tokens – record each one
-                for d in range(k):
+            if m == k_cur:
+                for d in range(k_cur):
                     with torch.inference_mode(False):
                         hidden = hidden_seq[b, d].detach().clone().cpu()
                         vlogits = deep_logits[b, d].detach().clone().cpu()
+                    prev_tok = int(last_tokens[b] if d == 0 else ps_list[b][d - 1])
                     buf.append(
                         hidden=hidden,
-                        token=int(va_list[b][d]),
+                        token=int(ps_list[b][d]),
                         reward=1.0,
                         conf=0.0,
                         vlogits=vlogits,
+                        state=prev_tok,
                     )
-                kept = k
+                kept = k_cur
             else:
-                # record the accepted prefix (m) and then the mismatch (1)
                 for d in range(m):
                     with torch.inference_mode(False):
                         hidden = hidden_seq[b, d].detach().clone().cpu()
                         vlogits = deep_logits[b, d].detach().clone().cpu()
+                    prev_tok = int(last_tokens[b] if d == 0 else ps_list[b][d - 1])
                     buf.append(
                         hidden=hidden,
-                        token=int(va_list[b][d]),
+                        token=int(ps_list[b][d]),
                         reward=1.0,
                         conf=0.0,
                         vlogits=vlogits,
+                        state=prev_tok,
                     )
                 d = m
                 with torch.inference_mode(False):
                     hidden = hidden_seq[b, d].detach().clone().cpu()
                     vlogits = deep_logits[b, d].detach().clone().cpu()
+                prev_tok = int(last_tokens[b] if d == 0 else ps_list[b][d - 1])
                 buf.append(
                     hidden=hidden,
-                    token=int(va_list[b][d]),
+                    token=int(ps_list[b][d]),
                     reward=0.0,
                     conf=0.0,
                     vlogits=vlogits,
+                    state=prev_tok,
                 )
                 kept = m + 1
             n_collected += kept
@@ -303,10 +331,11 @@ def rollout_collect_k_spec(
             pass
 
         steps_done += 1
+        prefix_hist = torch.bincount(prefix_lens, minlength=k_cur + 1).tolist()
         logger.block_report(
             phase="rollout",
             step_idx=steps_done,
-            k=k,
+            k=k_cur,
             B=B,
             greedy=greedy,
             temperature=temperature,
@@ -320,6 +349,8 @@ def rollout_collect_k_spec(
             kv_len_deep_after=kv_len_deep,
             gold=None,
             sample0_tensors=sample0,
+            eta=float(eta),
+            prefix_hist=prefix_hist,
         )
 
     return n_collected

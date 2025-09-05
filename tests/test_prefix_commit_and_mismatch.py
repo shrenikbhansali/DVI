@@ -39,7 +39,17 @@ def test_prefix_and_mismatch_path_runs_and_logs():
         pytest.skip("missing attention mask helper")
     tok = DummyTok()
     buf = ReplayBuffer(capacity=64, device=torch.device("cpu"))
-    n = rollout_collect_k_spec(m, tok, "x", buf, steps=2, k=2, greedy=True)
+    n = rollout_collect_k_spec(
+        m,
+        tok,
+        "x",
+        buf,
+        steps=2,
+        k=2,
+        greedy=True,
+        spec_adaptive=False,
+        eta=0.0,
+    )
     assert n == 4
     rewards = buf._reward_buf[: len(buf)]
     zero_mismatches = (rewards == 0).sum().item()

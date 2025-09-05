@@ -4,6 +4,12 @@
 alignment in both training and runtime experiments. Telemetry is **off by
 default** and is controlled entirely through CLI flags in `train_bestcase.py`.
 
+Policy-gradient training can be enabled with `--use-policy-grad` and is further
+configured via `--rl-weight`, `--pg-baseline-ema`, `--kl-beta0`,
+`--kl-beta-min` and `--kl-anneal-steps`. When enabled, telemetry JSONs also
+record averaged advantages/kl terms and the drafting `eta`/`prefix_hist` per
+block.
+
 When enabled it can:
 
 * emit up to `--telemetry-prints-budget` concise lines to stdout
@@ -49,4 +55,9 @@ Telemetry files are stored in the directory passed via `--telemetry-save-dir`
 and are named `{run_id}_{phase}_step####.json`.  Each JSON file contains a
 `diag` block with fields such as `match_0`, `match_p1`, `best_offset` and
 `accept_len_default`, together with KV-cache lengths before/after the block.
-A couple of sample JSONs are usually enough to diagnose alignment issues.
+When policy-gradient training is enabled the dumps also contain a
+`diag_extra` section with `eta`, a per-block `prefix_hist`, and averaged
+`policy_mean_advantage`/`policy_mean_kl` statistics.
+These additional fields help correlate runtime behaviour with policy
+updates.  A couple of sample JSONs are usually enough to diagnose
+alignment issues.
