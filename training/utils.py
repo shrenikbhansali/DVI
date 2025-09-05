@@ -18,6 +18,7 @@ from transformers import __version__ as transformers_ver
 import time
 from statistics import median
 from .mem import deep_kv_purge, timing_trace
+from .kv import clear_all_kv
 from .align_telemetry import AlignTelemetryParams
 
 
@@ -30,6 +31,7 @@ __all__ = [
     "free_cuda",
     "_cuda_sync",
     # added helpers for compression + timing
+    "get_num_decoder_layers",
     "count_transformer_layers",
     "theoretical_compression",
     "measure_generate_walltime",
@@ -118,12 +120,28 @@ def _cuda_sync() -> None:
 # Added: compression + timing
 # -----------------------------
 
-def count_transformer_layers(model) -> int:
+_num_layers_warned = False
+
+
+def get_num_decoder_layers(model) -> int:
+    """Best-effort discovery of decoder layer count.
+
+    Attempts to traverse common HuggingFace/PEFT model wrappers. If traversal
+    fails, falls back to ``model.config.num_hidden_layers`` and logs a warning
+    once. Returns ``>=1`` to avoid zero-division downstream.
     """
-    Best-effort count of decoder block layers across common HF model structures.
-    Returns >=1 to avoid zero-division downstream.
-    """
-    for path in ("model.layers", "transformer.h", "model.decoder.layers"):
+
+    # Common attribute paths for decoder blocks across wrappers
+    candidates = (
+        "model.layers",
+        "base_model.model.layers",
+        "model.model.layers",
+        "base_model.model.model.layers",
+        "model.decoder.layers",
+        "transformer.h",
+        "gpt_neox.layers",
+    )
+    for path in candidates:
         cur = model
         ok = True
         for p in path.split("."):
@@ -134,10 +152,31 @@ def count_transformer_layers(model) -> int:
                 break
         if ok and hasattr(cur, "__len__"):
             try:
-                return len(cur)
+                n = len(cur)
+                if n > 0:
+                    return int(n)
             except Exception:
                 pass
-    return 1
+
+    cfg_layers = None
+    cfg = getattr(model, "config", None)
+    if cfg is not None:
+        cfg_layers = getattr(cfg, "num_hidden_layers", None)
+
+    n = int(cfg_layers) if isinstance(cfg_layers, int) and cfg_layers > 0 else 1
+    global _num_layers_warned
+    if not _num_layers_warned:
+        print(
+            f"[warn] get_num_decoder_layers: using config.num_hidden_layers={n}",
+            flush=True,
+        )
+        _num_layers_warned = True
+    return n
+
+
+def count_transformer_layers(model) -> int:
+    """Deprecated helper preserved for backward compatibility."""
+    return get_num_decoder_layers(model)
 
 
 def theoretical_compression(accept_rate: float, early_layer: int, total_layers: int):
@@ -227,6 +266,8 @@ def measure_generate_walltime(
     # keep the safety cap
     input_cap_tokens: int = 256,
     telemetry: AlignTelemetryParams | None = None,
+    layers_total: int | None = None,
+    debug_purge_kv: bool = False,
 ):
     """
     Returns:
@@ -313,8 +354,14 @@ def measure_generate_walltime(
 
     # ``torch.no_grad`` is sufficient for generation benchmarking here and
     # avoids returning tensors marked as inference.
+    def _reset_kv() -> None:
+        clear_all_kv(model)
+        if debug_purge_kv:
+            deep_kv_purge(model)
+
     @torch.no_grad()
     def _baseline_once(enc_chunk, force_greedy: bool) -> float:
+        _reset_kv()
         _cuda_sync()
         t0 = time.perf_counter()
         temp = max(1e-6, temperature) if force_greedy else temperature
@@ -335,7 +382,7 @@ def measure_generate_walltime(
 
     @torch.no_grad()
     def _spec_once(enc_chunk, eta_val) -> (float, Dict[str, float]):
-        deep_kv_purge(model)
+        _reset_kv()
         from training.spec_decode import generate_with_dvi_spec
 
         _cuda_sync()
@@ -354,9 +401,10 @@ def measure_generate_walltime(
             device=device,
             quiet=quiet,
             telemetry=telemetry,
+            layers_total=layers_total,
         )
         _cuda_sync()
-        deep_kv_purge(model)
+        _reset_kv()
         return time.perf_counter() - t0, spec_metrics.to_dict()
 
     # ----- timing loop -----
@@ -368,7 +416,7 @@ def measure_generate_walltime(
     B = int(enc_all["input_ids"].size(0))
 
     for _ in range(max(1, repeats)):
-        deep_kv_purge(model)
+        _reset_kv()
         total_elapsed = 0.0
         agg_proposed = 0
         agg_accepted = 0
