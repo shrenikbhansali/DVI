@@ -302,7 +302,6 @@ def generate_with_dvi_spec(
                 model,
                 hidden_k=hidden_seq,
                 past_key_values=deep_past,
-                attention_mask=None,
                 use_cache=True,
             )
         metrics.steps += 1

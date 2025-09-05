@@ -32,6 +32,7 @@ def build_mismatch_model(vsz=32, h=16, L=4, ksplit=2):
         for p in m.model.parameters():
             p.zero_()
         m.model.embed_tokens.weight[:, 0] = 1.0  # constant positive feature
+        m.model.norm.weight.fill_(1.0)
 
         # Force drafter/verifier disagreement.
         m.lm_head.weight.zero_()
