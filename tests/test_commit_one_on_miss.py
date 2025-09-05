@@ -27,6 +27,14 @@ def build_mismatch_model(vsz=32, h=16, L=4, ksplit=2):
     m.lm_head = torch.nn.Linear(h, vsz, bias=False)
     m.exit_proj = torch.nn.Linear(h, vsz, bias=False)
     with torch.no_grad():
+        # Zero out the entire transformer stack and embeddings so the
+        # hidden state is purely the token embedding.
+        for p in m.model.parameters():
+            p.zero_()
+        m.model.embed_tokens.weight[:, 0] = 1.0  # constant positive feature
+        m.model.norm.weight.fill_(1.0)
+
+        # Force drafter/verifier disagreement.
         m.lm_head.weight.zero_()
         m.exit_proj.weight.zero_()
         m.lm_head.weight[1, 0] = 1.0  # verifier prefers token 1
