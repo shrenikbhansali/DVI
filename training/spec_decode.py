@@ -209,7 +209,7 @@ def generate_with_dvi_spec(
     sp = tuple(shallow_past) if shallow_past is not None else tuple()
     dp = tuple(deep_past) if deep_past is not None else tuple()
     if sp or dp:
-        combined_past = sp + dp
+        combined_past = list(sp) + list(dp)
         try:
             model.past_key_values = combined_past
         except Exception:
@@ -411,7 +411,7 @@ def generate_with_dvi_spec(
             sp = tuple(shallow_past) if shallow_past is not None else tuple()
             dp = tuple(deep_past) if deep_past is not None else tuple()
             if sp or dp:
-                combined_past = sp + dp
+                combined_past = list(sp) + list(dp)
                 try:
                     model.past_key_values = combined_past
                 except Exception:
@@ -452,7 +452,7 @@ def generate_with_dvi_spec(
             sp = tuple(shallow_past) if shallow_past is not None else tuple()
             dp = tuple(deep_past) if deep_past is not None else tuple()
             if sp or dp:
-                combined_past = sp + dp
+                combined_past = list(sp) + list(dp)
                 try:
                     model.past_key_values = combined_past
                 except Exception:

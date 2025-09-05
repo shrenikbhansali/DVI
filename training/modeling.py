@@ -312,6 +312,14 @@ def run_shallow_until_k(
 
     # Try fast-path only if enabled and no external KV is provided
     if early is not None and past_key_values is None and not os.getenv("DVI_DISABLE_EARLY_FASTPATH"):
+        # ``EarlyExitLlamaForCausalLM`` expects a list for ``past_key_values`` so
+        # convert any tuple that may have been persisted by callers.
+        kvs = getattr(early, "past_key_values", None)
+        if isinstance(kvs, tuple):
+            try:
+                early.past_key_values = list(kvs)
+            except Exception:
+                pass
         try:
             out = early.forward_draft_or_large_model(
                 in_tokens_small=input_ids, position_ids=None, use_cache=use_cache
