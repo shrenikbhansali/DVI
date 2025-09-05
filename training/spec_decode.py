@@ -10,7 +10,7 @@ from .modeling import (
     adapter_guard,
 )
 from .sampling import sample_from_logits
-from .utils import theoretical_compression, count_transformer_layers
+from .utils import theoretical_compression, get_num_decoder_layers
 from .mem import timing_trace  # kept for compatibility
 from .kv import clear_all_kv, prime_kv_full, advance_kv_with_committed
 from .align_telemetry import AlignLogger, AlignTelemetryParams
@@ -103,6 +103,7 @@ def generate_with_dvi_spec(
     device: Optional[torch.device] = None,
     quiet: bool = True,
     telemetry: Optional[AlignTelemetryParams] = None,
+    layers_total: Optional[int] = None,
 ) -> Tuple[List[torch.Tensor], SpecMetrics]:
     """Self-speculative decoding using vectorised block verification."""
 
@@ -152,6 +153,7 @@ def generate_with_dvi_spec(
                 device=device,
                 quiet=quiet,
                 telemetry=telemetry,
+                layers_total=layers_total,
             )
             outs.extend(sub_out)
             agg.proposed += sub_m.proposed
@@ -165,7 +167,7 @@ def generate_with_dvi_spec(
             for j in range(draft_k + 1):
                 agg.prefix_hist[j] += sub_m.prefix_hist[j]
         # derive runtime compression estimate on aggregate stats
-        total_layers = count_transformer_layers(model)
+        total_layers = layers_total or get_num_decoder_layers(model)
         comp_ratio, _ = theoretical_compression(agg.accept_rate, k, total_layers)
         agg.comp_ratio_runtime_est = comp_ratio
         return outs, agg
@@ -464,7 +466,7 @@ def generate_with_dvi_spec(
         if total_new >= max_new_tokens:
             break
 
-    total_layers = count_transformer_layers(model)
+    total_layers = layers_total or get_num_decoder_layers(model)
     comp_ratio, _ = theoretical_compression(metrics.accept_rate, k, total_layers)
     metrics.comp_ratio_runtime_est = comp_ratio
 

@@ -30,12 +30,12 @@ from training.utils import (
     free_cuda,
     _cuda_sync,
     # added for compression + timing
-    count_transformer_layers,
+    get_num_decoder_layers,
     theoretical_compression,
 )
 from training.mem import deep_kv_purge, timing_trace
 from training.modeling import prepare_dvi_trainable, build_optimizer
-from training.kv import estimate_kv_cache
+from training.kv import estimate_kv_cache, clear_all_kv
 from training.rollout import rollout_collect, rollout_collect_k_spec, buf_debug
 from training.objectives import one_mixed_step, one_policy_step
 from training.schedule import mix_schedule, phase_of_step
@@ -81,6 +81,8 @@ def train_bestcase_kl_rl(model, tok, prompts_train: List[str], prompts_eval: Lis
                         kl_beta0: float = 0.5,
                         kl_beta_min: float = 0.05,
                         kl_anneal_steps: int = 2000,
+                        debug_purge_kv: bool = False,
+                        layers_total: int | None = None,
                         ):
     metrics_path = os.path.join(outdir, "logs", "train_metrics.jsonl")
     samples_path = os.path.join(outdir, "logs", "rollout_samples.jsonl")
@@ -95,8 +97,17 @@ def train_bestcase_kl_rl(model, tok, prompts_train: List[str], prompts_eval: Lis
     wandb_log({"sanity/lm_head_norm": lm_norm, "sanity/exit_head_norm": init_fro}, step=0)
 
     # layer count for compression estimates
-    total_layers = count_transformer_layers(model)
-    print(f"[info] total decoder layers detected: {total_layers}", flush=True)
+    detected_layers = get_num_decoder_layers(model)
+    if layers_total and layers_total > 0:
+        if layers_total != detected_layers:
+            print(
+                f"[warn] overriding detected layer count {detected_layers} with layers_total={layers_total}",
+                flush=True,
+            )
+        total_layers = int(layers_total)
+    else:
+        total_layers = detected_layers
+    print(f"[info] total decoder layers: {total_layers}", flush=True)
 
     eval_k_max = eval_k_max or train_k_spec
     if eval_k_max > train_k_spec:
@@ -473,7 +484,9 @@ def train_bestcase_kl_rl(model, tok, prompts_train: List[str], prompts_eval: Lis
 
     wandb_summary_update({**log_post, **log_rt_post})
 
-    deep_kv_purge(model)
+    clear_all_kv(model)
+    if debug_purge_kv:
+        deep_kv_purge(model)
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -555,6 +568,10 @@ def main():
                     help=">0: compute acceptance by best of {offset 0, +1}.")
     ap.add_argument("--telemetry-topk", type=int, default=5,
                     help="Optional: top-k to include in debug contexts, if used.")
+    ap.add_argument("--layers-total", type=int, default=0,
+                    help="Override total decoder layer count (0=auto-detect)")
+    ap.add_argument("--debug-purge-kv", action="store_true",
+                    help="Force deep KV-cache purge for debugging")
     args = ap.parse_args()
 
     # --- Initialize W&B and merge sweep overrides back into args ---
@@ -655,21 +672,32 @@ def main():
         kl_beta0=args.kl_beta0,
         kl_beta_min=args.kl_beta_min,
         kl_anneal_steps=args.kl_anneal_steps,
+        debug_purge_kv=args.debug_purge_kv,
+        layers_total=args.layers_total,
     )
-    deep_kv_purge(model)
+    clear_all_kv(model)
+    if args.debug_purge_kv:
+        deep_kv_purge(model)
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
     # -------- Post-train walltime timing --------
     print("\n[e2e] timing DVI (SPEC) vs baseline…", flush=True)
-    from training.utils import measure_generate_walltime, theoretical_compression, count_transformer_layers
+    from training.utils import measure_generate_walltime, theoretical_compression, get_num_decoder_layers
     timing_prompts = build_prompts_from_alpaca(args.time_prompts)
 
     model.eval()
     dvi_device = next(model.parameters()).device
     dvi_dtype = next(model.parameters()).dtype
-    total_layers = count_transformer_layers(model)
+    detected_layers = get_num_decoder_layers(model)
+    total_layers = args.layers_total or detected_layers
+    if args.layers_total and args.layers_total != detected_layers:
+        print(
+            f"[warn] overriding detected layer count {detected_layers} with --layers-total={args.layers_total}",
+            flush=True,
+        )
+    print(f"[info] total decoder layers: {total_layers}", flush=True)
     print(
         f"[time] decode_mode=DVI(SPEC); device={dvi_device}; dtype={dvi_dtype}; temperature={args.temperature}",
         flush=True,
@@ -690,6 +718,8 @@ def main():
         quiet=True,
         microbatch_base=1,
         telemetry=telemetry,
+        layers_total=total_layers,
+        debug_purge_kv=args.debug_purge_kv,
     )
     dvi_time, spec_metrics = dvi_res
     print(f"[time] DVI(SPEC) generate: {dvi_time:.3f}s", flush=True)
@@ -697,16 +727,19 @@ def main():
         spec_metrics = {}
     acc_rt = float(spec_metrics.get("spec/accept_rate_from_hist", 0.0))
     comp_rt, _ = theoretical_compression(acc_rt, args.early_layer, total_layers)
+    f = args.early_layer / max(1, total_layers)
     hist_counts = [
         spec_metrics.get(f"spec/prefix_hist_{i}", 0.0)
         for i in range(args.spec_k_max + 1)
     ]
     print(
-        f"[spec] runtime_accept_rate={acc_rt:.3f} | runtime_comp_est≈{comp_rt:.3f} | prefix_hist={hist_counts}",
+        f"[spec] layers_total={total_layers} early_layer={args.early_layer} f={f:.3f} acc_rt={acc_rt:.3f} runtime_comp_est≈{comp_rt:.3f} | prefix_hist={hist_counts}",
         flush=True,
     )
 
-    deep_kv_purge(model)
+    clear_all_kv(model)
+    if args.debug_purge_kv:
+        deep_kv_purge(model)
     try:
         import wandb as _wandb
         if _wandb is not None:
@@ -730,7 +763,9 @@ def main():
     if getattr(baseline.config, "use_cache", True) is False:
         baseline.config.use_cache = True
 
-    deep_kv_purge(baseline)
+    clear_all_kv(baseline)
+    if args.debug_purge_kv:
+        deep_kv_purge(baseline)
 
     print(
         f"[time] decode_mode=BASELINE(vanilla); device={dvi_device}; dtype={dvi_dtype}; temperature={args.temperature}",
@@ -745,7 +780,9 @@ def main():
         repeats=args.time_repeats,
         use_dvi_spec=False,
         temperature=max(1e-6, args.temperature),
-        microbatch_base=1
+        microbatch_base=1,
+        layers_total=total_layers,
+        debug_purge_kv=args.debug_purge_kv,
     )
     print(f"[time] Baseline generate: {base_time:.3f}s", flush=True)
 
@@ -772,7 +809,9 @@ def main():
     wandb_log(final_metrics, step=args.steps)
     wandb_summary_update(final_metrics)
 
-    deep_kv_purge(baseline)
+    clear_all_kv(baseline)
+    if args.debug_purge_kv:
+        deep_kv_purge(baseline)
     del baseline
     gc.collect()
     if torch.cuda.is_available():
