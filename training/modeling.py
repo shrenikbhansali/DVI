@@ -106,7 +106,7 @@ def prepare_dvi_trainable(
     *,
     rank_s: int = 8,
     rank_v: int = 0,
-    dtype: torch.dtype = torch.float16,
+    dtype: torch.dtype = torch.float32,
 ) -> EarlyExitLlamaForCausalLM:
     model = EarlyExitLlamaForCausalLM.from_pretrained(
         model_id, torch_dtype=dtype, device_map="auto", EARLY_STOP_LAYER=early_layer
@@ -175,6 +175,16 @@ def prepare_dvi_trainable(
 
 
 def build_optimizer(model, lr_exit=2e-4, lr_lora=5e-5, wd_exit=1e-2, wd_lora=0.0):
+    # Ensure exit-head components remain in float32 before constructing the optimizer.
+    if getattr(model, "exit_proj", None) is not None:
+        if getattr(model.exit_proj, "weight", None) is not None and model.exit_proj.weight.dtype != torch.float32:
+            model.exit_proj = model.exit_proj.to(dtype=torch.float32)
+    if hasattr(model, "exit_pre_norm") and model.exit_pre_norm is not None:
+        if next(model.exit_pre_norm.parameters()).dtype != torch.float32:
+            model.exit_pre_norm = model.exit_pre_norm.to(dtype=torch.float32)
+    if hasattr(model, "exit_logit_scale") and model.exit_logit_scale.dtype != torch.float32:
+        model.exit_logit_scale.data = model.exit_logit_scale.data.to(torch.float32)
+
     head_params = [model.exit_proj.weight]
     if hasattr(model, "exit_pre_norm") and model.exit_pre_norm is not None:
         head_params += list(model.exit_pre_norm.parameters())
@@ -485,10 +495,26 @@ def run_deep_from_k(
 
 def exit_logits_from_hidden_k(model, hidden_k: torch.Tensor) -> torch.Tensor:
     """Project hidden states at split layer to draft logits."""
-    h = hidden_k
+    # ``run_shallow_until_k`` returns activations in the model's native dtype
+    # (typically float16).  Operate the exit head in float32 to avoid the
+    # extreme log-probabilities and gradient spikes that can arise from the
+    # narrower FP16 range.
+    h = hidden_k.float()
+
     if hasattr(model, "exit_pre_norm") and model.exit_pre_norm is not None:
+        # Ensure the pre-norm is also in float32 before applying.
+        try:
+            if next(model.exit_pre_norm.parameters()).dtype != torch.float32:
+                model.exit_pre_norm = model.exit_pre_norm.to(dtype=torch.float32)
+        except StopIteration:
+            pass
         h = model.exit_pre_norm(h)
+
+    # Likewise keep the exit projection weights in float32 for stability.
+    if getattr(model.exit_proj, "weight", None) is not None and model.exit_proj.weight.dtype != torch.float32:
+        model.exit_proj = model.exit_proj.to(dtype=torch.float32)
     logits = model.exit_proj(h)
+
     if hasattr(model, "exit_logit_scale"):
         logits = model.exit_logit_scale.to(logits.dtype) * logits
     return logits

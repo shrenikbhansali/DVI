@@ -609,7 +609,7 @@ def main():
         args.early_layer,
         rank_s=args.lora_s_rank,
         rank_v=args.lora_v_rank,
-        dtype=torch.float16,
+        dtype=torch.float32,
     )
 
     with torch.no_grad():
