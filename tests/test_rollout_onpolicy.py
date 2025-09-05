@@ -66,6 +66,7 @@ def test_rollout_labels_and_tokens(monkeypatch):
     buf = ReplayBuffer(16, torch.device("cpu"))
     rollout_mod.rollout_collect_k_spec(spec, tok, "hi", buf, steps=1, k=2, greedy=True)
     sample = buf.sample_on_policy(2)
+    assert "state" in sample
     mapping = {int(tok): float(acc) for tok, acc in zip(sample["token"], sample["accepted"])}
     assert mapping[0] == 1.0 and mapping[1] == 0.0
 

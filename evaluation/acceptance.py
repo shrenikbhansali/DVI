@@ -15,6 +15,7 @@ from training.kv import (
 from training.utils import ctar, free_cuda
 from training.modeling import exit_logits_from_hidden_k, adapter_guard
 from training.spec_decode import generate_with_dvi_spec
+from training.align_telemetry import AlignTelemetryParams
 
 __all__ = ["eval_acceptance", "eval_runtime_acceptance"]
 
@@ -118,6 +119,8 @@ def eval_runtime_acceptance(
     greedy: bool = True,
     temperature: float = 1.0,
     max_new_tokens: int = 1,
+    quiet: bool = True,
+    telemetry: AlignTelemetryParams | None = None,
 ) -> Dict[str, float]:
     """Run free-form speculative decoding and return runtime metrics."""
 
@@ -131,5 +134,7 @@ def eval_runtime_acceptance(
         greedy=greedy,
         temperature=temperature,
         max_new_tokens=max_new_tokens,
+        quiet=quiet,
+        telemetry=telemetry,
     )
     return metrics.to_dict()

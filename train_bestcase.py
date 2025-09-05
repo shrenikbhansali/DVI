@@ -18,7 +18,7 @@ import json
 import math
 import time
 import gc
-from typing import List
+from typing import List, Dict
 
 import torch
 
@@ -37,7 +37,7 @@ from training.mem import deep_kv_purge, timing_trace
 from training.modeling import prepare_dvi_trainable, build_optimizer
 from training.kv import estimate_kv_cache
 from training.rollout import rollout_collect, rollout_collect_k_spec, buf_debug
-from training.objectives import one_mixed_step
+from training.objectives import one_mixed_step, one_policy_step
 from training.schedule import mix_schedule, phase_of_step
 from training.logging import (
     init_wandb,
@@ -49,8 +49,7 @@ from training.logging import (
     WANDB_DEFAULT_PROJECT,
 )
 from training.buffer import ReplayBuffer
-from evaluation.acceptance import eval_acceptance
-from training.spec_decode import generate_with_dvi_spec
+from evaluation.acceptance import eval_acceptance, eval_runtime_acceptance
 from training.align_telemetry import AlignTelemetryParams
 import random
 
@@ -76,6 +75,12 @@ def train_bestcase_kl_rl(model, tok, prompts_train: List[str], prompts_eval: Lis
                         eval_k_max: int = None,
                         timing_greedy: bool = False,
                         telemetry: AlignTelemetryParams | None = None,
+                        use_policy_grad: bool = False,
+                        rl_weight: float = 1.0,
+                        pg_baseline_ema: float = 0.9,
+                        kl_beta0: float = 0.5,
+                        kl_beta_min: float = 0.05,
+                        kl_anneal_steps: int = 2000,
                         ):
     metrics_path = os.path.join(outdir, "logs", "train_metrics.jsonl")
     samples_path = os.path.join(outdir, "logs", "rollout_samples.jsonl")
@@ -110,8 +115,33 @@ def train_bestcase_kl_rl(model, tok, prompts_train: List[str], prompts_eval: Lis
         log_dict[f"eval/pre/ctar{w}"] = ctar0.get(w, 0)
     wandb_log(log_dict, step=0)
 
+    rt_prompts_pre = random.sample(prompts_eval, k=min(16, len(prompts_eval)))
+    rt_metrics_pre = eval_runtime_acceptance(
+        model,
+        tok,
+        prompts=rt_prompts_pre,
+        draft_k=train_k_spec,
+        eta=eta,
+        spec_adaptive=spec_adaptive,
+        greedy=timing_greedy,
+        temperature=temperature if not timing_greedy else max(1e-6, temperature),
+        max_new_tokens=32,
+        telemetry=telemetry,
+    )
+    log_rt_pre = {f"eval/runtime/pre/{k}": v for k, v in rt_metrics_pre.items()}
+    wandb_log(log_rt_pre, step=0)
+    hist_msg = " ".join(
+        [f"{k.split('_')[-1]}={int(v)}" for k, v in rt_metrics_pre.items() if k.startswith("spec/prefix_hist_")]
+    )
+    print(
+        f"[eval/runtime] PRE  acc_rate={rt_metrics_pre.get('spec/accept_rate',0.0):.3f} {hist_msg}",
+        flush=True,
+    )
+
     # Build optimizer after any dtype casting that may occur during evaluation.
     opt = build_optimizer(model, lr_exit=lr_exit, lr_lora=lr_lora, wd_exit=1e-2, wd_lora=0.0)
+    pg_baseline_state: Dict[str, float] = {}
+    pg_active = False
 
     ptr = 0
     tokens_total = 0
@@ -213,6 +243,30 @@ def train_bestcase_kl_rl(model, tok, prompts_train: List[str], prompts_eval: Lis
         _cuda_sync()
         t_trn_e = time.perf_counter()
         step_time = (t_trn_e - t_trn_s)
+        policy_stats = None
+        if use_policy_grad and lam_pg > 0:
+            if not pg_active:
+                pg_baseline_state.clear()
+                pg_active = True
+            try:
+                pg_batch = buf.sample_on_policy(batch_size)
+            except ValueError:
+                pg_batch = None
+            if pg_batch is not None:
+                frac = min(1.0, g / max(1, kl_anneal_steps))
+                beta = kl_beta0 - (kl_beta0 - kl_beta_min) * frac
+                pol_out = one_policy_step(
+                    model,
+                    opt,
+                    pg_batch,
+                    rl_weight=rl_weight,
+                    beta=beta,
+                    clip=1.0,
+                    baseline_state=pg_baseline_state,
+                    baseline_ema=pg_baseline_ema,
+                )
+                pol_acc = float(pg_batch["accepted"].float().mean().item())
+                policy_stats = {**pol_out, "accepted": pol_acc, "beta": beta}
 
         accept_roll = float(batch["reward"].float().mean().item())
         # per-step compression & speedup estimate (frequent logging)
@@ -233,6 +287,13 @@ def train_bestcase_kl_rl(model, tok, prompts_train: List[str], prompts_eval: Lis
             continue
 
         std_s, std_t = out["std_s_t"]
+        pol_msg = ""
+        if policy_stats:
+            pol_msg = (
+                f" | pol_loss {policy_stats['loss']:+7.4f} pg {policy_stats['pg']:+7.4f}"
+                f" kl {policy_stats['kl']:+7.4f} acc {policy_stats['accepted']:.3f}"
+                f" beta {policy_stats['beta']:.3f}"
+            )
         print(
             f"[train] step {g:04d} | {phase:>10} | "
             f"loss {out['loss']:+7.4f} "
@@ -243,7 +304,7 @@ def train_bestcase_kl_rl(model, tok, prompts_train: List[str], prompts_eval: Lis
             f"||exit||={exit_norm:.2f} | roll_acc≈{accept_roll:.4f} | "
             f"buf_size={buf_size} acc_rate≈{buf_rate:.3f} | λ_pg={lam_pg:.3f} λ_kl={lam_kl:.3f} | accepted_only={accepted_only} | "
             f"KV={kv_mb:.2f} MB (seq≈{kv_seq}) | CUDA alloc={mem_alloc:.1f} MB | "
-            f"comp≈{comp_ratio:.3f} (speedup≈{speedup_est:.2f}×)",
+            f"comp≈{comp_ratio:.3f} (speedup≈{speedup_est:.2f}×)" + pol_msg,
             flush=True,
         )
 
@@ -265,6 +326,15 @@ def train_bestcase_kl_rl(model, tok, prompts_train: List[str], prompts_eval: Lis
             total_layers=total_layers,
             early_layer=early_layer,
         )
+        if policy_stats:
+            metrics.update({
+                "policy/loss": policy_stats["loss"],
+                "policy/pg": policy_stats["pg"],
+                "policy/kl": policy_stats["kl"],
+                "policy/baseline": policy_stats["baseline"],
+                "policy/accepted": policy_stats["accepted"],
+                "policy/beta": policy_stats["beta"],
+            })
         with open(metrics_path, "a") as f:
             f.write(json.dumps(metrics) + "\n")
 
@@ -288,6 +358,15 @@ def train_bestcase_kl_rl(model, tok, prompts_train: List[str], prompts_eval: Lis
             # added: frequent compression logging
             "comp/theoretical_from_train": comp_ratio,
         }, step=g)
+        if policy_stats:
+            wandb_log({
+                "policy/loss": policy_stats["loss"],
+                "policy/pg": policy_stats["pg"],
+                "policy/kl": policy_stats["kl"],
+                "policy/baseline": policy_stats["baseline"],
+                "policy/accepted": policy_stats["accepted"],
+                "policy/beta": policy_stats["beta"],
+            }, step=g)
 
         if dbg_roll:
             with open(samples_path, "a") as f:
@@ -311,24 +390,22 @@ def train_bestcase_kl_rl(model, tok, prompts_train: List[str], prompts_eval: Lis
 
             # ----- runtime-style evaluation (free-running) -----
             rt_prompts = random.sample(prompts_eval, k=min(16, len(prompts_eval)))
-            _, rt_metrics = generate_with_dvi_spec(
+            rt_dict = eval_runtime_acceptance(
                 model,
                 tok,
                 prompts=rt_prompts,
-                max_new_tokens=32,
                 draft_k=train_k_spec,
+                eta=eta,
+                spec_adaptive=spec_adaptive,
                 greedy=timing_greedy,
                 temperature=temperature if not timing_greedy else max(1e-6, temperature),
-                early_layer=early_layer,
-                quiet=True,
+                max_new_tokens=32,
                 telemetry=telemetry,
             )
-            rt_dict = rt_metrics.to_dict()
             rt_dict.update({
                 "spec/greedy": float(timing_greedy),
                 "spec/temperature": float(max(1e-6, temperature) if timing_greedy else temperature),
                 "spec/k": float(train_k_spec),
-                "spec/early_layer": float(early_layer),
             })
             log_rt = {f"eval/runtime/{k}": v for k, v in rt_dict.items()}
             # cross-check CTAR hats vs teacher-forced CTARs
@@ -370,7 +447,31 @@ def train_bestcase_kl_rl(model, tok, prompts_train: List[str], prompts_eval: Lis
     for w in range(1, eval_k_max + 1):
         log_post[f"eval/post/ctar{w}"] = ctar1.get(w, 0)
     wandb_log(log_post, step=steps)
-    wandb_summary_update(log_post)
+
+    rt_prompts_post = random.sample(prompts_eval, k=min(16, len(prompts_eval)))
+    rt_metrics_post = eval_runtime_acceptance(
+        model,
+        tok,
+        prompts=rt_prompts_post,
+        draft_k=train_k_spec,
+        eta=eta,
+        spec_adaptive=spec_adaptive,
+        greedy=timing_greedy,
+        temperature=temperature if not timing_greedy else max(1e-6, temperature),
+        max_new_tokens=32,
+        telemetry=telemetry,
+    )
+    log_rt_post = {f"eval/runtime/post/{k}": v for k, v in rt_metrics_post.items()}
+    wandb_log(log_rt_post, step=steps)
+    hist_msg = " ".join(
+        [f"{k.split('_')[-1]}={int(v)}" for k, v in rt_metrics_post.items() if k.startswith("spec/prefix_hist_")]
+    )
+    print(
+        f"[eval/runtime] POST acc_rate={rt_metrics_post.get('spec/accept_rate',0.0):.3f} {hist_msg}",
+        flush=True,
+    )
+
+    wandb_summary_update({**log_post, **log_rt_post})
 
     deep_kv_purge(model)
     gc.collect()
@@ -397,6 +498,12 @@ def main():
     ap.add_argument("--ce-weight", type=float, default=0.10)
     ap.add_argument("--ce-mask-by-reward", action="store_true")
     ap.add_argument("--ent-weight", type=float, default=0.00)
+    ap.add_argument("--use-policy-grad", action="store_true")
+    ap.add_argument("--rl-weight", type=float, default=1.0)
+    ap.add_argument("--pg-baseline-ema", type=float, default=0.9)
+    ap.add_argument("--kl-beta0", type=float, default=0.5)
+    ap.add_argument("--kl-beta-min", type=float, default=0.05)
+    ap.add_argument("--kl-anneal-steps", type=int, default=2000)
     ap.add_argument("--warmup-kl", type=int, default=40)
     ap.add_argument("--ramp-steps", type=int, default=80)
     ap.add_argument("--kl-min", type=float, default=0.05)
@@ -506,7 +613,7 @@ def main():
         args.early_layer,
         rank_s=args.lora_s_rank,
         rank_v=args.lora_v_rank,
-        dtype=torch.float16,
+        dtype=torch.float32,
     )
 
     with torch.no_grad():
@@ -542,6 +649,12 @@ def main():
         eval_k_max=args.eval_k_max,
         timing_greedy=args.timing_greedy,
         telemetry=telemetry,
+        use_policy_grad=args.use_policy_grad,
+        rl_weight=args.rl_weight,
+        pg_baseline_ema=args.pg_baseline_ema,
+        kl_beta0=args.kl_beta0,
+        kl_beta_min=args.kl_beta_min,
+        kl_anneal_steps=args.kl_anneal_steps,
     )
     deep_kv_purge(model)
     gc.collect()

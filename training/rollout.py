@@ -202,7 +202,6 @@ def rollout_collect_k_spec(
             prefix_lens = torch.zeros_like(prefix_lens)
 
         # ---- buffer training examples: accepted prefix tokens + one mismatch (if any) ----
-        va_list = deep_argmax.detach().cpu().tolist()
         ps_list = prop_seq.detach().cpu().tolist()
         for b in range(B):
             m = int(prefix_lens[b].item())
@@ -211,12 +210,14 @@ def rollout_collect_k_spec(
                     with torch.inference_mode(False):
                         hidden = hidden_seq[b, d].detach().clone().cpu()
                         vlogits = deep_logits[b, d].detach().clone().cpu()
+                    prev_tok = int(last_tokens[b] if d == 0 else ps_list[b][d - 1])
                     buf.append(
                         hidden=hidden,
                         token=int(ps_list[b][d]),
                         reward=1.0,
                         conf=0.0,
                         vlogits=vlogits,
+                        state=prev_tok,
                     )
                 kept = k_cur
             else:
@@ -224,23 +225,27 @@ def rollout_collect_k_spec(
                     with torch.inference_mode(False):
                         hidden = hidden_seq[b, d].detach().clone().cpu()
                         vlogits = deep_logits[b, d].detach().clone().cpu()
+                    prev_tok = int(last_tokens[b] if d == 0 else ps_list[b][d - 1])
                     buf.append(
                         hidden=hidden,
                         token=int(ps_list[b][d]),
                         reward=1.0,
                         conf=0.0,
                         vlogits=vlogits,
+                        state=prev_tok,
                     )
                 d = m
                 with torch.inference_mode(False):
                     hidden = hidden_seq[b, d].detach().clone().cpu()
                     vlogits = deep_logits[b, d].detach().clone().cpu()
+                prev_tok = int(last_tokens[b] if d == 0 else ps_list[b][d - 1])
                 buf.append(
                     hidden=hidden,
                     token=int(ps_list[b][d]),
                     reward=0.0,
                     conf=0.0,
                     vlogits=vlogits,
+                    state=prev_tok,
                 )
                 kept = m + 1
             n_collected += kept
@@ -326,6 +331,7 @@ def rollout_collect_k_spec(
             pass
 
         steps_done += 1
+        prefix_hist = torch.bincount(prefix_lens, minlength=k_cur + 1).tolist()
         logger.block_report(
             phase="rollout",
             step_idx=steps_done,
@@ -344,6 +350,7 @@ def rollout_collect_k_spec(
             gold=None,
             sample0_tensors=sample0,
             eta=float(eta),
+            prefix_hist=prefix_hist,
         )
 
     return n_collected

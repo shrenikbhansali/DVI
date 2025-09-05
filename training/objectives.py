@@ -4,6 +4,7 @@ from typing import Tuple, List, Dict, Optional
 
 import torch
 import torch.nn.functional as F
+from training.modeling import run_shallow_until_k, exit_logits_from_hidden_k, adapter_guard
 
 __all__ = ["one_mixed_step", "policy_kl_ent_multi_step", "policy_gradient_terms", "one_policy_step"]
 
@@ -51,40 +52,43 @@ def one_mixed_step(model, opt, batch,
     tokens = batch["token"].to(dev).view(-1)
     rewards = batch.get("reward", torch.ones_like(tokens, dtype=torch.float32, device=dev)).to(dev).view(-1)
 
-    h = hidden.float()
-    if hasattr(model, "exit_pre_norm") and model.exit_pre_norm is not None:
-        h = model.exit_pre_norm(h)
-    slogits = model.exit_proj(h)
-    if hasattr(model, "exit_logit_scale"):
-        slogits = model.exit_logit_scale.to(slogits.dtype) * slogits
+    device_type = dev.type if dev.type in ("cuda", "cpu") else "cuda"
+    # Run the exit-head forward pass and losses in FP32 with autocast disabled.
+    with torch.autocast(device_type=device_type, enabled=False):
+        h = hidden.float()
+        if hasattr(model, "exit_pre_norm") and model.exit_pre_norm is not None:
+            h = model.exit_pre_norm(h)
+        slogits = model.exit_proj(h)
+        if hasattr(model, "exit_logit_scale"):
+            slogits = model.exit_logit_scale.to(slogits.dtype) * slogits
 
-    slogp = F.log_softmax(slogits, dim=-1)
-    sp = slogp.exp()
+        slogp = F.log_softmax(slogits, dim=-1)
+        sp = slogp.exp()
 
-    pi_v = sp.gather(1, tokens.view(-1, 1)).squeeze(1)
-    pos = rewards.gt(0)
-    count_pos = pos.float().sum().clamp_min(1.0)
-    loss_pg = -(rewards * torch.log(pi_v.clamp_min(1e-8))).sum() / count_pos
+        pi_v = sp.gather(1, tokens.view(-1, 1)).squeeze(1)
+        pos = rewards.gt(0)
+        count_pos = pos.float().sum().clamp_min(1.0)
+        loss_pg = -(rewards * torch.log(pi_v.clamp_min(1e-8))).sum() / count_pos
 
-    tlogits = vlogits.float() / float(temperature)
-    tlogp = F.log_softmax(tlogits, dim=-1)
-    tp = tlogp.exp()
-    kl = F.kl_div(input=slogp, target=tp, reduction="batchmean", log_target=False)
+        tlogits = vlogits.float() / float(temperature)
+        tlogp = F.log_softmax(tlogits, dim=-1)
+        tp = tlogp.exp()
+        kl = F.kl_div(input=slogp, target=tp, reduction="batchmean", log_target=False)
 
-    if ce_weight > 0.0:
-        if ce_mask_by_reward:
-            mask = rewards > 0
-            if mask.any():
-                ce = F.nll_loss(slogp[mask], tokens[mask], reduction="mean")
+        if ce_weight > 0.0:
+            if ce_mask_by_reward:
+                mask = rewards > 0
+                if mask.any():
+                    ce = F.nll_loss(slogp[mask], tokens[mask], reduction="mean")
+                else:
+                    ce = torch.tensor(0.0, device=dev)
             else:
-                ce = torch.tensor(0.0, device=dev)
+                ce = F.nll_loss(slogp, tokens, reduction="mean")
         else:
-            ce = F.nll_loss(slogp, tokens, reduction="mean")
-    else:
-        ce = torch.tensor(0.0, device=dev)
-    ent = -(sp * slogp).sum(-1).mean()
+            ce = torch.tensor(0.0, device=dev)
+        ent = -(sp * slogp).sum(-1).mean()
 
-    loss = lam_pg * loss_pg + lam_kl * kl + ce_weight * ce - ent_weight * ent
+        loss = lam_pg * loss_pg + lam_kl * kl + ce_weight * ce - ent_weight * ent
     contrib_pg = float((lam_pg * loss_pg).detach().item())
     contrib_kl = float((lam_kl * kl).detach().item())
     contrib_ce = float((ce_weight * ce).detach().item()) if ce_weight > 0.0 else 0.0
@@ -161,19 +165,34 @@ def policy_gradient_terms(
 
     dev = next(model.parameters()).device
     with torch.inference_mode(False):
-        hidden = batch["hidden"].to(dev).clone()
+        state = batch["state"].to(dev).clone()
         vlogits = batch["vlogits"].to(dev).clone()
     tokens = batch["token"].to(dev).view(-1)
     accepted = batch["accepted"].to(dev).view(-1).float()
 
-    h = hidden.float()
-    if hasattr(model, "exit_pre_norm") and model.exit_pre_norm is not None:
-        h = model.exit_pre_norm(h)
-    slogits = model.exit_proj(h)
-    if hasattr(model, "exit_logit_scale"):
-        slogits = model.exit_logit_scale.to(slogits.dtype) * slogits
-    slogp = F.log_softmax(slogits, dim=-1)
-    logp = slogp.gather(1, tokens.unsqueeze(1)).squeeze(1)
+    with adapter_guard(model, "draft"):
+        h_k, _ = run_shallow_until_k(
+            model,
+            input_ids=state.view(-1, 1),
+            attention_mask=None,
+            past_key_values=None,
+            use_cache=False,
+        )
+    # ``h_k`` is produced in the model's native dtype (typically float16).
+    # Run the exit head in float32 with autocast disabled for numerical stability.
+    device_type = dev.type if dev.type in ("cuda", "cpu") else "cuda"
+    with torch.autocast(device_type=device_type, enabled=False):
+        h_k = h_k.float()
+        slogits_full = exit_logits_from_hidden_k(model, h_k)
+        slogits = slogits_full[:, -1, :]
+        slogp = F.log_softmax(slogits, dim=-1)
+        logp = slogp.gather(1, tokens.unsqueeze(1)).squeeze(1)
+        kl = F.kl_div(
+            slogp,
+            F.softmax(vlogits.float(), dim=-1),
+            reduction="batchmean",
+            log_target=False,
+        )
 
     # Baseline EMA
     baseline = 0.0
@@ -187,12 +206,6 @@ def policy_gradient_terms(
     adv = accepted - baseline
     pg_loss = -(adv.detach() * logp).mean()
 
-    kl = F.kl_div(
-        slogp,
-        F.softmax(vlogits.float(), dim=-1),
-        reduction="batchmean",
-        log_target=False,
-    )
     return pg_loss, kl, baseline
 
 
