@@ -175,6 +175,10 @@ def policy_gradient_terms(
             past_key_values=None,
             use_cache=False,
         )
+    # ``h_k`` is produced in the model's native dtype (typically float16).
+    # Cast to float32 so the exit head and subsequent losses operate in a
+    # numerically stable range.
+    h_k = h_k.float()
     slogits_full = exit_logits_from_hidden_k(model, h_k)
     slogits = slogits_full[:, -1, :]
     slogp = F.log_softmax(slogits, dim=-1)

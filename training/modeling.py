@@ -485,10 +485,26 @@ def run_deep_from_k(
 
 def exit_logits_from_hidden_k(model, hidden_k: torch.Tensor) -> torch.Tensor:
     """Project hidden states at split layer to draft logits."""
-    h = hidden_k
+    # ``run_shallow_until_k`` returns activations in the model's native dtype
+    # (typically float16).  Operate the exit head in float32 to avoid the
+    # extreme log-probabilities and gradient spikes that can arise from the
+    # narrower FP16 range.
+    h = hidden_k.float()
+
     if hasattr(model, "exit_pre_norm") and model.exit_pre_norm is not None:
+        # Ensure the pre-norm is also in float32 before applying.
+        try:
+            if next(model.exit_pre_norm.parameters()).dtype != torch.float32:
+                model.exit_pre_norm = model.exit_pre_norm.to(dtype=torch.float32)
+        except StopIteration:
+            pass
         h = model.exit_pre_norm(h)
+
+    # Likewise keep the exit projection weights in float32 for stability.
+    if getattr(model.exit_proj, "weight", None) is not None and model.exit_proj.weight.dtype != torch.float32:
+        model.exit_proj = model.exit_proj.to(dtype=torch.float32)
     logits = model.exit_proj(h)
+
     if hasattr(model, "exit_logit_scale"):
         logits = model.exit_logit_scale.to(logits.dtype) * logits
     return logits
