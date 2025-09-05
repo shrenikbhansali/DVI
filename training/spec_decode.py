@@ -339,6 +339,16 @@ def generate_with_dvi_spec(
             if accept_len_p1 > accept_len:
                 accept_len = accept_len_p1
 
+        # Clamp acceptance to remaining decode budget to avoid overshoot.
+        remaining = max_new_tokens - total_new
+        if accept_len > remaining:
+            # Adjust prefix histogram so metrics stay consistent with the
+            # truncated commitment.  ``prefix_hist`` had already counted the
+            # original match length (``accept_len_default``).
+            metrics.prefix_hist[accept_len_default] -= 1
+            metrics.prefix_hist[remaining] += 1
+            accept_len = remaining
+
         # IMPORTANT: do NOT zero accept_len if deep_past_full is None.
         # We will commit accepted tokens via the model as a fallback.
         metrics.accepted += int(B * accept_len)
