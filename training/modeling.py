@@ -356,8 +356,21 @@ def run_shallow_until_k(
         past_len = past_key_values[0][0].shape[2]
 
     if past_len > 0:
+        # ``attention_mask`` may be ``None`` or may only cover the drafted tokens.
+        # Prepend ones for the cached prefix so the mask spans ``past_len + T``
+        # positions and matches the concatenated KV state.
         if attention_mask is None:
-            attention_mask = torch.ones((B, T), dtype=torch.bool, device=device)
+            attention_mask = torch.ones(
+                (B, past_len + T), dtype=torch.bool, device=device
+            )
+        elif attention_mask.size(1) < past_len + T:
+            pad = torch.ones(
+                (B, past_len + T - attention_mask.size(1)),
+                dtype=attention_mask.dtype,
+                device=attention_mask.device,
+            )
+            attention_mask = torch.cat((pad, attention_mask), dim=1)
+
         attn_mask = lm._prepare_decoder_attention_mask(
             attention_mask,
             (B, T),
@@ -445,7 +458,17 @@ def run_deep_from_k(
 
         if past_len > 0:
             if attention_mask is None:
-                attention_mask = torch.ones((B, T), dtype=torch.bool, device=device)
+                attention_mask = torch.ones(
+                    (B, past_len + T), dtype=torch.bool, device=device
+                )
+            elif attention_mask.size(1) < past_len + T:
+                pad = torch.ones(
+                    (B, past_len + T - attention_mask.size(1)),
+                    dtype=attention_mask.dtype,
+                    device=attention_mask.device,
+                )
+                attention_mask = torch.cat((pad, attention_mask), dim=1)
+
             attn_mask = lm._prepare_decoder_attention_mask(
                 attention_mask,
                 (B, T),
