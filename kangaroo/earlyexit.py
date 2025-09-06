@@ -60,12 +60,15 @@ class EarlyExitLlamaForCausalLM(LlamaForCausalLM):
         in_tokens_small:  Optional[torch.LongTensor] = None,   # (B, T)
         in_features_large: Optional[torch.Tensor]     = None,   # (B, T, H)
         position_ids:      Optional[torch.Tensor]     = None,
+        use_cache: bool = True,
     ):
         if (in_tokens_small is None) == (in_features_large is None):
             raise ValueError("Specify exactly one of in_tokens_small / "
                              "in_features_large")
 
         self._ensure_past_cache(len(self.model.layers))
+        if isinstance(self.past_key_values, tuple):
+            self.past_key_values = list(self.past_key_values)
 
         # -------- choose sub‑network ----------------------------------
         if in_tokens_small is not None:                       # draft path
@@ -96,15 +99,18 @@ class EarlyExitLlamaForCausalLM(LlamaForCausalLM):
         # -------- transformer layers ----------------------------------
         for i, layer in enumerate(layers):
             idx = i + focus_offset
-            hidden, pkv = layer(
+            outputs = layer(
                 hidden,
                 attention_mask   = attn_mask,
                 position_ids     = position_ids,
                 past_key_value   = self.past_key_values[idx],
                 output_attentions=False,
-                use_cache        = True,
+                use_cache        = use_cache,
             )
-            self.past_key_values[idx] = pkv
+            hidden = outputs[0]
+            if use_cache:
+                pkv = outputs[1]
+                self.past_key_values[idx] = pkv
 
         # verifier also returns pre‑head hidden for layer‑norm’d logits
         if in_features_large is not None:
