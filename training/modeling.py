@@ -356,13 +356,20 @@ def run_shallow_until_k(
         past_len = past_key_values[0][0].shape[2]
 
     if past_len > 0:
-        attn_mask = None
+        if attention_mask is None:
+            attention_mask = torch.ones((B, T), dtype=torch.bool, device=device)
+        attn_mask = lm._prepare_decoder_attention_mask(
+            attention_mask,
+            (B, T),
+            hidden_states,
+            past_len,
+        )
         position_ids = (
             torch.arange(past_len, past_len + T, device=device)
             .unsqueeze(0)
             .expand(B, T)
         )
-        timing_trace("run_shallow_until_k: cached fast-path mask skip")
+        timing_trace("run_shallow_until_k: cached prefix mask")
     else:
         if attention_mask is None:
             attention_mask = torch.ones((B, T), dtype=torch.bool, device=device)
@@ -437,13 +444,20 @@ def run_deep_from_k(
             past_len = past_key_values[0][0].shape[2]
 
         if past_len > 0:
-            attn_mask = None
+            if attention_mask is None:
+                attention_mask = torch.ones((B, T), dtype=torch.bool, device=device)
+            attn_mask = lm._prepare_decoder_attention_mask(
+                attention_mask,
+                (B, T),
+                hidden_k,
+                past_len,
+            )
             position_ids = (
                 torch.arange(past_len, past_len + T, device=device)
                 .unsqueeze(0)
                 .expand(B, T)
             )
-            timing_trace("run_deep_from_k: cached fast-path mask skip")
+            timing_trace("run_deep_from_k: cached prefix mask")
         else:
             if attention_mask is None:
                 attention_mask = torch.ones((B, T), dtype=torch.bool, device=device)
